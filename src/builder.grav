@@ -682,7 +682,8 @@ namespace orbit {
             let out = new Array<T>();
             out.reserve(rows.size());
             let extras = self.extraColumns(rows.columns);
-            for (row in rows) { out.push(self.hydrate(row, extras) as T); }
+            let at = Persister.positions(self.__map, rows.columns);       // (once, not per row)
+            for (row in rows) { out.push(self.hydrate(row, extras, at) as T); }
             if (self.__withs.size() > 0 && out.size() > 0) {
                 let models = new Array<Model>();
                 for (o in out) { models.push(o as Model); }
@@ -805,11 +806,11 @@ namespace orbit {
             for (c in cols) { if (self.__map.find(c) == null) { out.push(c); } }
             return out;
         }
-        private fn hydrate(row: Row, extras: Array<string>) -> any {
-            let obj = Persister.load(self.__map, row);
+        private fn hydrate(row: Row, extras: Array<string>, at: Array<int>) -> any {
+            let obj = Persister.load(self.__map, row, at);
             if (extras.size() > 0 && obj is Model) {
                 let m = obj as Model;
-                for (c in extras) { m.__extra.put(c, row.get(c)); }
+                for (c in extras) { m.__extra().put(c, row.get(c)); }
             }
             return obj;
         }

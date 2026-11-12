@@ -44,34 +44,54 @@ namespace orbit {
     // Saving, loading and deleting objects of a mapped class (what Model,
     // Repository and Query share).
     class Persister {
-        // A new object of the class with the row's columns in its fields.
-        static fn load(map: TableMap, row: Row) -> any {
+        // A new object of the class with the row's columns in its fields; `at` is
+        // where each field's column is in the row (Persister.positions), when known.
+        static fn load(map: TableMap, row: Row, at: Array<int> = null) -> any {
             let obj = map.info.create();
-            Persister.read(obj, map, row);
+            Persister.read(obj, map, row, at);
             if (obj is Model) { (obj as Model).__exists = true; }
             map.fire("retrieved", obj);
             return obj;
         }
-        // Copies the row's columns into `obj`'s fields (those the class maps).
-        static fn read(obj: any, map: TableMap, row: Row) {
+        // Where each of the class's fields is among `columns` (-1: not there), found
+        // once for a whole result instead of by name in every row.
+        static fn positions(map: TableMap, columns: Array<string>) -> Array<int> {
+            let at = new Array<int>();
             for (m in map.fields) {
-                if (!row.has(m.column)) { continue; }
-                let v = row.get(m.column);
+                let p = -1;
+                for (i, c in columns) { if (c == m.column) { p = i; break; } }
+                at.push(p);
+            }
+            return at;
+        }
+        // Copies the row's columns into `obj`'s fields (those the class maps).
+        static fn read(obj: any, map: TableMap, row: Row, at: Array<int> = null) {
+            let pos = at == null ? Persister.positions(map, row.columns()) : at;
+            let model: Model = obj is Model ? obj as Model : null;
+            let orig: Array<any> = model == null ? null : new Array<any>();
+            for (m in map.fields) {
+                let p = pos[m.index];
+                if (p < 0) {
+                    if (orig != null) { orig.push(m.field.get(obj)); }
+                    continue;
+                }
+                let v = row.at(p);
                 if (v != null) {
                     if (m.kind == "decimal" && !(v is Decimal)) { v = row.getDecimal(m.column); }
                     else if (m.kind == "json" && !(v is JsonValue)) { v = row.getJson(m.column); }
                     else if (m.kind == "datetime" && !(v is DateTime)) { v = row.getDateTime(m.column); }
                 }
                 m.field.set(obj, v);
+                if (orig != null) { orig.push(m.field.get(obj)); } // (the snapshot, as set: bools from 1/0 and so on)
             }
-            Persister.snapshot(obj, map);
+            if (model != null) { model.__orig = orig; }
         }
         // Remembers `obj`'s field values as its row has them (for isDirty and saves of the changes only).
         static fn snapshot(obj: any, map: TableMap) {
             if (!(obj is Model)) { return; }
-            let model = obj as Model;
-            model.__original.clear();
-            for (m in map.fields) { model.__original.put(m.field.name, m.field.get(obj)); }
+            let orig = new Array<any>();
+            for (m in map.fields) { orig.push(m.field.get(obj)); }
+            (obj as Model).__orig = orig;
         }
         // The fields whose values differ from the snapshot (all of them for an object that is not a Model).
         static fn dirty(obj: any, map: TableMap) -> Array<FieldMap> {
@@ -79,8 +99,8 @@ namespace orbit {
             let model: Model = obj is Model ? obj as Model : null;
             for (m in map.fields) {
                 if (m.isId) { continue; }
-                if (model == null || !model.__original.containsKey(m.field.name) ||
-                    !Persister.same(model.__original[m.field.name], m.field.get(obj))) { out.push(m); }
+                if (model == null || model.__orig == null ||
+                    !Persister.same(model.__orig[m.index], m.field.get(obj))) { out.push(m); }
             }
             return out;
         }
@@ -127,12 +147,12 @@ namespace orbit {
                 if (map.updatedAt != null) { map.updatedAt.field.set(obj, now); }
                 if (!quiet) { map.fire("creating", obj); if (model != null) { model.beforeCreate(); } }
                 Persister.insert(obj, map, db);
-                if (model != null) { model.__changes.clear(); }
+                if (model != null && model.__ch != null) { model.__ch.clear(); }
                 if (!quiet) { if (model != null) { model.afterCreate(); } map.fire("created", obj); }
             } else {
                 if (!quiet) { map.fire("updating", obj); if (model != null) { model.beforeUpdate(); } }
                 let changed = Persister.dirty(obj, map);
-                if (model != null) { model.__changes.clear(); }
+                if (model != null && model.__ch != null) { model.__ch.clear(); }
                 if (changed.size() > 0) {
                     if (map.updatedAt != null) {
                         map.updatedAt.field.set(obj, now);
@@ -141,7 +161,7 @@ namespace orbit {
                         if (!has) { changed.push(map.updatedAt); }
                     }
                     if (Persister.update(obj, map, db, changed) == 0 && map.id != null && !map.id.auto) { Persister.insert(obj, map, db); }
-                    if (model != null) { for (c in changed) { model.__changes.put(c.field.name, c.field.get(obj)); } }
+                    if (model != null) { for (c in changed) { model.__changes().put(c.field.name, c.field.get(obj)); } }
                 }
                 if (!quiet) { if (model != null) { model.afterUpdate(); } map.fire("updated", obj); }
             }
@@ -210,18 +230,20 @@ namespace orbit {
                 let name = m.field.name;
                 let hidden = m.hidden;
                 if (model0 != null) {
-                    if (model0.__show.contains(name)) { hidden = false; }
-                    if (model0.__hide.contains(name)) { hidden = true; }
+                    if (model0.__sh != null && model0.__sh.contains(name)) { hidden = false; }
+                    if (model0.__hd != null && model0.__hd.contains(name)) { hidden = true; }
                 }
                 if (!hidden) { out.put(name, m.field.get(obj)); }
             }
             if (obj is Model) {
                 let model = obj as Model;
-                for (k in model.__extra.keys()) { out.put(k, model.__extra[k]); }
-                for (k in model.__names.keys()) {
-                    let key = model.__names[k];
-                    let v = model.__loaded.getOr(key + "#models", model.__loaded.getOr(key, null));   // (a list as Array<Model>)
-                    out.put(k, Persister.plain(v));
+                if (model.__ex != null) { for (k in model.__ex.keys()) { out.put(k, model.__ex[k]); } }
+                if (model.__nm != null) {
+                    for (k in model.__nm.keys()) {
+                        let key = model.__nm[k];
+                        let v = model.__loaded().getOr(key + "#models", model.__loaded().getOr(key, null));   // (a list as Array<Model>)
+                        out.put(k, Persister.plain(v));
+                    }
                 }
             }
             return out;
@@ -269,15 +291,23 @@ namespace orbit {
     // on: User.find(1) is a User.
     class Model {
         // (Internals: loaded relations by key, their names, extra columns a query
-        // selected, and whether the row exists for a class without a numbered id.)
-        @Ignore public __loaded: HashMap<string, any> = new HashMap<string, any>()
-        @Ignore public __names: HashMap<string, string> = new HashMap<string, string>()
-        @Ignore public __extra: HashMap<string, any> = new HashMap<string, any>()
+        // selected, whether the row exists for a class without a numbered id, the
+        // field values the row has (by field position), and what the last save
+        // changed. The maps are made when first needed: most objects never need them.)
+        @Ignore public __ld: HashMap<string, any> = null
+        @Ignore public __nm: HashMap<string, string> = null
+        @Ignore public __ex: HashMap<string, any> = null
         @Ignore public __exists: bool = false
-        @Ignore public __original: HashMap<string, any> = new HashMap<string, any>()
-        @Ignore public __changes: HashMap<string, any> = new HashMap<string, any>()
-        @Ignore public __hide: Array<string> = new Array<string>()
-        @Ignore public __show: Array<string> = new Array<string>()
+        @Ignore public __orig: Array<any> = null
+        @Ignore public __ch: HashMap<string, any> = null
+        @Ignore public __hd: Array<string> = null
+        @Ignore public __sh: Array<string> = null
+        fn __loaded() -> HashMap<string, any> { if (self.__ld == null) { self.__ld = new HashMap<string, any>(); } return self.__ld; }
+        fn __names() -> HashMap<string, string> { if (self.__nm == null) { self.__nm = new HashMap<string, string>(); } return self.__nm; }
+        fn __extra() -> HashMap<string, any> { if (self.__ex == null) { self.__ex = new HashMap<string, any>(); } return self.__ex; }
+        fn __changes() -> HashMap<string, any> { if (self.__ch == null) { self.__ch = new HashMap<string, any>(); } return self.__ch; }
+        fn __hide() -> Array<string> { if (self.__hd == null) { self.__hd = new Array<string>(); } return self.__hd; }
+        fn __show() -> Array<string> { if (self.__sh == null) { self.__sh = new Array<string>(); } return self.__sh; }
 
         // ── queries (each starts a Query of this class) ──────────────────────────
         static fn query() -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))); }
@@ -411,10 +441,13 @@ namespace orbit {
             return out;
         }
         // A field's value as its row had it (null when not loaded or saved).
-        fn getOriginal(name: string) -> any { return self.__original.getOr(name, null); }
+        fn getOriginal(name: string) -> any {
+            let m = self.__map().find(name);
+            return m == null || self.__orig == null ? null : self.__orig[m.index];
+        }
         // What the last save changed, and whether it changed a field (any, with no name).
-        fn getChanges() -> HashMap<string, any> { return self.__changes; }
-        fn wasChanged(name: string = "") -> bool { return name == "" ? self.__changes.size() > 0 : self.__changes.containsKey(name); }
+        fn getChanges() -> HashMap<string, any> { return self.__changes(); }
+        fn wasChanged(name: string = "") -> bool { return name == "" ? self.__changes().size() > 0 : self.__changes().containsKey(name); }
         // Takes the current values as the row's (nothing is dirty after).
         fn syncOriginal() -> Self { Persister.snapshot(self, self.__map()); return self; }
         // Sets these fields (not @Guarded ones) and saves.
@@ -453,8 +486,8 @@ namespace orbit {
             let row = new Builder(map, map.table, self.__db()).withTrashed().whereKey(map.requireId().field.get(self)).rows();
             if (row.size() == 0) { throw new NotFound("the " + map.info.simpleName() + " is no longer in " + map.table); }
             Persister.read(self, map, row.get(0));
-            self.__loaded.clear();
-            self.__names.clear();
+            self.__loaded().clear();
+            self.__names().clear();
             return self;
         }
         // Adds `by` to a field, in the object and its row (decrement subtracts).
@@ -497,33 +530,33 @@ namespace orbit {
             let q = new Builder(map, map.table, self.__db()).withTrashed().whereKey(map.requireId().field.get(self)).withCount(relation);
             let rows = q.rows();
             let key = Naming.snake(relation) + "_count";
-            if (rows.size() > 0) { self.__extra.put(key, rows.get(0).get(key)); }
+            if (rows.size() > 0) { self.__extra().put(key, rows.get(0).get(key)); }
             return self;
         }
         // Saves it and every loaded related object (one level down, and theirs in turn).
         fn push() -> Self {
             self.save();
-            for (name in self.__names.keys()) {
-                let v = self.__loaded.getOr(self.__names[name] + "#models", self.__loaded.getOr(self.__names[name], null));
+            for (name in self.__names().keys()) {
+                let v = self.__loaded().getOr(self.__names()[name] + "#models", self.__loaded().getOr(self.__names()[name], null));
                 if (v is Model) { (v as Model).push(); }
                 else if (v is Array<Model>) { for (m in v as Array<Model>) { m.push(); } }
             }
             return self;
         }
         // Whether `relation` is loaded.
-        fn relationLoaded(relation: string) -> bool { return self.__names.containsKey(relation); }
+        fn relationLoaded(relation: string) -> bool { return self.__names().containsKey(relation); }
         // A count withCount added (`countOf("posts")` for posts_count), or 0.
-        fn countOf(relation: string) -> long { return Builder.toLong(self.__extra.getOr(Naming.snake(relation) + "_count", 0)); }
+        fn countOf(relation: string) -> long { return Builder.toLong(self.__extra().getOr(Naming.snake(relation) + "_count", 0)); }
         // A column the query selected beyond the fields (selectRaw, withCount, a pivot's columns).
-        fn extra(name: string) -> any { return self.__extra.getOr(name, null); }
+        fn extra(name: string) -> any { return self.__extra().getOr(name, null); }
         // A pivot column of a many-to-many link this object was read through (`pivot("level")`).
-        fn pivot(name: string) -> any { return self.__extra.getOr("pivot_" + name, null); }
+        fn pivot(name: string) -> any { return self.__extra().getOr("pivot_" + name, null); }
         // Its fields (not @Hidden), and its loaded relations.
         fn toMap() -> HashMap<string, any> { return Persister.toMap(self, self.__map()); }
         // Hides (or shows, though @Hidden) these fields in this object's toMap and toJson.
-        fn makeHidden(names: Array<string>) -> Self { for (n in names) { self.__hide.push(n); } return self; }
+        fn makeHidden(names: Array<string>) -> Self { for (n in names) { self.__hide().push(n); } return self; }
         fn makeVisible(names: Array<string>) -> Self {
-            for (n in names) { self.__show.push(n); self.__hide.remove(n); }
+            for (n in names) { self.__show().push(n); self.__hide().remove(n); }
             return self;
         }
         // Just these fields (by name), or all but these, as a map.
@@ -579,14 +612,14 @@ namespace orbit {
 
         // (Internals.)
         // Keeps a loaded list also as models, for toMap and toJson (an Array<Post> is not an Array<Model>).
-        fn __keepList(key: string, models: Array<Model>) { self.__loaded.put(key + "#models", models); }
+        fn __keepList(key: string, models: Array<Model>) { self.__loaded().put(key + "#models", models); }
         // Forgets a loaded relation (it changed): its values and the names it was loaded under.
         fn __forget(key: string) {
-            self.__loaded.remove(key);
-            self.__loaded.remove(key + "#models");
+            self.__loaded().remove(key);
+            self.__loaded().remove(key + "#models");
             let gone = new Array<string>();
-            for (n in self.__names.keys()) { if (self.__names[n] == key) { gone.push(n); } }
-            for (n in gone) { self.__names.remove(n); }
+            for (n in self.__names().keys()) { if (self.__names()[n] == key) { gone.push(n); } }
+            for (n in gone) { self.__names().remove(n); }
         }
         fn __map() -> TableMap { return TableMap.of(ClassInfo.of(self)); }
         fn __db() -> Connection { return DB.connection(self.__map().connection); }
@@ -598,11 +631,11 @@ namespace orbit {
             let n = now is long ? now as long : now is int ? (now as int) as long : 0;
             m.field.set(self, n + by);
             new Builder(map, map.table, self.__db()).withTrashed().whereKey(map.requireId().field.get(self)).increment(name, by);
-            self.__original.put(m.field.name, n + by);           // (the row has it now: not dirty)
+            if (self.__orig != null) { self.__orig[m.index] = n + by; }   // (the row has it now: not dirty)
             if (map.updatedAt != null) {
                 let stamp = DateTime.now();
                 map.updatedAt.field.set(self, stamp);
-                self.__original.put(map.updatedAt.field.name, stamp);
+                if (self.__orig != null) { self.__orig[map.updatedAt.index] = stamp; }
             }
             return self;
         }

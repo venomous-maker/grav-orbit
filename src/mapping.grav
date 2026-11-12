@@ -79,6 +79,8 @@ namespace orbit {
         // Left out of toMap and toJson (@Hidden); not set by fill and create (@Guarded, and a numbered id).
         public hidden: bool = false
         public guarded: bool = false
+        // Its place in TableMap.fields (a model's snapshot keeps values by it).
+        public index: int = 0
 
         constructor(field: FieldInfo, column: string, kind: string) {
             self.field = field;
@@ -146,6 +148,7 @@ namespace orbit {
                     if (m.auto) { m.guarded = true; }
                     self.id = m;
                 }
+                m.index = self.fields.size();
                 self.fields.push(m);
                 self.byName.put(f.name, m);
                 if (!self.byName.containsKey(column)) { self.byName.put(column, m); }

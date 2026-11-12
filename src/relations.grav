@@ -56,7 +56,7 @@ namespace orbit {
         abstract fn key() -> string
 
         fn db() -> Connection { return DB.connection(self.relatedMap == null ? self.parentMap.connection : self.relatedMap.connection); }
-        fn loaded() -> bool { return self.parent.__loaded.containsKey(self.key()); }
+        fn loaded() -> bool { return self.parent.__ld != null && self.parent.__ld.containsKey(self.key()); }
 
         // The relation `name` of `map`'s class (its method of that name, called on a blank object).
         // The objects of a typed list, as models.
@@ -86,7 +86,7 @@ namespace orbit {
             if (!(r is Relation)) { throw new ValueError(map.info.simpleName() + "." + first + "() is not a relation"); }
             let rel = r as Relation;
             rel.eager(models, rest);
-            for (x in models) { x.__names.put(first, rel.key()); }
+            for (x in models) { x.__names().put(first, rel.key()); }
         }
         // The distinct non-null values of `f` in `objs` (keys to look up with IN).
         static fn keysOf(objs: Array<Model>, f: FieldMap) -> Array<any> {
@@ -139,7 +139,7 @@ namespace orbit {
         fn with(relation: string) -> Query<T> { return self.query().with(relation); }
         // The related objects (loaded ones when with() loaded them).
         fn get() -> Array<T> {
-            if (self.loaded()) { return self.parent.__loaded[self.key()] as Array<T>; }
+            if (self.loaded()) { return self.parent.__loaded()[self.key()] as Array<T>; }
             return self.query().get();
         }
         fn count() -> long { return self.loaded() ? (self.get().size() as long) : self.query().count(); }
@@ -175,7 +175,7 @@ namespace orbit {
                 if (!groups.containsKey(k)) { groups.put(k, new Array<T>()); }
                 groups[k].push(kid);
             }
-            for (p in parents) { p.__keepList(self.key(), Relation.models::<T>(groups.getOr("${self.localKey.field.get(p)}", new Array<T>()))); p.__loaded.put(self.key(), groups.getOr("${self.localKey.field.get(p)}", new Array<T>())); }
+            for (p in parents) { p.__keepList(self.key(), Relation.models::<T>(groups.getOr("${self.localKey.field.get(p)}", new Array<T>()))); p.__loaded().put(self.key(), groups.getOr("${self.localKey.field.get(p)}", new Array<T>())); }
         }
     }
 
@@ -198,13 +198,13 @@ namespace orbit {
         }
         // The related object, or null.
         fn get() -> T {
-            if (self.loaded()) { return self.parent.__loaded[self.key()] as T; }
+            if (self.loaded()) { return self.parent.__loaded()[self.key()] as T; }
             return self.query().first();
         }
         fn save(child: T) -> T {
             self.foreignKey.field.set(child, self.localKey.field.get(self.parent));
             Persister.save(child, self.relatedMap, self.db());
-            self.parent.__loaded.put(self.key(), child);
+            self.parent.__loaded().put(self.key(), child);
             return child;
         }
         fn create(values: HashMap<string, any>) -> T {
@@ -226,7 +226,7 @@ namespace orbit {
                 let k = "${self.foreignKey.field.get(kid)}";
                 if (!byKey.containsKey(k)) { byKey.put(k, kid); }
             }
-            for (p in parents) { p.__loaded.put(self.key(), byKey.getOr("${self.localKey.field.get(p)}", null)); }
+            for (p in parents) { p.__loaded().put(self.key(), byKey.getOr("${self.localKey.field.get(p)}", null)); }
         }
     }
 
@@ -249,14 +249,14 @@ namespace orbit {
         }
         // The owner, or null (when the foreign key is null or names no row).
         fn get() -> T {
-            if (self.loaded()) { return self.parent.__loaded[self.key()] as T; }
+            if (self.loaded()) { return self.parent.__loaded()[self.key()] as T; }
             if (self.foreignKey.field.get(self.parent) == null) { return null; }
             return self.query().first();
         }
         // Sets the foreign key to `owner`'s key (save the object to keep it).
         fn associate(owner: T) -> Model {
             self.foreignKey.field.set(self.parent, owner == null ? null : self.ownerKey.field.get(owner));
-            self.parent.__loaded.put(self.key(), owner);
+            self.parent.__loaded().put(self.key(), owner);
             return self.parent;
         }
         fn dissociate() -> Model { return self.associate(null); }
@@ -276,7 +276,7 @@ namespace orbit {
             }
             for (p in parents) {
                 let v = self.foreignKey.field.get(p);
-                p.__loaded.put(self.key(), v == null ? null : byKey.getOr("${v}", null));
+                p.__loaded().put(self.key(), v == null ? null : byKey.getOr("${v}", null));
             }
         }
     }
@@ -396,7 +396,7 @@ namespace orbit {
         fn with(relation: string) -> Query<T> { return self.query().with(relation); }
         // The linked objects (loaded ones when with() loaded them).
         fn get() -> Array<T> {
-            if (self.loaded()) { return self.parent.__loaded[self.key()] as Array<T>; }
+            if (self.loaded()) { return self.parent.__loaded()[self.key()] as Array<T>; }
             return self.query().get();
         }
         fn count() -> long { return self.loaded() ? (self.get().size() as long) : self.query().count(); }
@@ -505,11 +505,11 @@ namespace orbit {
             if (nested != "") { q.with(nested); }
             let groups = new HashMap<string, Array<T>>();
             for (o in q.get()) {
-                let k = "${(o as Model).__extra.getOr("pivot_" + self.foreignPivotKey, null)}";
+                let k = "${(o as Model).__extra().getOr("pivot_" + self.foreignPivotKey, null)}";
                 if (!groups.containsKey(k)) { groups.put(k, new Array<T>()); }
                 groups[k].push(o);
             }
-            for (p in parents) { p.__keepList(self.key(), Relation.models::<T>(groups.getOr("${self.parentKey.field.get(p)}", new Array<T>()))); p.__loaded.put(self.key(), groups.getOr("${self.parentKey.field.get(p)}", new Array<T>())); }
+            for (p in parents) { p.__keepList(self.key(), Relation.models::<T>(groups.getOr("${self.parentKey.field.get(p)}", new Array<T>()))); p.__loaded().put(self.key(), groups.getOr("${self.parentKey.field.get(p)}", new Array<T>())); }
         }
 
         private fn joinPivot(q: Builder) {
@@ -561,7 +561,7 @@ namespace orbit {
         fn limit(n: long) -> Query<T> { return self.query().limit(n); }
         fn with(relation: string) -> Query<T> { return self.query().with(relation); }
         fn get() -> Array<T> {
-            if (self.loaded()) { return self.parent.__loaded[self.key()] as Array<T>; }
+            if (self.loaded()) { return self.parent.__loaded()[self.key()] as Array<T>; }
             return self.query().get();
         }
         fn first() -> T { return self.query().first(); }
@@ -588,7 +588,7 @@ namespace orbit {
             for (p in parents) {
                 let mine = groups.getOr("${self.localKey.field.get(p)}", new Array<T>());
                 p.__keepList(self.key(), Relation.models::<T>(mine));
-                p.__loaded.put(self.key(), mine);
+                p.__loaded().put(self.key(), mine);
             }
         }
         private fn joinThrough(q: Builder) {
@@ -608,15 +608,15 @@ namespace orbit {
         fn key() -> string { return "oneThrough:" + self.many.key(); }
         fn query() -> Query<T> { return self.many.query(); }
         fn get() -> T {
-            if (self.loaded()) { return self.parent.__loaded[self.key()] as T; }
+            if (self.loaded()) { return self.parent.__loaded()[self.key()] as T; }
             return self.many.query().first();
         }
         fn existence(outer: Builder) -> Builder { return self.many.existence(outer); }
         fn eager(parents: Array<Model>, nested: string) {
             self.many.eager(parents, nested);
             for (p in parents) {
-                let all = p.__loaded[self.many.key()] as Array<T>;
-                p.__loaded.put(self.key(), all.size() == 0 ? null : all[0]);
+                let all = p.__loaded()[self.many.key()] as Array<T>;
+                p.__loaded().put(self.key(), all.size() == 0 ? null : all[0]);
             }
         }
     }
@@ -641,7 +641,7 @@ namespace orbit {
             return q;
         }
         fn get() -> Array<T> {
-            if (self.loaded()) { return self.parent.__loaded[self.key()] as Array<T>; }
+            if (self.loaded()) { return self.parent.__loaded()[self.key()] as Array<T>; }
             return self.query().get();
         }
         fn count() -> long { return self.loaded() ? (self.get().size() as long) : self.query().count(); }
@@ -676,7 +676,7 @@ namespace orbit {
                 if (!groups.containsKey(k)) { groups.put(k, new Array<T>()); }
                 groups[k].push(kid);
             }
-            for (p in parents) { p.__keepList(self.key(), Relation.models::<T>(groups.getOr("${self.localKey.field.get(p)}", new Array<T>()))); p.__loaded.put(self.key(), groups.getOr("${self.localKey.field.get(p)}", new Array<T>())); }
+            for (p in parents) { p.__keepList(self.key(), Relation.models::<T>(groups.getOr("${self.localKey.field.get(p)}", new Array<T>()))); p.__loaded().put(self.key(), groups.getOr("${self.localKey.field.get(p)}", new Array<T>())); }
         }
     }
 
@@ -690,7 +690,7 @@ namespace orbit {
         fn key() -> string { return "morphOne:" + self.many.key(); }
         fn query() -> Query<T> { return self.many.query(); }
         fn get() -> T {
-            if (self.loaded()) { return self.parent.__loaded[self.key()] as T; }
+            if (self.loaded()) { return self.parent.__loaded()[self.key()] as T; }
             return self.many.query().first();
         }
         fn save(child: T) -> T { return self.many.save(child); }
@@ -699,8 +699,8 @@ namespace orbit {
         fn eager(parents: Array<Model>, nested: string) {
             self.many.eager(parents, nested);
             for (p in parents) {
-                let all = p.__loaded[self.many.key()] as Array<T>;
-                p.__loaded.put(self.key(), all.size() == 0 ? null : all[0]);
+                let all = p.__loaded()[self.many.key()] as Array<T>;
+                p.__loaded().put(self.key(), all.size() == 0 ? null : all[0]);
             }
         }
     }
@@ -721,7 +721,7 @@ namespace orbit {
         fn key() -> string { return "morphTo:" + self.name; }
         // The object it points to, or null.
         fn get() -> Model {
-            if (self.loaded()) { return self.parent.__loaded[self.key()] as Model; }
+            if (self.loaded()) { return self.parent.__loaded()[self.key()] as Model; }
             let kind = self.typeField.field.get(self.parent);
             let id = self.idField.field.get(self.parent);
             if (kind == null || id == null) { return null; }
@@ -738,7 +738,7 @@ namespace orbit {
                 self.idField.field.set(self.parent, map.requireId().field.get(owner));
                 self.typeField.field.set(self.parent, map.morphName);
             }
-            self.parent.__loaded.put(self.key(), owner);
+            self.parent.__loaded().put(self.key(), owner);
             return self.parent;
         }
         fn existence(outer: Builder) -> Builder {
@@ -748,7 +748,7 @@ namespace orbit {
             let byType = new HashMap<string, Array<Model>>();
             for (p in parents) {
                 let t = self.typeField.field.get(p);
-                if (t == null) { p.__loaded.put(self.key(), null); continue; }
+                if (t == null) { p.__loaded().put(self.key(), null); continue; }
                 let k = "${t}";
                 if (!byType.containsKey(k)) { byType.put(k, new Array<Model>()); }
                 byType[k].push(p);
@@ -761,7 +761,7 @@ namespace orbit {
                 if (nested != "") { q.with(nested); }
                 let byId = new HashMap<string, Model>();
                 for (o in q.get()) { byId.put("${map.id.field.get(o)}", o); }
-                for (p in group) { p.__loaded.put(self.key(), byId.getOr("${self.idField.field.get(p)}", null)); }
+                for (p in group) { p.__loaded().put(self.key(), byId.getOr("${self.idField.field.get(p)}", null)); }
             }
         }
         // The mapping of the class morph name `type` stands for.
