@@ -43,6 +43,8 @@ namespace orbit {
         public onDeleteAction: string = ""
         public onUpdateAction: string = ""
         public changing: bool = false
+        // enumeration's values.
+        public allowed: Array<string> = new Array<string>()
 
         constructor(name: string, kind: string) { self.name = Builder.ident(name); self.kind = kind; }
 
@@ -128,6 +130,33 @@ namespace orbit {
         fn dateTime(name: string) -> ColumnDef { return self.add(name, "dateTime"); }
         fn timestamp(name: string) -> ColumnDef { return self.add(name, "dateTime"); }
         fn time(name: string) -> ColumnDef { return self.add(name, "time"); }
+        fn timestampTz(name: string) -> ColumnDef { return self.add(name, "dateTime"); }
+        fn year(name: string) -> ColumnDef { return self.add(name, "year"); }
+        // ── more types ───────────────────────────────────────────────────────────
+        // One of `values` (MySQL's ENUM; a CHECK elsewhere).
+        fn enumeration(name: string, values: Array<string>) -> ColumnDef {
+            let c = self.add(name, "enum");
+            for (v in values) { c.allowed.push(v); }
+            return c;
+        }
+        fn mediumText(name: string) -> ColumnDef { return self.add(name, "mediumText"); }
+        fn ipAddress(name: string = "ip_address") -> ColumnDef { let c = self.add(name, "string"); c.length = 45; return c; }
+        fn macAddress(name: string = "mac_address") -> ColumnDef { let c = self.add(name, "string"); c.length = 17; return c; }
+        // remember_token, a nullable VARCHAR(100) (login "remember me" tokens).
+        fn rememberToken() -> ColumnDef { let c = self.add("remember_token", "string"); c.length = 100; return c.nullable(); }
+        fn unsignedSmallInteger(name: string) -> ColumnDef { return self.add(name, "smallInteger").unsigned(); }
+        fn unsignedTinyInteger(name: string) -> ColumnDef { return self.add(name, "tinyInteger").unsigned(); }
+        // A UUID column for a foreign key (then .constrained()).
+        fn foreignUuid(name: string) -> ColumnDef { return self.add(name, "uuid"); }
+        // <name>_id as a UUID and <name>_type, indexed together.
+        fn uuidMorphs(name: string) {
+            self.add(name + "_id", "uuid");
+            self.add(name + "_type", "string");
+            let cols = new Array<string>();
+            cols.push(name + "_type");
+            cols.push(name + "_id");
+            self.index(cols);
+        }
         // created_at and updated_at, both nullable (what Model fills in).
         fn timestamps() {
             self.add("created_at", "dateTime").nullable();
@@ -161,8 +190,24 @@ namespace orbit {
         fn dropColumn(name: string) { self.commands.push("dropColumn|" + Builder.ident(name)); }
         fn renameColumn(from: string, to: string) { self.commands.push("renameColumn|" + Builder.ident(from) + "|" + Builder.ident(to)); }
         fn dropIndex(name: string) { self.commands.push("dropIndex|" + Builder.ident(name)); }
+        fn dropColumns(names: Array<string>) { for (n in names) { self.dropColumn(n); } }
         fn dropTimestamps() { self.dropColumn("created_at"); self.dropColumn("updated_at"); }
         fn dropSoftDeletes() { self.dropColumn("deleted_at"); }
+        fn dropRememberToken() { self.dropColumn("remember_token"); }
+        // Drops the foreign key on `column` (as constrained() named it: <table>_<column>_foreign).
+        fn dropForeign(column: string) { self.commands.push("dropForeign|" + self.table + "_" + Builder.ident(column) + "_foreign"); }
+        // Drops the unique index on `columns` (<table>_<columns>_unique).
+        fn dropUnique(columns: Array<string>) {
+            let cols = new Array<string>();
+            for (c in columns) { cols.push(Builder.ident(c)); }
+            self.dropIndex(self.table + "_" + Str.join(cols, "_") + "_unique");
+        }
+        // Drops a polymorphic pair (<name>_type, <name>_id) and its index.
+        fn dropMorphs(name: string) {
+            self.dropIndex(self.table + "_" + name + "_type_" + name + "_id_index");
+            self.dropColumn(name + "_type");
+            self.dropColumn(name + "_id");
+        }
 
         // The SQL to create the table on `db`.
         fn createSql(db: Connection) -> Array<string> {
@@ -171,7 +216,7 @@ namespace orbit {
             let keys = new Array<string>();
             for (c in self.columns) {
                 parts.push(Schema.columnSql(c, d, db));
-                if (c.refTable != "") { keys.push(Schema.foreignSql(c, db)); }
+                if (c.refTable != "") { keys.push(Schema.foreignSql(c, db, self.table)); }
             }
             for (i, cols in self.indexCols) {
                 if (self.indexKind(i) == "primary") { parts.push("PRIMARY KEY (" + Schema.quoted(cols, db) + ")"); }
@@ -200,7 +245,7 @@ namespace orbit {
                 out.push("ALTER TABLE " + t + " ADD COLUMN " + Schema.columnSql(c, d, db));
                 if (c.refTable != "") {
                     if (d == "sqlite") { throw new StateError("SQLite cannot add a foreign key to an existing table"); }
-                    out.push("ALTER TABLE " + t + " ADD " + Schema.foreignSql(c, db));
+                    out.push("ALTER TABLE " + t + " ADD " + Schema.foreignSql(c, db, self.table));
                 }
             }
             for (cmd in self.commands) {
@@ -208,6 +253,13 @@ namespace orbit {
                 if (p[0] == "dropColumn") { out.push("ALTER TABLE " + t + " DROP COLUMN " + db.quote(p[1])); }
                 else if (p[0] == "renameColumn") { out.push("ALTER TABLE " + t + " RENAME COLUMN " + db.quote(p[1]) + " TO " + db.quote(p[2])); }
                 else if (p[0] == "dropIndex") { out.push(d == "mysql" ? "DROP INDEX " + db.quote(p[1]) + " ON " + t : "DROP INDEX " + db.quote(p[1])); }
+                else if (p[0] == "dropForeign") {
+                    if (d == "sqlite") { throw new StateError("SQLite cannot drop a foreign key from an existing table"); }
+                    out.push("ALTER TABLE " + t + (d == "mysql" ? " DROP FOREIGN KEY " : " DROP CONSTRAINT ") + db.quote(p[1]));
+                }
+            }
+            for (i, cols in self.indexCols) {
+                if (self.indexKind(i) == "primary") { throw new StateError("a primary key is set when the table is created (Schema.create), not in Schema.table"); }
             }
             for (s in self.indexSql(db)) { out.push(s); }
             return out;
@@ -253,8 +305,10 @@ namespace orbit {
             f(b);
             for (s in b.createSql(db)) { db.exec(s); }
         }
-        // Changes table `table`: new columns, and the changes the Blueprint lists.
+        // Changes table `table`: new columns, and the changes the Blueprint lists
+        // (alter is the same).
         static fn table(table: string, f: fn(Blueprint)) { Schema.tableOn(DB.connection(), table, f); }
+        static fn alter(table: string, f: fn(Blueprint)) { Schema.tableOn(DB.connection(), table, f); }
         static fn tableOn(db: Connection, table: string, f: fn(Blueprint)) {
             let b = new Blueprint(table);
             f(b);
@@ -279,6 +333,50 @@ namespace orbit {
         static fn hasColumn(table: string, column: string) -> bool {
             for (c in Schema.columns(table)) { if (c == column) { return true; } }
             return false;
+        }
+        // Whether `table` has every one of `columns`.
+        static fn hasColumns(table: string, columns: Array<string>) -> bool {
+            let have = Schema.columns(table);
+            for (c in columns) { if (!have.contains(c)) { return false; } }
+            return true;
+        }
+        static fn dropColumns(table: string, columns: Array<string>) { Schema.table(table, fn(t: Blueprint) { t.dropColumns(columns) }); }
+        // The tables of the database (its current schema).
+        static fn getTables() -> Array<string> {
+            let db = DB.connection();
+            let d = db.driver();
+            let sql = d == "sqlite" ? "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                    : d == "mysql" ? "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE' ORDER BY table_name"
+                    : "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' ORDER BY table_name";
+            let out = new Array<string>();
+            for (row in db.query(sql)) { out.push(row.getString(row.columns()[0])); }
+            return out;
+        }
+        // Drops every table of the database (foreign keys aside).
+        static fn dropAllTables() {
+            let db = DB.connection();
+            let tables = Schema.getTables();
+            Schema.withoutForeignKeyConstraints(fn() {
+                for (t in tables) { db.exec("DROP TABLE IF EXISTS " + db.quote(t) + (db.driver() == "postgres" ? " CASCADE" : "")); }
+            });
+        }
+        // Runs `body` with foreign-key checks off (PostgreSQL: deferred to the end of the transaction).
+        static fn withoutForeignKeyConstraints(body: fn()) {
+            let db = DB.connection();
+            // (SQLite: put the setting back as it was; it starts off.)
+            let wasOn = db.driver() != "sqlite" || Builder.toLong(db.queryValue("PRAGMA foreign_keys")) == 1;
+            Schema.disableForeignKeyConstraints();
+            try { body(); } finally { if (wasOn) { Schema.enableForeignKeyConstraints(); } }
+        }
+        static fn disableForeignKeyConstraints() {
+            let db = DB.connection();
+            let d = db.driver();
+            db.exec(d == "sqlite" ? "PRAGMA foreign_keys = OFF" : d == "mysql" ? "SET FOREIGN_KEY_CHECKS = 0" : "SET CONSTRAINTS ALL DEFERRED");
+        }
+        static fn enableForeignKeyConstraints() {
+            let db = DB.connection();
+            let d = db.driver();
+            db.exec(d == "sqlite" ? "PRAGMA foreign_keys = ON" : d == "mysql" ? "SET FOREIGN_KEY_CHECKS = 1" : "SET CONSTRAINTS ALL IMMEDIATE");
         }
         // The column names of `table`, in order.
         static fn columns(table: string) -> Array<string> {
@@ -318,6 +416,9 @@ namespace orbit {
             if (c.hasDefault) { s = s + " DEFAULT " + (d == "sqlite" && c.defaultSql == "TRUE" ? "1" : d == "sqlite" && c.defaultSql == "FALSE" ? "0" : c.defaultSql); }
             if (c.isUnique) { s = s + " UNIQUE"; }
             if (c.isPrimary) { s = s + " PRIMARY KEY"; }
+            if (c.kind == "enum" && d != "mysql" && c.allowed.size() > 0) {
+                s = s + " CHECK (" + db.quote(c.name) + " IN (" + Schema.values(c) + "))";
+            }
             return s;
         }
         static fn typeSql(c: ColumnDef, d: string) -> string {
@@ -341,6 +442,9 @@ namespace orbit {
                 case "char": return "CHAR(${c.length > 0 ? c.length : 255})"
                 case "text": return "TEXT"
                 case "longText": return my ? "LONGTEXT" : "TEXT"
+                case "mediumText": return my ? "MEDIUMTEXT" : "TEXT"
+                case "year": return my ? "YEAR" : lite ? "INTEGER" : "SMALLINT"
+                case "enum": return my ? "ENUM(" + Schema.values(c) + ")" : "VARCHAR(255)"
                 case "json": return pg ? "JSONB" : "JSON"
                 case "binary": return pg ? "BYTEA" : my ? "LONGBLOB" : "BLOB"
                 case "date": return "DATE"
@@ -350,8 +454,9 @@ namespace orbit {
             }
             return "TEXT";
         }
-        static fn foreignSql(c: ColumnDef, db: Connection) -> string {
-            let s = "FOREIGN KEY (" + db.quote(c.name) + ") REFERENCES " + db.quote(c.refTable) + " (" + db.quote(c.refColumn) + ")";
+        static fn foreignSql(c: ColumnDef, db: Connection, table: string) -> string {
+            let s = "CONSTRAINT " + db.quote(table + "_" + c.name + "_foreign") + " FOREIGN KEY (" + db.quote(c.name) + ") REFERENCES " +
+                    db.quote(c.refTable) + " (" + db.quote(c.refColumn) + ")";
             if (c.onDeleteAction != "") { s = s + " ON DELETE " + c.onDeleteAction; }
             if (c.onUpdateAction != "") { s = s + " ON UPDATE " + c.onUpdateAction; }
             return s;
@@ -360,6 +465,12 @@ namespace orbit {
             let q = new Array<string>();
             for (c in cols) { q.push(db.quote(c)); }
             return Str.join(q, ", ");
+        }
+        // An enumeration's values as SQL literals, comma-separated.
+        static fn values(c: ColumnDef) -> string {
+            let vals = new Array<string>();
+            for (v in c.allowed) { vals.push(Schema.literal(v)); }
+            return Str.join(vals, ", ");
         }
         // A value as an SQL literal for DEFAULT.
         static fn literal(v: any) -> string {
