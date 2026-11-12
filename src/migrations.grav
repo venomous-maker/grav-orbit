@@ -47,7 +47,7 @@ namespace orbit {
                 let name = m.name();
                 if (done.containsKey(name)) { continue; }
                 db.transaction(fn() {
-                    m.up();
+                    self.using(fn() { m.up() });
                     let a = new Array<any>();
                     a.push(name);
                     a.push(batch);
@@ -115,13 +115,20 @@ namespace orbit {
             let v = db.queryValue("SELECT MAX(" + db.quote("batch") + ") FROM " + db.quote(self.table));
             return v == null ? 0 : v is long ? v as long : Integer.parseOr("${v}", 0);
         }
+        // Runs `body` with the Migrator's connection (on) as the default, for the migrations' Schema calls.
+        private fn using(body: fn()) {
+            if (self.db == null) { body(); return; }
+            let before: Connection = DB.hasConnection() ? DB.connection() : null;
+            DB.connect(self.db);
+            try { body(); } finally { if (before != null) { DB.connect(before); } else { DB.disconnect(); } }
+        }
         private fn undo(db: Connection, name: string) {
             let found: Migration = null;
             for (m in self.list) { if (m.name() == name) { found = m; } }
             if (found == null) { throw new StateError("migration '" + name + "' was run but is not in this Migrator"); }
             let m = found;
             db.transaction(fn() {
-                m.down();
+                self.using(fn() { m.down() });
                 let a = new Array<any>();
                 a.push(name);
                 db.execute("DELETE FROM " + db.quote(self.table) + " WHERE " + db.quote("migration") + " = ?", a);
