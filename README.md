@@ -726,16 +726,21 @@ in: both when it is inserted (`createdAt` only when it is null), and
 `increment` set `updatedAt` too, and `upsert` and `insertOrIgnore` fill both.
 A model without such fields has no timestamps; `@NoTimestamps` turns them off
 for one that has them, and `@Timestamps("created", "updated")` names other
-fields.
+fields. `implements HasTimestamps` gives a model both fields.
 
 ### Soft deletes
 
 ```grav
-@SoftDeletes
-class Post extends Model {
+class Post extends Model implements SoftDeletes {   // brings deletedAt and @SoftDeletes
     public id: long = 0
     public title: string = ""
-    public deletedAt: DateTime? = null      // @SoftDeletes("removedAt") for another field
+}
+
+// or, with the field written out (and named as you like):
+@SoftDeletes("removedAt")
+class Draft extends Model {
+    public id: long = 0
+    public removedAt: DateTime? = null
 }
 
 post.delete()                       // sets deletedAt; the row stays
@@ -894,6 +899,49 @@ whether one is.
   `@Timestamps("created", "updated")` names the fields.
 - `Uuids`: `@Uuids`, or `@Uuids("field")`: a new row gets a random UUID (v4)
   in that string field (`uuid` by default) when it is empty.
+
+Their classes are `SoftDeletesBehavior`, `TimestampsBehavior` and
+`UuidsBehavior`, for extending.
+
+### Traits: a behavior with its fields
+
+A behavior's decorator says what to do; the fields it works on must still be
+written in each model. A Grav `trait` carries both, so a model takes a behavior
+in one word. Orbit has three:
+
+| Trait | Gives the model |
+|-------|-----------------|
+| `SoftDeletes` | `deletedAt: DateTime?` and `@SoftDeletes` |
+| `HasTimestamps` | `createdAt: DateTime?` and `updatedAt: DateTime?` |
+| `HasUuids` | `uuid: string` and `@Uuids` |
+
+```grav
+class Post extends Model implements SoftDeletes, HasTimestamps, HasUuids {
+    public id: long = 0
+    public title: string = ""
+}
+```
+
+Write your own the same way: a trait that wears your behavior's decorator and
+declares the fields the behavior needs. A field the model declares itself wins
+over the trait's, and a subclass gets the trait's members from its base.
+
+```grav
+@Sluggable("title")
+trait HasSlug {
+    public slug: string = ""
+}
+
+class Article extends Model implements HasSlug {
+    public id: long = 0
+    public title: string = ""
+}
+```
+
+A trait's fields, helpers and decorators are copied into the model when it is
+compiled, so reflection, mapping, mass assignment and every behavior see them
+as the model's own. Traits with fields need a Grav compiler with trait state
+(November 2026 or later).
 
 ## Repository: classes that do not extend Model
 
