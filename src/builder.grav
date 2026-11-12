@@ -42,6 +42,9 @@ namespace orbit {
         private havingArgs: Array<any> = new Array<any>()
         private orders: Array<string> = new Array<string>()
         private lim: long = -1
+        // chunkById's cursor: `column > value` after the other conditions.
+        private cursorCol: string = ""
+        private cursorVal: any = null
         private off: long = -1
         private lockRows: bool = false
         public __withs: Array<string> = new Array<string>()
@@ -117,6 +120,8 @@ namespace orbit {
         fn orWhereRaw(sql: string, args: Array<any> = new Array<any>()) -> Self { return self.condArgs(" OR ", "(" + sql + ")", args); }
         // Applies `f` when `condition` holds (a filter that is optional).
         fn when(condition: bool, f: fn(Builder)) -> Self { if (condition) { f(self); } return self; }
+        // Applies `f` unless `condition` holds.
+        fn unless(condition: bool, f: fn(Builder)) -> Self { if (!condition) { f(self); } return self; }
         // Applies `f` (a scope kept in a function).
         fn tap(f: fn(Builder)) -> Self { f(self); return self; }
 
@@ -131,6 +136,33 @@ namespace orbit {
         fn orWhereHas(relation: string, f: fn(Builder)) -> Self { return self.relCond(" OR ", relation, f, ">=", 1, false); }
         fn whereDoesntHave(relation: string, f: fn(Builder)) -> Self { return self.relCond(" AND ", relation, f, ">=", 1, true); }
         fn orWhereDoesntHave(relation: string, f: fn(Builder)) -> Self { return self.relCond(" OR ", relation, f, ">=", 1, true); }
+        // Rows with a `relation` whose `name op value` holds: whereHas with one condition.
+        fn whereRelation(relation: string, name: string, op: string, value: any) -> Self {
+            return self.whereHas(relation, fn(q: Builder) { q.where(name, op, value) });
+        }
+        fn orWhereRelation(relation: string, name: string, op: string, value: any) -> Self {
+            return self.orWhereHas(relation, fn(q: Builder) { q.where(name, op, value) });
+        }
+        // Adds `<relation>_sum_<field>` (snake_case) to each row, and the like for
+        // avg, min and max; withExists adds `<relation>_exists`. Read with extra(...).
+        fn withSum(relation: string, name: string) -> Self { return self.withAggregate(relation, "SUM", name, "sum"); }
+        fn withAvg(relation: string, name: string) -> Self { return self.withAggregate(relation, "AVG", name, "avg"); }
+        fn withMin(relation: string, name: string) -> Self { return self.withAggregate(relation, "MIN", name, "min"); }
+        fn withMax(relation: string, name: string) -> Self { return self.withAggregate(relation, "MAX", name, "max"); }
+        fn withExists(relation: string) -> Self {
+            let inner = self.relationExistence(relation);
+            let test = "EXISTS (" + inner.__subSql("1") + ")";
+            self.extraSelects.push("CASE WHEN " + test + " THEN 1 ELSE 0 END AS " + self.q(Naming.snake(relation) + "_exists"));   // (1 or 0 on every database)
+            for (a in inner.__bindings()) { self.selectArgs.push(a); }
+            return self;
+        }
+        private fn withAggregate(relation: string, agg: string, name: string, word: string) -> Self {
+            let inner = self.relationExistence(relation);
+            self.extraSelects.push("(" + inner.__subSql(agg + "(" + inner.col(name) + ")") + ") AS " +
+                                   self.q(Naming.snake(relation) + "_" + word + "_" + Naming.snake(name)));
+            for (a in inner.__bindings()) { self.selectArgs.push(a); }
+            return self;
+        }
         // Loads `relation` (one query for all the rows; "posts.comments" loads both) with the results.
         fn with(relation: string) -> Self { self.__withs.push(relation); return self; }
         fn with(relations: Array<string>) -> Self { for (r in relations) { self.__withs.push(r); } return self; }
@@ -325,6 +357,67 @@ namespace orbit {
             for (x in self.whereArgs()) { a.push(x); }
             return db.execute("UPDATE " + db.quote(self.__table) + " SET " + Str.join(sets, ", ") + self.whereSql(true), a);
         }
+        // Inserts rows (field or column names), or, where one with the same `uniqueBy`
+        // columns exists, updates its `update` columns; the rows written. One
+        // statement per row, batched (ON CONFLICT, or MySQL's ON DUPLICATE KEY).
+        fn upsert(rows: Array<HashMap<string, any>>, uniqueBy: Array<string>, update: Array<string>) -> long {
+            if (rows.size() == 0) { return 0; }
+            let db = self.conn();
+            let d = db.driver();
+            let keys = self.withStamps(rows);
+            let cols = new Array<string>();
+            let marks = new Array<string>();
+            for (k in keys) { cols.push(db.quote(self.column(k))); marks.push("?"); }
+            let sets = new Array<string>();
+            let ups = new Array<string>();
+            for (u in update) { ups.push(u); }
+            if (self.__map != null && self.__map.updatedAt != null && !ups.contains(self.__map.updatedAt.field.name)) { ups.push(self.__map.updatedAt.field.name); }
+            for (u in ups) {
+                let c = db.quote(self.column(u));
+                sets.push(d == "mysql" ? c + " = VALUES(" + c + ")" : c + " = excluded." + c);
+            }
+            let target = new Array<string>();
+            for (u in uniqueBy) { target.push(db.quote(self.column(u))); }
+            let sql = "INSERT INTO " + db.quote(self.__table) + " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")";
+            if (d == "mysql") { sql = sql + (sets.size() > 0 ? " ON DUPLICATE KEY UPDATE " + Str.join(sets, ", ") : ""); }
+            else { sql = sql + " ON CONFLICT (" + Str.join(target, ", ") + ")" + (sets.size() > 0 ? " DO UPDATE SET " + Str.join(sets, ", ") : " DO NOTHING"); }
+            return db.executeMany(sql, self.rowArgs(rows, keys));
+        }
+        // Inserts rows, skipping those a unique key already has; the rows inserted.
+        fn insertOrIgnore(rows: Array<HashMap<string, any>>) -> long {
+            if (rows.size() == 0) { return 0; }
+            let db = self.conn();
+            let d = db.driver();
+            let keys = self.withStamps(rows);
+            let cols = new Array<string>();
+            let marks = new Array<string>();
+            for (k in keys) { cols.push(db.quote(self.column(k))); marks.push("?"); }
+            let head = d == "sqlite" ? "INSERT OR IGNORE INTO " : d == "mysql" ? "INSERT IGNORE INTO " : "INSERT INTO ";
+            let sql = head + db.quote(self.__table) + " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")" +
+                      (d == "postgres" ? " ON CONFLICT DO NOTHING" : "");
+            return db.executeMany(sql, self.rowArgs(rows, keys));
+        }
+        // The rows' names (the first row's), with a model's createdAt and updatedAt added when missing.
+        private fn withStamps(rows: Array<HashMap<string, any>>) -> Array<string> {
+            let keys = rows[0].keys();
+            if (self.__map == null) { return keys; }
+            let now = DateTime.now();
+            for (m in [self.__map.createdAt, self.__map.updatedAt]) {
+                if (m == null || keys.contains(m.field.name)) { continue; }
+                keys.push(m.field.name);
+                for (r in rows) { if (!r.containsKey(m.field.name)) { r.put(m.field.name, now); } }
+            }
+            return keys;
+        }
+        private fn rowArgs(rows: Array<HashMap<string, any>>, keys: Array<string>) -> Array<Array<any>> {
+            let all = new Array<Array<any>>();
+            for (r in rows) {
+                let a = new Array<any>();
+                for (k in keys) { a.push(r.getOr(k, null)); }
+                all.push(a);
+            }
+            return all;
+        }
         // Adds `by` to a column of the matches (subtracts, for decrement); the rows changed.
         fn increment(name: string, by: long = 1) -> long { return self.bump(name, by); }
         fn decrement(name: string, by: long = 1) -> long { return self.bump(name, 0 - by); }
@@ -340,8 +433,7 @@ namespace orbit {
         fn __bindings() -> Array<any> {
             let all = new Array<any>();
             for (a in self.selectArgs) { all.push(a); }
-            for (a in self.args) { all.push(a); }
-            for (sa in self.scopeArgs) { for (a in sa) { all.push(a); } }
+            for (a in self.whereArgs()) { all.push(a); }
             for (a in self.havingArgs) { all.push(a); }
             return all;
         }
@@ -387,8 +479,12 @@ namespace orbit {
             let all = new Array<any>();
             for (a in self.args) { all.push(a); }
             for (sa in self.scopeArgs) { for (a in sa) { all.push(a); } }
+            if (self.cursorCol != "" && self.cursorVal != null) { all.push(self.cursorVal); }
             return all;
         }
+        // The limit (-1 for none), and chunkById's cursor.
+        fn __getLimit() -> long { return self.lim; }
+        fn __cursor(column: string, value: any) { self.cursorCol = column; self.cursorVal = value; }
         // Adds an already-built condition (relations use it).
         fn __addCond(join: string, sql: string, values: Array<any>) -> Self { return self.condArgs(join, sql, values); }
         // A builder over `map`'s table under alias `alias`, nested one level deeper.
@@ -436,6 +532,10 @@ namespace orbit {
             }
             let body = parts.toString();
             for (sq in self.scopeSqls) { if (sq != "") { body = body == "" ? sq : "(" + body + ") AND " + sq; } }
+            if (self.cursorCol != "" && self.cursorVal != null) {
+                let c = self.cursorCol + " > ?";
+                body = body == "" ? c : "(" + body + ") AND " + c;
+            }
             if (scoped && self.__map != null && self.__map.softDelete != null && self.__trashed != 1) {
                 let sd = self.q(self.__alias) + "." + self.q(self.__map.softDelete.column) + (self.__trashed == 2 ? " IS NOT NULL" : " IS NULL");
                 body = body == "" ? sd : "(" + body + ") AND " + sd;
@@ -592,10 +692,10 @@ namespace orbit {
         }
         // The first match, or null.
         fn first() -> T {
-            let keep = self.__limit();
+            let keep = self.__getLimit();
             self.limit(1);
             let all = self.get();
-            self.__restoreLimit(keep);
+            self.limit(keep);
             return all.size() == 0 ? null : all[0];
         }
         // The first match; NotFound when there is none.
@@ -606,13 +706,36 @@ namespace orbit {
         }
         // The one match: NotFound for none, StateError for more than one.
         fn sole() -> T {
-            let keep = self.__limit();
+            let keep = self.__getLimit();
             self.limit(2);
             let all = self.get();
-            self.__restoreLimit(keep);
+            self.limit(keep);
             if (all.size() == 0) { throw new NotFound("no " + self.__map.info.simpleName() + " matches"); }
             if (all.size() > 1) { throw new StateError("more than one " + self.__map.info.simpleName() + " matches"); }
             return all[0];
+        }
+        // The first match of one more condition.
+        fn firstWhere(name: string, op: string, value: any) -> T { return self.where(name, op, value).first(); }
+        fn firstWhere(name: string, value: any) -> T { return self.where(name, value).first(); }
+        // The first match, or what `f` gives when there is none.
+        fn firstOr(f: fn() -> T) -> T { let one = self.first(); return one != null ? one : f(); }
+        // The match with id `id`, or a new (unsaved) object.
+        fn findOrNew(id: any) -> T {
+            let one = self.whereKey(id).first();
+            return one != null ? one : self.__map.info.create() as T;
+        }
+        // Each match in turn, `size` at a time, paged by id (rows changed meanwhile are not skipped or repeated).
+        fn chunkById(size: int, f: fn(Array<T>)) {
+            let id = self.__map.requireId();
+            self.reorder().orderBy(id.field.name).limit(size as long);
+            self.__cursor(self.col(id.field.name), null);
+            while (true) {
+                let part = self.get();
+                if (part.size() == 0) { return; }
+                f(part);
+                if (part.size() < size) { return; }
+                self.__cursor(self.col(id.field.name), id.field.get(part[part.size() - 1]));
+            }
         }
         // The match with id `id`, or null; with ids, those that exist.
         fn find(id: any) -> T { return self.whereKey(id).first(); }
@@ -665,8 +788,6 @@ namespace orbit {
             return found;
         }
 
-        fn __limit() -> long { return -2; }
-        fn __restoreLimit(keep: long) { self.limit(-1); }
         private fn matching(attrs: HashMap<string, any>) -> Query<T> {
             let q = new Query<T>(self.__map);
             q.__db = self.__db;
@@ -675,8 +796,8 @@ namespace orbit {
         }
         private fn make(attrs: HashMap<string, any>, values: HashMap<string, any>) -> T {
             let obj = self.__map.info.create() as T;
-            Persister.fill(obj, self.__map, attrs, false);
-            Persister.fill(obj, self.__map, values, false);
+            Persister.fill(obj, self.__map, attrs, true);       // (mass assignment: @Guarded fields stay as they are)
+            Persister.fill(obj, self.__map, values, true);
             return obj;
         }
         private fn extraColumns(cols: Array<string>) -> Array<string> {
