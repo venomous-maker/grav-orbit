@@ -7,7 +7,7 @@ import "../src/orbit.grav"
 use db.*
 use orbit.*
 
-class User extends Model {
+class User extends Model implements HasTimestamps {
     public id: long = 0
     public name: string = ""
     @Column("email", length: 190, unique: true)
@@ -17,8 +17,6 @@ class User extends Model {
     public balance: Decimal = Decimal.of(0)
     @Hidden public secret: string = ""
     @Guarded public role: string = "member"
-    public createdAt: DateTime? = null
-    public updatedAt: DateTime? = null
 
     fn posts() -> HasMany<Post> { return self.hasMany() }
     fn profile() -> HasOne<Profile> { return self.hasOne() }
@@ -27,14 +25,12 @@ class User extends Model {
     fn seniorRoles() -> BelongsToMany<Role> { return self.belongsToMany::<Role>().withPivot(["level"]).wherePivot("level", ">=", 3) }
 }
 
-@SoftDeletes
-class Post extends Model {
+class Post extends Model implements SoftDeletes {
     public id: long = 0
     public userId: long = 0
     public title: string = ""
     public published: bool = false
     public views: int = 0
-    public deletedAt: DateTime? = null
 
     fn author() -> BelongsTo<User> { return self.belongsTo("user_id") }
     fn comments() -> MorphMany<Comment> { return self.morphMany("commentable") }
@@ -344,11 +340,10 @@ class Content extends Model {
     public createdAt: DateTime? = null
     public updatedAt: DateTime? = null
 }
-@Sluggable("title") @Published @Uuids
+@Sluggable("title") @Published
 @Table("articles")
-class Article extends Content {
+class Article extends Content implements HasUuids {
     public slug: string = ""
-    public uuid: string = ""
     public published: bool = false
 }
 
