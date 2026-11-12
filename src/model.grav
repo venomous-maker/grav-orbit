@@ -64,6 +64,34 @@ namespace orbit {
                 }
                 m.field.set(obj, v);
             }
+            Persister.snapshot(obj, map);
+        }
+        // Remembers `obj`'s field values as its row has them (for isDirty and saves of the changes only).
+        static fn snapshot(obj: any, map: TableMap) {
+            if (!(obj is Model)) { return; }
+            let model = obj as Model;
+            model.__original.clear();
+            for (m in map.fields) { model.__original.put(m.field.name, m.field.get(obj)); }
+        }
+        // The fields whose values differ from the snapshot (all of them for an object that is not a Model).
+        static fn dirty(obj: any, map: TableMap) -> Array<FieldMap> {
+            let out = new Array<FieldMap>();
+            let model: Model = obj is Model ? obj as Model : null;
+            for (m in map.fields) {
+                if (m.isId) { continue; }
+                if (model == null || !model.__original.containsKey(m.field.name) ||
+                    !Persister.same(model.__original[m.field.name], m.field.get(obj))) { out.push(m); }
+            }
+            return out;
+        }
+        // Whether two field values are the same (objects such as DateTime and Decimal by their text).
+        static fn same(a: any, b: any) -> bool {
+            if (a == null || b == null) { return a == null && b == null; }
+            if (Object.equals(a, b)) { return true; }
+            if (a is JsonValue && b is JsonValue) { return (a as JsonValue).toJson() == (b as JsonValue).toJson(); }
+            if (a is Bytes && b is Bytes) { return (a as Bytes).toHex() == (b as Bytes).toHex(); }
+            if (ClassInfo.of(a) != null && ClassInfo.of(a) == ClassInfo.of(b)) { return "${a}" == "${b}"; }
+            return false;
         }
         // Sets fields from `values` (field names); with `mass`, @Guarded fields and a
         // numbered id are left out, as from user input.
@@ -88,26 +116,37 @@ namespace orbit {
         }
         // Inserts `obj` (filling in its id) or updates its row; createdAt and
         // updatedAt are set when the class has them.
-        static fn save(obj: any, map: TableMap, db: Connection) {
+        // A saved Model's changes go out alone (none: no UPDATE at all); `quiet`
+        // runs no hooks (saveQuietly).
+        static fn save(obj: any, map: TableMap, db: Connection, quiet: bool = false) {
             let now = DateTime.now();
-            map.fire("saving", obj);
+            let model: Model = obj is Model ? obj as Model : null;
+            if (!quiet) { map.fire("saving", obj); if (model != null) { model.beforeSave(); } }
             if (Persister.isNew(obj, map)) {
                 if (map.createdAt != null && map.createdAt.field.get(obj) == null) { map.createdAt.field.set(obj, now); }
                 if (map.updatedAt != null) { map.updatedAt.field.set(obj, now); }
-                map.fire("creating", obj);
-                if (obj is Model) { (obj as Model).beforeCreate(); }
+                if (!quiet) { map.fire("creating", obj); if (model != null) { model.beforeCreate(); } }
                 Persister.insert(obj, map, db);
-                if (obj is Model) { (obj as Model).afterCreate(); }
-                map.fire("created", obj);
+                if (model != null) { model.__changes.clear(); }
+                if (!quiet) { if (model != null) { model.afterCreate(); } map.fire("created", obj); }
             } else {
-                if (map.updatedAt != null) { map.updatedAt.field.set(obj, now); }
-                map.fire("updating", obj);
-                if (obj is Model) { (obj as Model).beforeUpdate(); }
-                if (Persister.update(obj, map, db) == 0 && map.id != null && !map.id.auto) { Persister.insert(obj, map, db); }
-                if (obj is Model) { (obj as Model).afterUpdate(); }
-                map.fire("updated", obj);
+                if (!quiet) { map.fire("updating", obj); if (model != null) { model.beforeUpdate(); } }
+                let changed = Persister.dirty(obj, map);
+                if (model != null) { model.__changes.clear(); }
+                if (changed.size() > 0) {
+                    if (map.updatedAt != null) {
+                        map.updatedAt.field.set(obj, now);
+                        let has = false;
+                        for (c in changed) { if (c == map.updatedAt) { has = true; } }
+                        if (!has) { changed.push(map.updatedAt); }
+                    }
+                    if (Persister.update(obj, map, db, changed) == 0 && map.id != null && !map.id.auto) { Persister.insert(obj, map, db); }
+                    if (model != null) { for (c in changed) { model.__changes.put(c.field.name, c.field.get(obj)); } }
+                }
+                if (!quiet) { if (model != null) { model.afterUpdate(); } map.fire("updated", obj); }
             }
-            map.fire("saved", obj);
+            Persister.snapshot(obj, map);
+            if (!quiet) { if (model != null) { model.afterSave(); } map.fire("saved", obj); }
         }
         static fn insert(obj: any, map: TableMap, db: Connection) {
             let cols = new Array<string>();
@@ -131,11 +170,11 @@ namespace orbit {
             if (obj is Model) { (obj as Model).__exists = true; }
         }
         // Updates `obj`'s row; how many rows it changed (0 when there is none with its id).
-        static fn update(obj: any, map: TableMap, db: Connection) -> long {
+        static fn update(obj: any, map: TableMap, db: Connection, only: Array<FieldMap> = null) -> long {
             let id = map.requireId();
             let sets = new Array<string>();
             let args = new Array<any>();
-            for (m in map.fields) {
+            for (m in only == null ? map.fields : only) {
                 if (m.isId) { continue; }
                 sets.push(db.quote(m.column) + " = ?");
                 args.push(m.field.get(obj));
@@ -151,6 +190,7 @@ namespace orbit {
             if (map.softDelete != null && !force) {
                 map.softDelete.field.set(obj, DateTime.now());
                 let marked = Persister.update(obj, map, db) > 0;
+                Persister.snapshot(obj, map);
                 map.fire("deleted", obj);
                 return marked;
             }
@@ -165,7 +205,16 @@ namespace orbit {
         // DateTime as ISO text, Decimal and the rest as they are), with its loaded relations.
         static fn toMap(obj: any, map: TableMap) -> HashMap<string, any> {
             let out = new HashMap<string, any>();
-            for (m in map.fields) { if (!m.hidden) { out.put(m.field.name, m.field.get(obj)); } }
+            let model0: Model = obj is Model ? obj as Model : null;
+            for (m in map.fields) {
+                let name = m.field.name;
+                let hidden = m.hidden;
+                if (model0 != null) {
+                    if (model0.__show.contains(name)) { hidden = false; }
+                    if (model0.__hide.contains(name)) { hidden = true; }
+                }
+                if (!hidden) { out.put(name, m.field.get(obj)); }
+            }
             if (obj is Model) {
                 let model = obj as Model;
                 for (k in model.__extra.keys()) { out.put(k, model.__extra[k]); }
@@ -225,6 +274,10 @@ namespace orbit {
         @Ignore public __names: HashMap<string, string> = new HashMap<string, string>()
         @Ignore public __extra: HashMap<string, any> = new HashMap<string, any>()
         @Ignore public __exists: bool = false
+        @Ignore public __original: HashMap<string, any> = new HashMap<string, any>()
+        @Ignore public __changes: HashMap<string, any> = new HashMap<string, any>()
+        @Ignore public __hide: Array<string> = new Array<string>()
+        @Ignore public __show: Array<string> = new Array<string>()
 
         // ── queries (each starts a Query of this class) ──────────────────────────
         static fn query() -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))); }
@@ -246,6 +299,18 @@ namespace orbit {
         static fn with(relation: string) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).with(relation); }
         static fn with(relations: Array<string>) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).with(relations); }
         static fn withCount(relation: string) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).withCount(relation); }
+        static fn withSum(relation: string, name: string) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).withSum(relation, name); }
+        static fn withExists(relation: string) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).withExists(relation); }
+        static fn whereRelation(relation: string, name: string, op: string, value: any) -> Query<Self> {
+            return new Query<Self>(TableMap.of(reflect(Self))).whereRelation(relation, name, op, value);
+        }
+        static fn withoutScope(name: string) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).withoutScope(name); }
+        static fn withoutScopes() -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).withoutScopes(); }
+        static fn withAvg(relation: string, name: string) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).withAvg(relation, name); }
+        static fn withMin(relation: string, name: string) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).withMin(relation, name); }
+        static fn withMax(relation: string, name: string) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).withMax(relation, name); }
+        static fn whereDate(name: string, op: string, value: any) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).whereDate(name, op, value); }
+        static fn when(condition: bool, f: fn(Builder)) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).when(condition, f); }
         static fn withTrashed() -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).withTrashed(); }
         static fn onlyTrashed() -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).onlyTrashed(); }
         static fn select(names: Array<string>) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).select(names); }
@@ -257,6 +322,16 @@ namespace orbit {
         // ── answers ──────────────────────────────────────────────────────────────
         static fn all() -> Array<Self> { return new Query<Self>(TableMap.of(reflect(Self))).get(); }
         static fn first() -> Self { return new Query<Self>(TableMap.of(reflect(Self))).first(); }
+        static fn firstWhere(name: string, value: any) -> Self { return new Query<Self>(TableMap.of(reflect(Self))).firstWhere(name, value); }
+        static fn firstWhere(name: string, op: string, value: any) -> Self { return new Query<Self>(TableMap.of(reflect(Self))).firstWhere(name, op, value); }
+        static fn firstOrFail() -> Self { return new Query<Self>(TableMap.of(reflect(Self))).firstOrFail(); }
+        static fn findOrNew(id: any) -> Self { return new Query<Self>(TableMap.of(reflect(Self))).findOrNew(id); }
+        // Inserts rows, or updates the `update` fields of those whose `uniqueBy` fields match (see Builder.upsert).
+        static fn upsert(rows: Array<HashMap<string, any>>, uniqueBy: Array<string>, update: Array<string>) -> long {
+            return new Query<Self>(TableMap.of(reflect(Self))).upsert(rows, uniqueBy, update);
+        }
+        static fn insertOrIgnore(rows: Array<HashMap<string, any>>) -> long { return new Query<Self>(TableMap.of(reflect(Self))).insertOrIgnore(rows); }
+        static fn chunkById(size: int, f: fn(Array<Self>)) { new Query<Self>(TableMap.of(reflect(Self))).chunkById(size, f); }
         // The object with id `id`, or null (a soft-deleted one too: null).
         static fn find(id: any) -> Self { return new Query<Self>(TableMap.of(reflect(Self))).find(id); }
         static fn findOrFail(id: any) -> Self { return new Query<Self>(TableMap.of(reflect(Self))).findOrFail(id); }
@@ -315,12 +390,33 @@ namespace orbit {
         // ── this object ──────────────────────────────────────────────────────────
         // Inserts it (filling in its id) or, once saved, updates its row.
         fn save() -> Self {
-            let map = self.__map();
-            self.beforeSave();
-            Persister.save(self, map, self.__db());
-            self.afterSave();
+            Persister.save(self, self.__map(), self.__db());
             return self;
         }
+        // Saves without running hooks or behaviors' lifecycle code.
+        fn saveQuietly() -> Self { Persister.save(self, self.__map(), self.__db(), true); return self; }
+
+        // ── changes ──────────────────────────────────────────────────────────────
+        // Whether a field (any, with no name) differs from its row.
+        fn isDirty(name: string = "") -> bool {
+            let map = self.__map();
+            for (m in Persister.dirty(self, map)) { if (name == "" || m.field.name == name) { return true; } }
+            return false;
+        }
+        fn isClean(name: string = "") -> bool { return !self.isDirty(name); }
+        // The changed fields and their new values.
+        fn getDirty() -> HashMap<string, any> {
+            let out = new HashMap<string, any>();
+            for (m in Persister.dirty(self, self.__map())) { out.put(m.field.name, m.field.get(self)); }
+            return out;
+        }
+        // A field's value as its row had it (null when not loaded or saved).
+        fn getOriginal(name: string) -> any { return self.__original.getOr(name, null); }
+        // What the last save changed, and whether it changed a field (any, with no name).
+        fn getChanges() -> HashMap<string, any> { return self.__changes; }
+        fn wasChanged(name: string = "") -> bool { return name == "" ? self.__changes.size() > 0 : self.__changes.containsKey(name); }
+        // Takes the current values as the row's (nothing is dirty after).
+        fn syncOriginal() -> Self { Persister.snapshot(self, self.__map()); return self; }
         // Sets these fields (not @Guarded ones) and saves.
         fn update(values: HashMap<string, any>) -> Self { Persister.fill(self, self.__map(), values, true); return self.save(); }
         // Sets these fields (not @Guarded ones), without saving.
@@ -333,13 +429,20 @@ namespace orbit {
             return gone;
         }
         // Deletes its row, even for a @SoftDeletes class.
-        fn forceDelete() -> bool { return Persister.delete(self, self.__map(), self.__db(), true); }
+        fn forceDelete() -> bool {
+            self.beforeDelete();
+            let gone = Persister.delete(self, self.__map(), self.__db(), true);
+            self.afterDelete();
+            return gone;
+        }
         // Undoes a soft delete.
         fn restore() -> Self {
             let map = self.__map();
             if (map.softDelete == null) { throw new StateError(map.info.simpleName() + " is not @SoftDeletes"); }
             map.softDelete.field.set(self, null);
+            if (map.updatedAt != null) { map.updatedAt.field.set(self, DateTime.now()); }
             Persister.update(self, map, self.__db());
+            Persister.snapshot(self, map);
             return self;
         }
         // Whether a soft delete marked it.
@@ -351,13 +454,19 @@ namespace orbit {
             if (row.size() == 0) { throw new NotFound("the " + map.info.simpleName() + " is no longer in " + map.table); }
             Persister.read(self, map, row.get(0));
             self.__loaded.clear();
+            self.__names.clear();
             return self;
         }
         // Adds `by` to a field, in the object and its row (decrement subtracts).
         fn increment(name: string, by: long = 1) -> Self { return self.bump(name, by); }
         fn decrement(name: string, by: long = 1) -> Self { return self.bump(name, 0 - by); }
         // Saves it with updatedAt set to now.
-        fn touch() -> Self { return self.save(); }
+        fn touch() -> Self {
+            let map = self.__map();
+            if (map.updatedAt == null) { return self; }
+            map.updatedAt.field.set(self, DateTime.now());       // (dirty now, so the save writes it)
+            return self.save();
+        }
         // Whether it is not saved yet.
         fn isNew() -> bool { return Persister.isNew(self, self.__map()); }
         // Whether `other` is the same row (same class and id).
@@ -380,14 +489,55 @@ namespace orbit {
             Relation.eagerLoad(list, relation);
             return self;
         }
+        // Loads `relation` unless it is loaded already.
+        fn loadMissing(relation: string) -> Self { if (!self.relationLoaded(relation)) { self.load(relation); } return self; }
+        // Counts `relation` now (countOf reads it), as withCount does for a query.
+        fn loadCount(relation: string) -> Self {
+            let map = self.__map();
+            let q = new Builder(map, map.table, self.__db()).withTrashed().whereKey(map.requireId().field.get(self)).withCount(relation);
+            let rows = q.rows();
+            let key = Naming.snake(relation) + "_count";
+            if (rows.size() > 0) { self.__extra.put(key, rows.get(0).get(key)); }
+            return self;
+        }
+        // Saves it and every loaded related object (one level down, and theirs in turn).
+        fn push() -> Self {
+            self.save();
+            for (name in self.__names.keys()) {
+                let v = self.__loaded.getOr(self.__names[name] + "#models", self.__loaded.getOr(self.__names[name], null));
+                if (v is Model) { (v as Model).push(); }
+                else if (v is Array<Model>) { for (m in v as Array<Model>) { m.push(); } }
+            }
+            return self;
+        }
         // Whether `relation` is loaded.
         fn relationLoaded(relation: string) -> bool { return self.__names.containsKey(relation); }
         // A count withCount added (`countOf("posts")` for posts_count), or 0.
         fn countOf(relation: string) -> long { return Builder.toLong(self.__extra.getOr(Naming.snake(relation) + "_count", 0)); }
         // A column the query selected beyond the fields (selectRaw, withCount, a pivot's columns).
         fn extra(name: string) -> any { return self.__extra.getOr(name, null); }
+        // A pivot column of a many-to-many link this object was read through (`pivot("level")`).
+        fn pivot(name: string) -> any { return self.__extra.getOr("pivot_" + name, null); }
         // Its fields (not @Hidden), and its loaded relations.
         fn toMap() -> HashMap<string, any> { return Persister.toMap(self, self.__map()); }
+        // Hides (or shows, though @Hidden) these fields in this object's toMap and toJson.
+        fn makeHidden(names: Array<string>) -> Self { for (n in names) { self.__hide.push(n); } return self; }
+        fn makeVisible(names: Array<string>) -> Self {
+            for (n in names) { self.__show.push(n); self.__hide.remove(n); }
+            return self;
+        }
+        // Just these fields (by name), or all but these, as a map.
+        fn only(names: Array<string>) -> HashMap<string, any> {
+            let all = Persister.toMap(self, self.__map());
+            let out = new HashMap<string, any>();
+            for (n in names) { if (all.containsKey(n)) { out.put(n, all[n]); } }
+            return out;
+        }
+        fn except(names: Array<string>) -> HashMap<string, any> {
+            let all = Persister.toMap(self, self.__map());
+            for (n in names) { all.remove(n); }
+            return all;
+        }
         fn toJson() -> string { return Persister.json(self.toMap()).toJson(); }
 
         // ── relations (return them from methods: see relations.grav) ────────────
@@ -399,6 +549,13 @@ namespace orbit {
         // T objects linked through a pivot table (default: both names, snake_case, in alphabetical order: "role_user").
         fn belongsToMany<T>(table: string = "", foreignPivotKey: string = "", relatedPivotKey: string = "") -> BelongsToMany<T> {
             return new BelongsToMany<T>(self, table, foreignPivotKey, relatedPivotKey, "", false);
+        }
+        // The T objects reached through U objects (HasManyThrough), or the one (HasOneThrough).
+        fn hasManyThrough<T, U>(firstKey: string = "", secondKey: string = "", localKey: string = "", secondLocalKey: string = "") -> HasManyThrough<T, U> {
+            return new HasManyThrough<T, U>(self, firstKey, secondKey, localKey, secondLocalKey);
+        }
+        fn hasOneThrough<T, U>(firstKey: string = "", secondKey: string = "", localKey: string = "", secondLocalKey: string = "") -> HasOneThrough<T, U> {
+            return new HasOneThrough<T, U>(self, firstKey, secondKey, localKey, secondLocalKey);
         }
         // Polymorphic: the T objects whose `<name>_id` and `<name>_type` point here.
         fn morphMany<T>(name: string) -> MorphMany<T> { return new MorphMany<T>(self, name); }
@@ -423,6 +580,14 @@ namespace orbit {
         // (Internals.)
         // Keeps a loaded list also as models, for toMap and toJson (an Array<Post> is not an Array<Model>).
         fn __keepList(key: string, models: Array<Model>) { self.__loaded.put(key + "#models", models); }
+        // Forgets a loaded relation (it changed): its values and the names it was loaded under.
+        fn __forget(key: string) {
+            self.__loaded.remove(key);
+            self.__loaded.remove(key + "#models");
+            let gone = new Array<string>();
+            for (n in self.__names.keys()) { if (self.__names[n] == key) { gone.push(n); } }
+            for (n in gone) { self.__names.remove(n); }
+        }
         fn __map() -> TableMap { return TableMap.of(ClassInfo.of(self)); }
         fn __db() -> Connection { return DB.connection(self.__map().connection); }
         private fn bump(name: string, by: long) -> Self {
@@ -433,7 +598,12 @@ namespace orbit {
             let n = now is long ? now as long : now is int ? (now as int) as long : 0;
             m.field.set(self, n + by);
             new Builder(map, map.table, self.__db()).withTrashed().whereKey(map.requireId().field.get(self)).increment(name, by);
-            if (map.updatedAt != null) { map.updatedAt.field.set(self, DateTime.now()); }
+            self.__original.put(m.field.name, n + by);           // (the row has it now: not dirty)
+            if (map.updatedAt != null) {
+                let stamp = DateTime.now();
+                map.updatedAt.field.set(self, stamp);
+                self.__original.put(map.updatedAt.field.name, stamp);
+            }
             return self;
         }
     }

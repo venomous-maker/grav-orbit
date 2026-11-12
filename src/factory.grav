@@ -4,7 +4,7 @@
 //   let users = new Factory<User>(fn(f: Fake) -> HashMap<string, any> {
 //       return fields("name", f.name(), "email", f.uniqueEmail(), "age", f.number(18, 90))
 //   })
-//   users.count(10).create()                                   // ten saved Users
+//   users.count(10).createMany()                               // ten saved Users
 //   users.state(fields("admin", true)).create()                // one admin
 //   let draft = users.make()                                   // not saved
 //
