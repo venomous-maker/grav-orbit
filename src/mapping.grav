@@ -245,7 +245,7 @@ namespace orbit {
             let pg = driver == "postgres";
             if (m.isId && m.auto) {
                 if (pg) { return m.kind == "long" ? "BIGSERIAL" : "SERIAL"; }
-                if (my) { return (m.kind == "long" ? "BIGINT" : "INT") + " AUTO_INCREMENT"; }
+                if (my) { return (m.kind == "long" ? "BIGINT" : "INT") + " UNSIGNED AUTO_INCREMENT"; }   // (as Blueprint.id: foreignId matches it)
                 return "INTEGER";                                    // (SQLite: the rowid)
             }
             switch (m.kind) {
