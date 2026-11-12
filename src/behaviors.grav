@@ -25,7 +25,8 @@
 //   Article.withoutScope("Published").count()     // every article
 //
 // Built in: SoftDeletes, Timestamps (on unless @NoTimestamps) and Uuids
-// (@Uuids, or @Uuids("field"): a new row gets a random UUID there).
+// (@Uuids, or @Uuids("field"): a new row gets a random UUID there). The traits in
+// traits.grav bring each one with its fields: `class Post extends Model implements SoftDeletes`.
 import "std"
 import "grav-db"
 import "mapping.grav"
@@ -108,9 +109,9 @@ namespace orbit {
             Behaviors.lock.lock();
             if (!Behaviors.builtIn) {
                 Behaviors.builtIn = true;
-                if (!Behaviors.registry.containsKey("SoftDeletes")) { Behaviors.registry.put("SoftDeletes", new SoftDeletes()); }
-                if (!Behaviors.registry.containsKey("Timestamps")) { Behaviors.registry.put("Timestamps", new Timestamps()); }
-                if (!Behaviors.registry.containsKey("Uuids")) { Behaviors.registry.put("Uuids", new Uuids()); }
+                if (!Behaviors.registry.containsKey("SoftDeletes")) { Behaviors.registry.put("SoftDeletes", new SoftDeletesBehavior()); }
+                if (!Behaviors.registry.containsKey("Timestamps")) { Behaviors.registry.put("Timestamps", new TimestampsBehavior()); }
+                if (!Behaviors.registry.containsKey("Uuids")) { Behaviors.registry.put("Uuids", new UuidsBehavior()); }
             }
             Behaviors.lock.unlock();
         }
@@ -119,7 +120,7 @@ namespace orbit {
     // @SoftDeletes, or @SoftDeletes("removedAt"): delete() marks the row (in a
     // `DateTime?` field, deletedAt by default) instead of removing it, and
     // queries leave marked rows out (withTrashed, onlyTrashed, restore, forceDelete).
-    class SoftDeletes extends Behavior {
+    class SoftDeletesBehavior extends Behavior {
         fn boot(map: TableMap, d: Decorator) {
             let name = d.args.size() > 0 ? d.text(0) : "deletedAt";
             let m = map.find(name);
@@ -133,7 +134,7 @@ namespace orbit {
 
     // Timestamps: createdAt and updatedAt (DateTime fields; or
     // @Timestamps("created", "updated")) are set on insert, and updatedAt on update.
-    class Timestamps extends Behavior {
+    class TimestampsBehavior extends Behavior {
         fn boot(map: TableMap, d: Decorator) {
             let c = map.find(d.args.size() > 0 ? d.text(0) : "createdAt");
             let u = map.find(d.args.size() > 1 ? d.text(1) : "updatedAt");
@@ -144,7 +145,7 @@ namespace orbit {
 
     // @Uuids, or @Uuids("field"): a new row gets a random UUID (v4) in that
     // string field (uuid by default) when it is empty.
-    class Uuids extends Behavior {
+    class UuidsBehavior extends Behavior {
         fn creating(m: Model, d: Decorator) {
             let info = ClassInfo.of(m);
             let name = d.args.size() > 0 ? d.text(0) : "uuid";
