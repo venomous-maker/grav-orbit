@@ -1,0 +1,34 @@
+// traits.grav — the built-in behaviors as traits: implementing one gives a model
+// the behavior's decorator and the fields it works on, so there is nothing to
+// declare by hand.
+//
+//   class Post extends Model implements SoftDeletes, HasTimestamps {
+//       public id: long = 0
+//       public title: string = ""
+//   }
+//   // Post has deletedAt, createdAt and updatedAt, and is @SoftDeletes.
+//
+// Write your own the same way: a trait wearing a registered behavior's
+// decorator, with the fields that behavior needs.
+import "std"
+
+namespace orbit {
+
+    // Soft deletes (see SoftDeletesBehavior): delete() sets deletedAt.
+    @SoftDeletes
+    trait SoftDeletes {
+        public deletedAt: DateTime? = null
+    }
+
+    // createdAt and updatedAt, set on insert and update (see TimestampsBehavior).
+    trait HasTimestamps {
+        public createdAt: DateTime? = null
+        public updatedAt: DateTime? = null
+    }
+
+    // A random UUID in `uuid` for each new row (see UuidsBehavior).
+    @Uuids
+    trait HasUuids {
+        public uuid: string = ""
+    }
+}
