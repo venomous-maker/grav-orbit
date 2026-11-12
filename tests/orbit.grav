@@ -1,0 +1,376 @@
+// Orbit on whichever database ORBIT_DB names (a grav-db URL: mysql://...,
+// postgresql://...; SQLite in memory without it): models, queries, relations
+// (polymorphic too), eager loading, whereHas and withCount, soft deletes,
+// timestamps, the schema builder, migrations, factories and seeders.
+import "std"
+import "../src/orbit.grav"
+use db.*
+use orbit.*
+
+class User extends Model {
+    public id: long = 0
+    public name: string = ""
+    @Column("email", length: 190, unique: true)
+    public email: string = ""
+    public age: int? = null
+    public active: bool = true
+    public balance: Decimal = Decimal.of(0)
+    @Hidden public secret: string = ""
+    @Guarded public role: string = "member"
+    public createdAt: DateTime? = null
+    public updatedAt: DateTime? = null
+
+    fn posts() -> HasMany<Post> { return self.hasMany() }
+    fn profile() -> HasOne<Profile> { return self.hasOne() }
+    fn roles() -> BelongsToMany<Role> { return self.belongsToMany() }
+}
+
+@SoftDeletes
+class Post extends Model {
+    public id: long = 0
+    public userId: long = 0
+    public title: string = ""
+    public published: bool = false
+    public views: int = 0
+    public deletedAt: DateTime? = null
+
+    fn author() -> BelongsTo<User> { return self.belongsTo("user_id") }
+    fn comments() -> MorphMany<Comment> { return self.morphMany("commentable") }
+    fn tags() -> BelongsToMany<Tag> { return self.morphToMany("taggable") }
+}
+
+class Video extends Model {
+    public id: long = 0
+    public title: string = ""
+    fn comments() -> MorphMany<Comment> { return self.morphMany("commentable") }
+}
+
+class Comment extends Model {
+    public id: long = 0
+    public body: string = ""
+    public commentableId: long = 0
+    public commentableType: string = ""
+    fn commentable() -> MorphTo { return self.morphTo("commentable") }
+}
+
+class Profile extends Model {
+    public id: long = 0
+    public userId: long = 0
+    public bio: string = ""
+}
+
+class Role extends Model {
+    public id: long = 0
+    public name: string = ""
+    fn users() -> BelongsToMany<User> { return self.belongsToMany() }
+}
+
+class Tag extends Model {
+    public id: long = 0
+    public name: string = ""
+    fn posts() -> BelongsToMany<Post> { return self.morphedByMany("taggable") }
+}
+
+class CreateTables extends Migration {
+    fn up() {
+        Schema.create("users", fn(t: Blueprint) {
+            t.id()
+            t.varchar("name")
+            t.varchar("email", 190).unique()
+            t.integer("age").nullable()
+            t.boolean("active").defaultValue(true)
+            t.decimal("balance", 12, 2).defaultValue(0)
+            t.varchar("secret").defaultValue("")
+            t.varchar("role").defaultValue("member")
+            t.timestamps()
+        })
+        Schema.create("posts", fn(t: Blueprint) {
+            t.id()
+            t.foreignId("user_id").constrained().cascadeOnDelete()
+            t.varchar("title")
+            t.boolean("published").defaultValue(false)
+            t.integer("views").defaultValue(0)
+            t.softDeletes()
+            t.index("title")
+        })
+        Schema.create("videos", fn(t: Blueprint) { t.id(); t.varchar("title") })
+        Schema.create("comments", fn(t: Blueprint) { t.id(); t.text("body"); t.morphs("commentable") })
+        Schema.create("profiles", fn(t: Blueprint) { t.id(); t.foreignId("user_id"); t.text("bio") })
+        Schema.create("roles", fn(t: Blueprint) { t.id(); t.varchar("name") })
+        Schema.create("role_user", fn(t: Blueprint) { t.foreignId("role_id"); t.foreignId("user_id") })
+        Schema.create("tags", fn(t: Blueprint) { t.id(); t.varchar("name") })
+        Schema.create("taggables", fn(t: Blueprint) { t.foreignId("tag_id"); t.morphs("taggable") })
+    }
+    fn down() {
+        for (t in ["taggables", "tags", "role_user", "roles", "profiles", "comments", "videos", "posts", "users"]) { Schema.dropIfExists(t) }
+    }
+}
+
+class DemoSeeder extends Seeder {
+    fn run() {
+        let ada = User.create(fields("name", "Ada", "email", "ada@example.com", "age", 36, "balance", Decimal.parse("100.50")))
+        let bob = User.create(fields("name", "Bob", "email", "bob@example.com", "age", 17))
+        User.create(fields("name", "Cy", "email", "cy@example.com", "active", false))
+        ada.posts().create(fields("title", "Hello", "published", true, "views", 10))
+        ada.posts().create(fields("title", "Draft"))
+        ada.posts().create(fields("title", "Grav tips", "published", true, "views", 5))
+        bob.posts().create(fields("title", "Bob's post", "published", true))
+        ada.profile().create(fields("bio", "First programmer"))
+    }
+}
+
+fn connect() -> Connection {
+    let url = env("ORBIT_DB")
+    if (url == "") { return Sqlite.open(":memory:") }
+    if (Str.startsWith(url, "mysql://") || Str.startsWith(url, "mariadb://")) { return MySql.open(url) }
+    return Postgres.open(url)
+}
+
+fn setUp() -> Migrator {
+    DB.connect(connect())
+    let m = new Migrator()
+    m.add(new CreateTables())
+    m.reset()
+    Schema.dropIfExists("migrations")
+    for (t in ["taggables", "tags", "role_user", "roles", "profiles", "comments", "videos", "posts", "users"]) { Schema.dropIfExists(t) }
+    m.migrate()
+    Seeder.seed(new DemoSeeder())
+    return m
+}
+
+test "models: create, find, save, update, delete, timestamps" {
+    setUp()
+    assertEq(User.count(), 3 as long)
+    let ada = User.where("email", "ada@example.com").first()
+    assertEq("${ada.name} ${ada.age} ${ada.active} ${ada.balance == Decimal.parse("100.50")} ${ada.createdAt != null} ${ada.id > 0}", "Ada 36 true true true true")
+    let again = User.find(ada.id)
+    assertEq(again.isSame(ada) && again.name == "Ada", true)
+    again.name = "Ada L."
+    again.save()
+    assertEq(User.find(ada.id).name, "Ada L.")
+    let u = User.make(fields("name", "Dee", "email", "dee@example.com", "role", "admin"))
+    assertEq("${u.isNew()} ${u.role}", "true member")                                  // (role is @Guarded)
+    u.save()
+    assertEq("${u.isNew()} ${User.count()}", "false 4")
+    u.update(fields("age", 40))
+    assertEq(User.find(u.id).age, 40)
+    u.increment("age", 2)
+    assertEq("${u.age} ${User.find(u.id).age}", "42 42")
+    assertEq(u.delete(), true)
+    assertEq(User.find(u.id) == null, true)
+    let first = User.firstOrCreate(fields("email", "eve@example.com"), fields("name", "Eve"))
+    let same = User.firstOrCreate(fields("email", "eve@example.com"), fields("name", "Other"))
+    assertEq("${first.id == same.id} ${same.name}", "true Eve")
+    let up = User.updateOrCreate(fields("email", "eve@example.com"), fields("age", 30))
+    assertEq("${up.id == first.id} ${up.age}", "true 30")
+    let missing = ""
+    try { User.findOrFail(999999) } catch (e: NotFound) { missing = e.message() }
+    assertEq(missing, "no User with id 999999")
+}
+
+test "the query builder" {
+    setUp()
+    assertEq(User.where("age", ">=", 18).pluck("name").size(), 1)
+    let names = User.where(fn(q: Builder) { q.where("age", ">", 30).orWhereNull("age") }).orderBy("name").pluck("name")
+    assertEq("${names}", "[Ada, Cy]")
+    assertEq(User.whereIn("name", ["Ada", "Bob"]).count(), 2 as long)
+    assertEq(User.query().whereNotIn("name", ["Ada"]).count(), 2 as long)
+    assertEq(User.whereBetween("age", 10, 20).value("name"), "Bob")
+    assertEq(User.query().whereNotBetween("age", 10, 20).value("name"), "Ada")
+    assertEq(User.whereLike("email", "%@example.com").count(), 3 as long)
+    assertEq(User.where("active", false).first().name, "Cy")
+    assertEq(User.query().where("name", "!=", "Ada").orderByDesc("name").first().name, "Cy")
+    assertEq(User.query().when(true, fn(q: Builder) { q.where("age", 17) }).count(), 1 as long)
+    assertEq(User.whereColumn("createdAt", "<=", "updatedAt").count(), 3 as long)
+    assertEq("${Post.sum("views")} ${Post.max("views")} ${Post.query().where("published", true).avg("views")}", "15 10 5")
+    assertEq(Post.query().select(["userId"]).distinct().count(), 2 as long)
+    let page = Post.query().orderBy("id").paginate(2, 2)
+    assertEq("${page.total} ${page.items.size()} ${page.lastPage()} ${page.items[0].title}", "4 2 2 Grav tips")
+    let seen = new Array<string>()
+    Post.query().orderBy("id").chunk(3, fn(part: Array<Post>) { seen.push("${part.size()}") })
+    assertEq("${seen}", "[\"3\", \"1\"]")
+    assertEq(Post.where("published", true).update(fields("views", 1)), 3 as long)
+    assertEq(Post.where("title", "Hello").first().views, 1)
+    let grouped = DB.table("posts").selectRaw("user_id, COUNT(*) AS n").groupBy("user_id").having("n", ">", 1).get()
+    assertEq(grouped.size(), 1)
+    let joined = DB.table("posts").join("users", "users.id", "=", "posts.user_id").where("users.name", "Bob").pluck("title")
+    assertEq("${joined}", "[Bob's post]")
+    let bad = ""
+    try { User.where("nmae", "x") } catch (e: ValueError) { bad = e.message() }
+    assertEq(bad, "User has no field or column 'nmae' (whereRaw takes SQL)")
+}
+
+test "relations: hasMany, hasOne, belongsTo, belongsToMany" {
+    setUp()
+    let ada = User.where("name", "Ada").first()
+    assertEq(ada.posts().count(), 3 as long)
+    assertEq(ada.posts().where("published", true).count(), 2 as long)
+    assertEq(ada.profile().get().bio, "First programmer")
+    let post = Post.where("title", "Hello").first()
+    assertEq(post.author().get().name, "Ada")
+    let admin = Role.create(fields("name", "admin"))
+    let editor = Role.create(fields("name", "editor"))
+    ada.roles().attach(admin.id)
+    ada.roles().attach(editor)
+    assertEq(ada.roles().count(), 2 as long)
+    assertEq(admin.users().get()[0].name, "Ada")
+    ada.roles().sync([editor.id])
+    assertEq("${ada.roles().pluck("name")}", "[editor]")
+    ada.roles().detachAll()
+    assertEq(ada.roles().count(), 0 as long)
+    let bob = User.where("name", "Bob").first()
+    let moved = Post.where("title", "Draft").first()
+    moved.author().associate(bob)
+    moved.save()
+    assertEq(bob.posts().count(), 2 as long)
+}
+
+test "eager loading, has, whereHas, withCount" {
+    setUp()
+    let users = User.with("posts").with("profile").orderBy("name").get()
+    assertEq("${users[0].relationLoaded("posts")} ${users[0].posts().get().size()} ${users[1].posts().get().size()} ${users[2].posts().get().size()}", "true 3 1 0")
+    assertEq("${users[0].profile().get().bio} ${users[1].profile().get() == null}", "First programmer true")
+    let posts = Post.with("author").get()
+    assertEq(posts[0].author().get().name != "", true)
+    assertEq("${User.has("posts").orderBy("name").pluck("name")}", "[Ada, Bob]")
+    assertEq("${User.has("posts", ">=", 2).pluck("name")}", "[Ada]")
+    assertEq("${User.doesntHave("posts").pluck("name")}", "[Cy]")
+    assertEq("${User.whereHas("posts", fn(q: Builder) { q.where("title", "like", "Grav%") }).pluck("name")}", "[Ada]")
+    assertEq("${User.whereDoesntHave("posts", fn(q: Builder) { q.where("published", true) }).pluck("name")}", "[Cy]")
+    let counted = User.withCount("posts").orderBy("name").get()
+    assertEq("${counted[0].countOf("posts")} ${counted[1].countOf("posts")} ${counted[2].countOf("posts")}", "3 1 0")
+    let ada = User.where("name", "Ada").first()
+    ada.load("posts")
+    let map = ada.toMap()
+    assertEq("${map.containsKey("secret")} ${(map["posts"] as Array<any>).size()}", "false 3")
+    assertEq(Str.contains(ada.toJson(), "\"name\":\"Ada\""), true)
+}
+
+test "polymorphic relations" {
+    setUp()
+    let post = Post.where("title", "Hello").first()
+    let video = Video.create(fields("title", "Intro"))
+    post.comments().create(fields("body", "Nice post"))
+    post.comments().create(fields("body", "Thanks"))
+    video.comments().create(fields("body", "Great video"))
+    assertEq("${post.comments().count()} ${video.comments().count()}", "2 1")
+    let c = Comment.where("body", "Great video").first()
+    assertEq((c.commentable().get() as Video).title, "Intro")
+    let all = Comment.with("commentable").orderBy("id").get()
+    assertEq("${(all[0].commentable().get() as Post).title} ${(all[2].commentable().get() as Video).title}", "Hello Intro")
+    let grav = Tag.create(fields("name", "grav"))
+    let news = Tag.create(fields("name", "news"))
+    post.tags().attachMany([grav.id, news.id])
+    assertEq("${post.tags().count()} ${grav.posts().get()[0].title}", "2 Hello")
+    assertEq("${Post.whereHas("tags", fn(q: Builder) { q.where("name", "news") }).pluck("title")}", "[Hello]")
+    let withTags = Post.with("tags").where("title", "Hello").first()
+    assertEq(withTags.tags().get().size(), 2)
+}
+
+test "soft deletes" {
+    setUp()
+    let post = Post.where("title", "Draft").first()
+    post.delete()
+    assertEq("${Post.count()} ${Post.withTrashed().count()} ${Post.onlyTrashed().count()} ${post.trashed()}", "3 4 1 true")
+    post.restore()
+    assertEq(Post.count(), 4 as long)
+    post.forceDelete()
+    assertEq(Post.withTrashed().count(), 3 as long)
+}
+
+test "transactions" {
+    setUp()
+    let failed = false
+    try {
+        DB.transaction(fn() {
+            User.create(fields("name", "Tmp", "email", "tmp@example.com"))
+            throw new ValueError("no")
+        })
+    } catch (e: ValueError) { failed = true }
+    assertEq(failed && User.where("name", "Tmp").first() == null, true)
+    DB.beginTransaction()
+    User.create(fields("name", "Tmp2", "email", "tmp2@example.com"))
+    DB.rollBack()
+    assertEq(User.where("name", "Tmp2").exists(), false)
+    DB.beginTransaction()
+    User.create(fields("name", "Kept", "email", "kept@example.com"))
+    DB.commit()
+    assertEq(User.where("name", "Kept").exists(), true)
+}
+
+test "schema, migrations, factories" {
+    let m = setUp()
+    assertEq("${Schema.hasTable("posts")} ${Schema.hasTable("nope")} ${Schema.hasColumn("posts", "deleted_at")}", "true false true")
+    Schema.table("videos", fn(t: Blueprint) { t.varchar("url").nullable() })
+    assertEq(Schema.hasColumn("videos", "url"), true)
+    assertEq("${m.status()}", "[\"CreateTables: ran (batch 1)\"]")
+    m.rollback()
+    assertEq(Schema.hasTable("users"), false)
+    m.migrate()
+    Fake.seed(7)
+    let users = new Factory<User>(fn(f: Fake) -> HashMap<string, any> {
+        return fields("name", f.name(), "email", f.uniqueEmail(), "age", f.number(18, 90))
+    })
+    let made = users.count(5).createMany()
+    assertEq("${made.size()} ${User.count()} ${made[0].id > 0}", "5 5 true")
+    let young = users.state(fields("age", 16)).make()
+    assertEq("${young.age} ${young.isNew()}", "16 true")
+    assertEq(User.where("age", ">=", 18).count(), 5 as long)
+}
+
+// Behaviors: traits written here, put on models with their decorators.
+class Sluggable extends Behavior {
+    fn saving(m: Model, d: Decorator) {
+        let info = ClassInfo.of(m)
+        let text = "${info.field(d.text(0)).get(m)}"
+        info.field("slug").set(m, Str.replace(Str.lower(Str.trim(text)), " ", "-"))
+    }
+}
+class Published extends Behavior {
+    fn apply(q: Builder, map: TableMap, d: Decorator) { q.where("published", true) }
+}
+class Audited extends Behavior {
+    public log: Array<string> = new Array<string>()
+    fn created(m: Model, d: Decorator) { self.log.push("created " + ClassInfo.of(m).simpleName()) }
+    fn deleting(m: Model, d: Decorator) { self.log.push("deleting " + ClassInfo.of(m).simpleName()) }
+}
+
+@Audited
+class Content extends Model {
+    public id: long = 0
+    public title: string = ""
+    public createdAt: DateTime? = null
+    public updatedAt: DateTime? = null
+}
+@Sluggable("title") @Published @Uuids
+@Table("articles")
+class Article extends Content {
+    public slug: string = ""
+    public uuid: string = ""
+    public published: bool = false
+}
+
+test "behaviors: traits on models" {
+    let audit = new Audited()
+    Behaviors.register("Sluggable", new Sluggable())
+    Behaviors.register("Published", new Published())
+    Behaviors.register("Audited", audit)
+    DB.connect(connect())
+    Schema.dropIfExists("articles")
+    Schema.create("articles", fn(t: Blueprint) {
+        t.id(); t.varchar("title"); t.varchar("slug"); t.varchar("uuid"); t.boolean("published"); t.timestamps()
+    })
+    let a = Article.create(fields("title", "Hello Orbit World", "published", true))
+    Article.create(fields("title", "Draft Post"))
+    assertEq("${a.slug} ${a.uuid.length} ${a.createdAt != null}", "hello-orbit-world 36 true")
+    assertEq("${Article.count()} ${Article.query().withoutScope("Published").count()} ${Article.query().withoutScopes().count()}", "1 2 2")
+    assertEq(Article.where("title", "like", "%Post").first() == null, true)              // (the scope hides the draft)
+    let draft = Article.query().withoutScope("Published").where("title", "Draft Post").first()
+    draft.title = "Draft Two"
+    draft.save()
+    assertEq(draft.slug, "draft-two")
+    draft.delete()
+    assertEq("${audit.log}", "[\"created Article\", \"created Article\", \"deleting Article\"]")   // (inherited from Content)
+    assertEq(Behaviors.isRegistered("SoftDeletes") && Behaviors.isRegistered("Sluggable"), true)
+    Schema.drop("articles")
+}

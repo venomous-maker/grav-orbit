@@ -1,0 +1,6 @@
+name = "grav-orbit"
+lib = "src/orbit.grav"
+paths = ["src"]
+
+[dependencies]
+grav-db = "github.com/venomous-maker/grav-db"

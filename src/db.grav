@@ -1,0 +1,68 @@
+// db.grav — DB: the connections Orbit uses, transactions, raw statements, and
+// queries on tables without a model.
+//
+//   DB.connect(Sqlite.open("app.db"))                // the default connection
+//   DB.connect(MySql.open(url), "reports")           // a named one (@Connection("reports") on a model)
+//   DB.transaction(fn() { ... })                     // committed, or rolled back when it throws
+//   DB.beginTransaction(); ...; DB.commit()          // or DB.rollBack()
+//   let rows = DB.select("SELECT * FROM users WHERE age > ?", [18])
+//   let names = DB.table("users").where("age", ">", 18).orderBy("name").pluck("name")
+import "std"
+import "grav-db"
+import "mapping.grav"
+import "builder.grav"
+
+namespace orbit {
+
+    // The database connections, transactions and raw SQL (see the top of this file).
+    class DB {
+        private static named: HashMap<string, Connection> = new HashMap<string, Connection>()
+
+        // Makes `db` the connection called `name` ("default": what models use).
+        static fn connect(db: Connection, name: string = "default") { DB.named.put(name, db); }
+        // The connection called `name`; StateError when there is none.
+        static fn connection(name: string = "default") -> Connection {
+            let key = name == "" ? "default" : name;
+            let db = DB.named.getOr(key, null);
+            if (db == null) {
+                throw new StateError(key == "default" ? "no database for Orbit: call DB.connect(db) first"
+                                                      : "no database connection called '" + key + "': DB.connect(db, \"" + key + "\")");
+            }
+            return db;
+        }
+        // Whether a connection called `name` is set.
+        static fn hasConnection(name: string = "default") -> bool { return DB.named.containsKey(name == "" ? "default" : name); }
+        // Forgets the connection called `name` (closing it is yours).
+        static fn disconnect(name: string = "default") { DB.named.remove(name); }
+
+        // ── transactions ─────────────────────────────────────────────────────────
+        // Runs `body` in a transaction: committed when it returns, rolled back when
+        // it throws (and the exception goes on). Nested, it is a savepoint.
+        static fn transaction(body: fn()) { DB.connection().transaction(body); }
+        static fn transaction(name: string, body: fn()) { DB.connection(name).transaction(body); }
+        // Starts a transaction (a savepoint inside one), to end with commit or rollBack.
+        static fn beginTransaction(name: string = "default") { DB.connection(name).begin(); }
+        static fn commit(name: string = "default") { DB.connection(name).commit(); }
+        static fn rollBack(name: string = "default") { DB.connection(name).rollback(); }
+        // Whether a transaction is open.
+        static fn inTransaction(name: string = "default") -> bool { return DB.connection(name).inTransaction(); }
+
+        // ── raw SQL (with `?` arguments) ─────────────────────────────────────────
+        static fn select(sql: string, args: Array<any> = new Array<any>()) -> ResultSet { return DB.connection().query(sql, args); }
+        static fn selectOne(sql: string, args: Array<any> = new Array<any>()) -> Row { return DB.connection().queryOne(sql, args); }
+        // The first column of the first row, or null.
+        static fn scalar(sql: string, args: Array<any> = new Array<any>()) -> any { return DB.connection().queryValue(sql, args); }
+        // Runs an INSERT; the new row's id.
+        static fn insert(sql: string, args: Array<any> = new Array<any>()) -> long { return DB.connection().insert(sql, args); }
+        // Runs an UPDATE or DELETE; the rows it changed.
+        static fn update(sql: string, args: Array<any> = new Array<any>()) -> long { return DB.connection().execute(sql, args); }
+        static fn delete(sql: string, args: Array<any> = new Array<any>()) -> long { return DB.connection().execute(sql, args); }
+        // Runs any statement; the rows it changed.
+        static fn statement(sql: string, args: Array<any> = new Array<any>()) -> long { return DB.connection().execute(sql, args); }
+        // Runs statements without arguments (a script).
+        static fn unprepared(sql: string) { DB.connection().exec(sql); }
+
+        // A query on table `name`, without a model: its rows come back as Rows.
+        static fn table(name: string) -> TableQuery { return new TableQuery(name, DB.connection()); }
+    }
+}

@@ -1,0 +1,612 @@
+// relations.grav — relations between models, declared as methods that return
+// them, as in Eloquent:
+//
+//   class User extends Model {
+//       fn posts() -> HasMany<Post> { return self.hasMany() }          // posts.user_id
+//       fn profile() -> HasOne<Profile> { return self.hasOne() }       // profiles.user_id
+//       fn roles() -> BelongsToMany<Role> { return self.belongsToMany() }   // role_user (role_id, user_id)
+//   }
+//   class Post extends Model {
+//       fn author() -> BelongsTo<User> { return self.belongsTo("user_id") }
+//       fn comments() -> MorphMany<Comment> { return self.morphMany("commentable") }
+//       fn tags() -> BelongsToMany<Tag> { return self.morphToMany("taggable") }   // taggables
+//   }
+//   class Comment extends Model {
+//       fn commentable() -> MorphTo { return self.morphTo("commentable") }   // commentable_type, commentable_id
+//   }
+//
+//   user.posts().get()                 // Array<Post> (loaded already when the query said with("posts"))
+//   user.posts().where("published", true).count()
+//   user.posts().create(fields("title", "Hi"))
+//   user.roles().attach(roleId); user.roles().sync(ids)
+//   User.whereHas("posts", fn(q: Builder) { q.where("published", true) })
+//
+// Keys follow Eloquent's names: a foreign key is the owner's class name,
+// snake_case, with _id (user_id), matched against the related class's field
+// names or columns; a pivot table is both names, singular, in alphabetical
+// order (role_user); a polymorphic relation `x` uses x_id and x_type, whose
+// value is the class's morph name (its name, or @MorphName).
+import "std"
+import "grav-db"
+import "mapping.grav"
+import "db.grav"
+import "builder.grav"
+import "model.grav"
+
+namespace orbit {
+
+    // What every relation does for queries: the condition joining it to its
+    // owner (has, whereHas, withCount) and loading it for many owners at once (with).
+    abstract class Relation {
+        public parent: Model
+        public parentMap: TableMap
+        public relatedMap: TableMap
+
+        constructor(parent: Model, related: ClassInfo) {
+            self.parent = parent;
+            self.parentMap = TableMap.of(ClassInfo.of(parent));
+            self.relatedMap = related == null ? null : TableMap.of(related);
+        }
+
+        // A query over the related table (aliased one level below `outer`), with the condition tying it to `outer`'s rows.
+        abstract fn existence(outer: Builder) -> Builder
+        // Loads it for every one of `parents` (one query), then `nested` ("comments.author") on the results.
+        abstract fn eager(parents: Array<Model>, nested: string)
+        // Where a parent keeps it once loaded.
+        abstract fn key() -> string
+
+        fn db() -> Connection { return DB.connection(self.relatedMap == null ? self.parentMap.connection : self.relatedMap.connection); }
+        fn loaded() -> bool { return self.parent.__loaded.containsKey(self.key()); }
+
+        // The relation `name` of `map`'s class (its method of that name, called on a blank object).
+        // The objects of a typed list, as models.
+        static fn models<T>(list: Array<T>) -> Array<Model> {
+            let out = new Array<Model>();
+            for (x in list) { out.push(x as Model); }
+            return out;
+        }
+        static fn named(map: TableMap, name: string) -> Relation {
+            let proto = map.info.create();
+            let m = map.info.method(name);
+            if (m == null) { throw new ValueError(map.info.simpleName() + " has no relation '" + name + "' (a method returning one)"); }
+            let r = m.invoke(proto, new Array<any>());
+            if (!(r is Relation)) { throw new ValueError(map.info.simpleName() + "." + name + "() is not a relation"); }
+            return r as Relation;
+        }
+        // Loads `path` ("posts", "posts.comments") for all of `models` (one query a level).
+        static fn eagerLoad(models: Array<Model>, path: string) {
+            if (models.size() == 0) { return; }
+            let dot = Str.indexOf(path, ".");
+            let first = dot > 0 ? path[..dot] : path;
+            let rest = dot > 0 ? path[dot + 1..] : "";
+            let map = TableMap.of(ClassInfo.of(models[0]));
+            let m = map.info.method(first);
+            if (m == null) { throw new ValueError(map.info.simpleName() + " has no relation '" + first + "'"); }
+            let r = m.invoke(models[0], new Array<any>());
+            if (!(r is Relation)) { throw new ValueError(map.info.simpleName() + "." + first + "() is not a relation"); }
+            let rel = r as Relation;
+            rel.eager(models, rest);
+            for (x in models) { x.__names.put(first, rel.key()); }
+        }
+        // The distinct non-null values of `f` in `objs` (keys to look up with IN).
+        static fn keysOf(objs: Array<Model>, f: FieldMap) -> Array<any> {
+            let seen = new HashSet<string>();
+            let out = new Array<any>();
+            for (o in objs) {
+                let v = f.field.get(o);
+                if (v == null) { continue; }
+                let k = "${v}";
+                if (seen.contains(k)) { continue; }
+                seen.add(k);
+                out.push(v);
+            }
+            return out;
+        }
+        // A field of `map` by field or column name; ValueError naming the relation otherwise.
+        static fn field(map: TableMap, name: string, what: string) -> FieldMap {
+            let m = map.find(name);
+            if (m == null) { throw new ValueError(map.info.simpleName() + " has no field or column '" + name + "' (" + what + ")"); }
+            return m;
+        }
+        // `inner`'s column `m`, and `outer`'s, quoted with their aliases.
+        static fn on(b: Builder, m: FieldMap) -> string { return b.q(b.__alias) + "." + b.q(m.column); }
+    }
+
+    // The T objects whose foreign key holds this one's key (one-to-many).
+    class HasMany<T> extends Relation {
+        public foreignKey: FieldMap          // on T
+        public localKey: FieldMap            // on the owner
+
+        constructor(parent: Model, foreignKey: string, localKey: string) {
+            super(parent, reflect(T));
+            let fk = foreignKey != "" ? foreignKey : Naming.snake(self.parentMap.info.simpleName()) + "_id";
+            self.foreignKey = Relation.field(self.relatedMap, fk, "the foreign key of " + self.parentMap.info.simpleName() + "'s hasMany");
+            self.localKey = localKey != "" ? Relation.field(self.parentMap, localKey, "a local key") : self.parentMap.requireId();
+        }
+        fn key() -> string { return "hasMany:" + self.relatedMap.table + "." + self.foreignKey.column; }
+        // A query for the related objects (narrow it further, then get, count, ...).
+        fn query() -> Query<T> {
+            let q = new Query<T>(self.relatedMap);
+            q.where(self.foreignKey.field.name, self.localKey.field.get(self.parent));
+            return q;
+        }
+        fn where(name: string, op: string, value: any) -> Query<T> { return self.query().where(name, op, value); }
+        fn where(name: string, value: any) -> Query<T> { return self.query().where(name, value); }
+        // The related objects (loaded ones when with() loaded them).
+        fn get() -> Array<T> {
+            if (self.loaded()) { return self.parent.__loaded[self.key()] as Array<T>; }
+            return self.query().get();
+        }
+        fn count() -> long { return self.loaded() ? (self.get().size() as long) : self.query().count(); }
+        // One field of each related object.
+        fn pluck(name: string) -> Array<any> { return self.query().pluck(name); }
+        fn exists() -> bool { return self.count() > 0; }
+        // Saves `child` as one of these (its foreign key set).
+        fn save(child: T) -> T {
+            self.foreignKey.field.set(child, self.localKey.field.get(self.parent));
+            Persister.save(child, self.relatedMap, self.db());
+            self.parent.__loaded.remove(self.key());
+            return child;
+        }
+        fn saveMany(children: Array<T>) { for (c in children) { self.save(c); } }
+        // A new related object with these fields, saved.
+        fn create(values: HashMap<string, any>) -> T {
+            let obj = self.relatedMap.info.create() as T;
+            Persister.fill(obj, self.relatedMap, values, true);
+            return self.save(obj);
+        }
+        fn existence(outer: Builder) -> Builder {
+            let inner = outer.__sub(self.relatedMap, "__orbit_${outer.__depth + 1}");
+            inner.__addCond(" AND ", Relation.on(inner, self.foreignKey) + " = " + Relation.on(outer, self.localKey), new Array<any>());
+            return inner;
+        }
+        fn eager(parents: Array<Model>, nested: string) {
+            let q = new Query<T>(self.relatedMap);
+            q.whereIn(self.foreignKey.field.name, Relation.keysOf(parents, self.localKey));
+            if (nested != "") { q.with(nested); }
+            let groups = new HashMap<string, Array<T>>();
+            for (kid in q.get()) {
+                let k = "${self.foreignKey.field.get(kid)}";
+                if (!groups.containsKey(k)) { groups.put(k, new Array<T>()); }
+                groups[k].push(kid);
+            }
+            for (p in parents) { p.__keepList(self.key(), Relation.models::<T>(groups.getOr("${self.localKey.field.get(p)}", new Array<T>()))); p.__loaded.put(self.key(), groups.getOr("${self.localKey.field.get(p)}", new Array<T>())); }
+        }
+    }
+
+    // The T object whose foreign key holds this one's key (one-to-one).
+    class HasOne<T> extends Relation {
+        public foreignKey: FieldMap
+        public localKey: FieldMap
+
+        constructor(parent: Model, foreignKey: string, localKey: string) {
+            super(parent, reflect(T));
+            let fk = foreignKey != "" ? foreignKey : Naming.snake(self.parentMap.info.simpleName()) + "_id";
+            self.foreignKey = Relation.field(self.relatedMap, fk, "the foreign key of " + self.parentMap.info.simpleName() + "'s hasOne");
+            self.localKey = localKey != "" ? Relation.field(self.parentMap, localKey, "a local key") : self.parentMap.requireId();
+        }
+        fn key() -> string { return "hasOne:" + self.relatedMap.table + "." + self.foreignKey.column; }
+        fn query() -> Query<T> {
+            let q = new Query<T>(self.relatedMap);
+            q.where(self.foreignKey.field.name, self.localKey.field.get(self.parent));
+            return q;
+        }
+        // The related object, or null.
+        fn get() -> T {
+            if (self.loaded()) { return self.parent.__loaded[self.key()] as T; }
+            return self.query().first();
+        }
+        fn save(child: T) -> T {
+            self.foreignKey.field.set(child, self.localKey.field.get(self.parent));
+            Persister.save(child, self.relatedMap, self.db());
+            self.parent.__loaded.put(self.key(), child);
+            return child;
+        }
+        fn create(values: HashMap<string, any>) -> T {
+            let obj = self.relatedMap.info.create() as T;
+            Persister.fill(obj, self.relatedMap, values, true);
+            return self.save(obj);
+        }
+        fn existence(outer: Builder) -> Builder {
+            let inner = outer.__sub(self.relatedMap, "__orbit_${outer.__depth + 1}");
+            inner.__addCond(" AND ", Relation.on(inner, self.foreignKey) + " = " + Relation.on(outer, self.localKey), new Array<any>());
+            return inner;
+        }
+        fn eager(parents: Array<Model>, nested: string) {
+            let q = new Query<T>(self.relatedMap);
+            q.whereIn(self.foreignKey.field.name, Relation.keysOf(parents, self.localKey));
+            if (nested != "") { q.with(nested); }
+            let byKey = new HashMap<string, T>();
+            for (kid in q.get()) {
+                let k = "${self.foreignKey.field.get(kid)}";
+                if (!byKey.containsKey(k)) { byKey.put(k, kid); }
+            }
+            for (p in parents) { p.__loaded.put(self.key(), byKey.getOr("${self.localKey.field.get(p)}", null)); }
+        }
+    }
+
+    // The T object this one's foreign key names (the inverse of hasMany and hasOne).
+    class BelongsTo<T> extends Relation {
+        public foreignKey: FieldMap          // on the owner
+        public ownerKey: FieldMap            // on T
+
+        constructor(parent: Model, foreignKey: string, ownerKey: string) {
+            super(parent, reflect(T));
+            let fk = foreignKey != "" ? foreignKey : Naming.snake(self.relatedMap.info.simpleName()) + "_id";
+            self.foreignKey = Relation.field(self.parentMap, fk, "the foreign key of belongsTo " + self.relatedMap.info.simpleName());
+            self.ownerKey = ownerKey != "" ? Relation.field(self.relatedMap, ownerKey, "an owner key") : self.relatedMap.requireId();
+        }
+        fn key() -> string { return "belongsTo:" + self.parentMap.table + "." + self.foreignKey.column; }
+        fn query() -> Query<T> {
+            let q = new Query<T>(self.relatedMap);
+            q.where(self.ownerKey.field.name, self.foreignKey.field.get(self.parent));
+            return q;
+        }
+        // The owner, or null (when the foreign key is null or names no row).
+        fn get() -> T {
+            if (self.loaded()) { return self.parent.__loaded[self.key()] as T; }
+            if (self.foreignKey.field.get(self.parent) == null) { return null; }
+            return self.query().first();
+        }
+        // Sets the foreign key to `owner`'s key (save the object to keep it).
+        fn associate(owner: T) -> Model {
+            self.foreignKey.field.set(self.parent, owner == null ? null : self.ownerKey.field.get(owner));
+            self.parent.__loaded.put(self.key(), owner);
+            return self.parent;
+        }
+        fn dissociate() -> Model { return self.associate(null); }
+        fn existence(outer: Builder) -> Builder {
+            let inner = outer.__sub(self.relatedMap, "__orbit_${outer.__depth + 1}");
+            inner.__addCond(" AND ", Relation.on(inner, self.ownerKey) + " = " + Relation.on(outer, self.foreignKey), new Array<any>());
+            return inner;
+        }
+        fn eager(parents: Array<Model>, nested: string) {
+            let keys = Relation.keysOf(parents, self.foreignKey);
+            let byKey = new HashMap<string, T>();
+            if (keys.size() > 0) {
+                let q = new Query<T>(self.relatedMap);
+                q.whereIn(self.ownerKey.field.name, keys);
+                if (nested != "") { q.with(nested); }
+                for (o in q.get()) { byKey.put("${self.ownerKey.field.get(o)}", o); }
+            }
+            for (p in parents) {
+                let v = self.foreignKey.field.get(p);
+                p.__loaded.put(self.key(), v == null ? null : byKey.getOr("${v}", null));
+            }
+        }
+    }
+
+    // T objects linked to this one through a pivot table: many-to-many, and its
+    // polymorphic forms (morphToMany, morphedByMany).
+    class BelongsToMany<T> extends Relation {
+        public table: string
+        public foreignPivotKey: string       // the pivot's column for the owner
+        public relatedPivotKey: string       // the pivot's column for T
+        public typeColumn: string = ""       // polymorphic: the pivot's <name>_type
+        public typeValue: string = ""
+        public parentKey: FieldMap
+        public relatedKey: FieldMap
+
+        constructor(parent: Model, table: string, foreignPivotKey: string, relatedPivotKey: string, morph: string, inverse: bool) {
+            super(parent, reflect(T));
+            let mine = Naming.snake(self.parentMap.info.simpleName());
+            let theirs = Naming.snake(self.relatedMap.info.simpleName());
+            if (morph == "") {
+                self.table = table != "" ? table : (mine < theirs ? mine + "_" + theirs : theirs + "_" + mine);
+                self.foreignPivotKey = foreignPivotKey != "" ? foreignPivotKey : mine + "_id";
+                self.relatedPivotKey = relatedPivotKey != "" ? relatedPivotKey : theirs + "_id";
+            } else if (!inverse) {                                   // Post.tags(): taggables(taggable_id, taggable_type = Post, tag_id)
+                self.table = table != "" ? table : Naming.plural(morph);
+                self.foreignPivotKey = morph + "_id";
+                self.relatedPivotKey = theirs + "_id";
+                self.typeColumn = morph + "_type";
+                self.typeValue = self.parentMap.morphName;
+            } else {                                                 // Tag.posts(): taggables(tag_id, taggable_id, taggable_type = Post)
+                self.table = table != "" ? table : Naming.plural(morph);
+                self.foreignPivotKey = mine + "_id";
+                self.relatedPivotKey = morph + "_id";
+                self.typeColumn = morph + "_type";
+                self.typeValue = self.relatedMap.morphName;
+            }
+            Builder.ident(self.table);
+            self.parentKey = self.parentMap.requireId();
+            self.relatedKey = self.relatedMap.requireId();
+        }
+        fn key() -> string { return "belongsToMany:" + self.table + "." + self.foreignPivotKey + "." + self.typeValue; }
+        // A query for the linked objects; each has the pivot's columns in extra("pivot_<column>").
+        fn query() -> Query<T> {
+            let q = new Query<T>(self.relatedMap);
+            self.joinPivot(q);
+            q.where(self.table + "." + self.foreignPivotKey, self.parentKey.field.get(self.parent));
+            return q;
+        }
+        fn where(name: string, op: string, value: any) -> Query<T> { return self.query().where(name, op, value); }
+        fn where(name: string, value: any) -> Query<T> { return self.query().where(name, value); }
+        // The linked objects (loaded ones when with() loaded them).
+        fn get() -> Array<T> {
+            if (self.loaded()) { return self.parent.__loaded[self.key()] as Array<T>; }
+            return self.query().get();
+        }
+        fn count() -> long { return self.loaded() ? (self.get().size() as long) : self.query().count(); }
+        // One field of each related object.
+        fn pluck(name: string) -> Array<any> { return self.query().pluck(name); }
+        // Links `id` (an object of T, or its key), or each of `ids`, with the
+        // pivot's other columns from `extra`.
+        fn attach(id: any, extra: HashMap<string, any> = new HashMap<string, any>()) {
+            let ids = new Array<any>();
+            ids.push(id);
+            self.attachMany(ids, extra);
+        }
+        fn attachMany(ids: Array<any>, extra: HashMap<string, any> = new HashMap<string, any>()) {
+            if (ids.size() == 0) { return; }
+            let db = self.db();
+            let cols = new Array<string>();
+            cols.push(db.quote(self.foreignPivotKey));
+            cols.push(db.quote(self.relatedPivotKey));
+            if (self.typeColumn != "") { cols.push(db.quote(self.typeColumn)); }
+            let keys = extra.keys();
+            for (k in keys) { cols.push(db.quote(Builder.ident(k))); }
+            let marks = new Array<string>();
+            for (c in cols) { marks.push("?"); }
+            let rows = new Array<Array<any>>();
+            let mine = self.parentKey.field.get(self.parent);
+            for (id in ids) {
+                let r = new Array<any>();
+                r.push(mine);
+                r.push(self.keyOf(id));
+                if (self.typeColumn != "") { r.push(self.typeValue); }
+                for (k in keys) { r.push(extra[k]); }
+                rows.push(r);
+            }
+            db.executeMany("INSERT INTO " + db.quote(self.table) + " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")", rows);
+            self.parent.__loaded.remove(self.key());
+        }
+        // Unlinks `id` (an object or key), or every linked object; how many links went.
+        fn detach(id: any) -> long {
+            let ids = new Array<any>();
+            ids.push(id);
+            return self.detachMany(ids);
+        }
+        fn detachAll() -> long { return self.detachMany(null); }
+        fn detachMany(ids: Array<any>) -> long {
+            let db = self.db();
+            let args = new Array<any>();
+            let sql = "DELETE FROM " + db.quote(self.table) + " WHERE " + db.quote(self.foreignPivotKey) + " = ?";
+            args.push(self.parentKey.field.get(self.parent));
+            if (self.typeColumn != "") { sql = sql + " AND " + db.quote(self.typeColumn) + " = ?"; args.push(self.typeValue); }
+            if (ids != null) {
+                if (ids.size() == 0) { return 0; }
+                let marks = new Array<string>();
+                for (id in ids) { marks.push("?"); args.push(self.keyOf(id)); }
+                sql = sql + " AND " + db.quote(self.relatedPivotKey) + " IN (" + Str.join(marks, ", ") + ")";
+            }
+            self.parent.__loaded.remove(self.key());
+            return db.execute(sql, args);
+        }
+        // Links exactly `ids`: those missing are attached, others detached.
+        fn sync(ids: Array<any>) {
+            let want = new HashSet<string>();
+            for (id in ids) { want.add("${self.keyOf(id)}"); }
+            let db = self.db();
+            let args = new Array<any>();
+            args.push(self.parentKey.field.get(self.parent));
+            let sql = "SELECT " + db.quote(self.relatedPivotKey) + " FROM " + db.quote(self.table) + " WHERE " + db.quote(self.foreignPivotKey) + " = ?";
+            if (self.typeColumn != "") { sql = sql + " AND " + db.quote(self.typeColumn) + " = ?"; args.push(self.typeValue); }
+            let have = new HashSet<string>();
+            let gone = new Array<any>();
+            for (row in db.query(sql, args)) {
+                let v = row.at(0);
+                have.add("${v}");
+                if (!want.contains("${v}")) { gone.push(v); }
+            }
+            let fresh = new Array<any>();
+            for (id in ids) { if (!have.contains("${self.keyOf(id)}")) { fresh.push(self.keyOf(id)); } }
+            if (gone.size() > 0) { self.detachMany(gone); }
+            self.attachMany(fresh);
+        }
+        // Attaches what is not linked, detaches what is.
+        fn toggle(ids: Array<any>) {
+            let now = new HashSet<string>();
+            for (o in self.query().get()) { now.add("${self.relatedKey.field.get(o)}"); }
+            let on = new Array<any>();
+            let off = new Array<any>();
+            for (id in ids) { if (now.contains("${self.keyOf(id)}")) { off.push(id); } else { on.push(id); } }
+            if (off.size() > 0) { self.detachMany(off); }
+            self.attachMany(on);
+        }
+        fn existence(outer: Builder) -> Builder {
+            let alias = "__orbit_${outer.__depth + 1}";
+            let inner = outer.__sub(self.relatedMap, alias);
+            inner.join(self.table, alias + "." + self.relatedKey.field.name, "=", self.table + "." + self.relatedPivotKey);
+            inner.__addCond(" AND ", inner.q(self.table) + "." + inner.q(self.foreignPivotKey) + " = " + Relation.on(outer, self.parentKey), new Array<any>());
+            if (self.typeColumn != "") { inner.where(self.table + "." + self.typeColumn, self.typeValue); }
+            return inner;
+        }
+        fn eager(parents: Array<Model>, nested: string) {
+            let q = new Query<T>(self.relatedMap);
+            self.joinPivot(q);
+            q.whereIn(self.table + "." + self.foreignPivotKey, Relation.keysOf(parents, self.parentKey));
+            if (nested != "") { q.with(nested); }
+            let groups = new HashMap<string, Array<T>>();
+            for (o in q.get()) {
+                let k = "${(o as Model).__extra.getOr("pivot_" + self.foreignPivotKey, null)}";
+                if (!groups.containsKey(k)) { groups.put(k, new Array<T>()); }
+                groups[k].push(o);
+            }
+            for (p in parents) { p.__keepList(self.key(), Relation.models::<T>(groups.getOr("${self.parentKey.field.get(p)}", new Array<T>()))); p.__loaded.put(self.key(), groups.getOr("${self.parentKey.field.get(p)}", new Array<T>())); }
+        }
+
+        private fn joinPivot(q: Builder) {
+            let db = q.conn();
+            q.join(self.table, self.relatedMap.table + "." + self.relatedKey.field.name, "=", self.table + "." + self.relatedPivotKey);
+            q.selectRaw(db.quote(self.relatedMap.table) + ".*, " + db.quote(self.table) + "." + db.quote(self.foreignPivotKey) +
+                        " AS " + db.quote("pivot_" + self.foreignPivotKey));
+            if (self.typeColumn != "") { q.where(self.table + "." + self.typeColumn, self.typeValue); }
+        }
+        private fn keyOf(id: any) -> any {
+            if (id is Model) { return self.relatedKey.field.get(id); }
+            return id;
+        }
+    }
+
+    // The T objects whose `<name>_id` and `<name>_type` point to this one.
+    class MorphMany<T> extends Relation {
+        public idField: FieldMap
+        public typeField: FieldMap
+        public localKey: FieldMap
+
+        constructor(parent: Model, name: string) {
+            super(parent, reflect(T));
+            self.idField = Relation.field(self.relatedMap, name + "_id", "morphMany " + name);
+            self.typeField = Relation.field(self.relatedMap, name + "_type", "morphMany " + name);
+            self.localKey = self.parentMap.requireId();
+        }
+        fn key() -> string { return "morph:" + self.relatedMap.table + "." + self.idField.column; }
+        fn query() -> Query<T> {
+            let q = new Query<T>(self.relatedMap);
+            q.where(self.idField.field.name, self.localKey.field.get(self.parent));
+            q.where(self.typeField.field.name, self.parentMap.morphName);
+            return q;
+        }
+        fn get() -> Array<T> {
+            if (self.loaded()) { return self.parent.__loaded[self.key()] as Array<T>; }
+            return self.query().get();
+        }
+        fn count() -> long { return self.loaded() ? (self.get().size() as long) : self.query().count(); }
+        // One field of each related object.
+        fn pluck(name: string) -> Array<any> { return self.query().pluck(name); }
+        fn save(child: T) -> T {
+            self.idField.field.set(child, self.localKey.field.get(self.parent));
+            self.typeField.field.set(child, self.parentMap.morphName);
+            Persister.save(child, self.relatedMap, self.db());
+            self.parent.__loaded.remove(self.key());
+            return child;
+        }
+        fn create(values: HashMap<string, any>) -> T {
+            let obj = self.relatedMap.info.create() as T;
+            Persister.fill(obj, self.relatedMap, values, true);
+            return self.save(obj);
+        }
+        fn existence(outer: Builder) -> Builder {
+            let inner = outer.__sub(self.relatedMap, "__orbit_${outer.__depth + 1}");
+            inner.__addCond(" AND ", Relation.on(inner, self.idField) + " = " + Relation.on(outer, self.localKey), new Array<any>());
+            inner.where(self.typeField.field.name, self.parentMap.morphName);
+            return inner;
+        }
+        fn eager(parents: Array<Model>, nested: string) {
+            let q = new Query<T>(self.relatedMap);
+            q.whereIn(self.idField.field.name, Relation.keysOf(parents, self.localKey));
+            q.where(self.typeField.field.name, self.parentMap.morphName);
+            if (nested != "") { q.with(nested); }
+            let groups = new HashMap<string, Array<T>>();
+            for (kid in q.get()) {
+                let k = "${self.idField.field.get(kid)}";
+                if (!groups.containsKey(k)) { groups.put(k, new Array<T>()); }
+                groups[k].push(kid);
+            }
+            for (p in parents) { p.__keepList(self.key(), Relation.models::<T>(groups.getOr("${self.localKey.field.get(p)}", new Array<T>()))); p.__loaded.put(self.key(), groups.getOr("${self.localKey.field.get(p)}", new Array<T>())); }
+        }
+    }
+
+    // The T object whose `<name>_id` and `<name>_type` point to this one.
+    class MorphOne<T> extends Relation {
+        private many: MorphMany<T>
+        constructor(parent: Model, name: string) {
+            super(parent, reflect(T));
+            self.many = new MorphMany<T>(parent, name);
+        }
+        fn key() -> string { return "morphOne:" + self.many.key(); }
+        fn query() -> Query<T> { return self.many.query(); }
+        fn get() -> T {
+            if (self.loaded()) { return self.parent.__loaded[self.key()] as T; }
+            return self.many.query().first();
+        }
+        fn save(child: T) -> T { return self.many.save(child); }
+        fn create(values: HashMap<string, any>) -> T { return self.many.create(values); }
+        fn existence(outer: Builder) -> Builder { return self.many.existence(outer); }
+        fn eager(parents: Array<Model>, nested: string) {
+            self.many.eager(parents, nested);
+            for (p in parents) {
+                let all = p.__loaded[self.many.key()] as Array<T>;
+                p.__loaded.put(self.key(), all.size() == 0 ? null : all[0]);
+            }
+        }
+    }
+
+    // The object `<name>_type` and `<name>_id` point to, of whichever mapped class
+    // the type names (its morph name: the class name, or @MorphName).
+    class MorphTo extends Relation {
+        public idField: FieldMap
+        public typeField: FieldMap
+        public name: string
+
+        constructor(parent: Model, name: string) {
+            super(parent, null);
+            self.name = name;
+            self.idField = Relation.field(self.parentMap, name + "_id", "morphTo " + name);
+            self.typeField = Relation.field(self.parentMap, name + "_type", "morphTo " + name);
+        }
+        fn key() -> string { return "morphTo:" + self.name; }
+        // The object it points to, or null.
+        fn get() -> Model {
+            if (self.loaded()) { return self.parent.__loaded[self.key()] as Model; }
+            let kind = self.typeField.field.get(self.parent);
+            let id = self.idField.field.get(self.parent);
+            if (kind == null || id == null) { return null; }
+            let map = MorphTo.mapOf("${kind}");
+            return new Query<Model>(map).find(id);
+        }
+        // Points it at `owner` (save the object to keep it).
+        fn associate(owner: Model) -> Model {
+            if (owner == null) {
+                self.idField.field.set(self.parent, null);
+                self.typeField.field.set(self.parent, null);
+            } else {
+                let map = TableMap.of(ClassInfo.of(owner));
+                self.idField.field.set(self.parent, map.requireId().field.get(owner));
+                self.typeField.field.set(self.parent, map.morphName);
+            }
+            self.parent.__loaded.put(self.key(), owner);
+            return self.parent;
+        }
+        fn existence(outer: Builder) -> Builder {
+            throw new StateError("whereHas cannot follow the polymorphic '" + self.name + "': query each type's own relation instead");
+        }
+        fn eager(parents: Array<Model>, nested: string) {
+            let byType = new HashMap<string, Array<Model>>();
+            for (p in parents) {
+                let t = self.typeField.field.get(p);
+                if (t == null) { p.__loaded.put(self.key(), null); continue; }
+                let k = "${t}";
+                if (!byType.containsKey(k)) { byType.put(k, new Array<Model>()); }
+                byType[k].push(p);
+            }
+            for (t in byType.keys()) {
+                let map = MorphTo.mapOf(t);
+                let group = byType[t];
+                let q = new Query<Model>(map);
+                q.whereIn(map.requireId().field.name, Relation.keysOf(group, self.idField));
+                if (nested != "") { q.with(nested); }
+                let byId = new HashMap<string, Model>();
+                for (o in q.get()) { byId.put("${map.id.field.get(o)}", o); }
+                for (p in group) { p.__loaded.put(self.key(), byId.getOr("${self.idField.field.get(p)}", null)); }
+            }
+        }
+        // The mapping of the class morph name `type` stands for.
+        static fn mapOf(kind: string) -> TableMap {
+            let info = TableMap.morphed(kind);
+            if (info == null) {
+                throw new StateError("no mapped class has the morph name '" + kind + "': call Orbit.morphMap(\"" + kind + "\", reflect(...)) first");
+            }
+            return TableMap.of(info);
+        }
+    }
+
+    // Settings that are not about one connection.
+    class Orbit {
+        // Makes `name` stand for `info`'s class in polymorphic relations' type columns.
+        static fn morphMap(name: string, info: ClassInfo) { TableMap.registerMorph(name, info); }
+        // Registers each class's morph name (so morphTo can find them before they are used).
+        static fn register(infos: Array<ClassInfo>) { for (i in infos) { TableMap.of(i); } }
+    }
+}

@@ -1,0 +1,469 @@
+// model.grav — Model, the base of ActiveRecord-style classes, and Repository,
+// the same operations for a class without that base.
+//
+//   class User extends Model {
+//       public id: long = 0
+//       public name: string = ""
+//       public createdAt: DateTime? = null        // filled in on save
+//       public updatedAt: DateTime? = null
+//       fn posts() -> HasMany<Post> { return self.hasMany() }
+//   }
+//
+//   DB.connect(Sqlite.open("app.db"))
+//   let u = User.create(fields("name", "Ada"))   // INSERT; u.id filled in
+//   u.name = "Ada L."
+//   u.save()                                     // UPDATE
+//   let back = User.find(u.id)                   // a User, or null
+//   let busy = User.has("posts", ">=", 3).with("posts").latest().get()
+//   u.delete()
+import "std"
+import "grav-db"
+import "mapping.grav"
+import "db.grav"
+import "builder.grav"
+import "relations.grav"
+import "schema.grav"
+
+namespace orbit {
+
+    // A map of field values, for create, fill, where and the like:
+    // `fields("name", "Ada", "age", 36)`.
+    fn fields(...pairs: any) -> HashMap<string, any> {
+        let m = new HashMap<string, any>();
+        let n = pairs.length;
+        if (n % 2 != 0) { throw new ValueError("fields takes names and values in pairs"); }
+        let i = 0;
+        while (i < n) {
+            if (!(pairs[i] is string)) { throw new ValueError("fields: argument ${i + 1} should be a field name"); }
+            m.put(pairs[i] as string, pairs[i + 1]);
+            i += 2;
+        }
+        return m;
+    }
+
+    // Saving, loading and deleting objects of a mapped class (what Model,
+    // Repository and Query share).
+    class Persister {
+        // A new object of the class with the row's columns in its fields.
+        static fn load(map: TableMap, row: Row) -> any {
+            let obj = map.info.create();
+            Persister.read(obj, map, row);
+            if (obj is Model) { (obj as Model).__exists = true; }
+            map.fire("retrieved", obj);
+            return obj;
+        }
+        // Copies the row's columns into `obj`'s fields (those the class maps).
+        static fn read(obj: any, map: TableMap, row: Row) {
+            for (m in map.fields) {
+                if (!row.has(m.column)) { continue; }
+                let v = row.get(m.column);
+                if (v != null) {
+                    if (m.kind == "decimal" && !(v is Decimal)) { v = row.getDecimal(m.column); }
+                    else if (m.kind == "json" && !(v is JsonValue)) { v = row.getJson(m.column); }
+                    else if (m.kind == "datetime" && !(v is DateTime)) { v = row.getDateTime(m.column); }
+                }
+                m.field.set(obj, v);
+            }
+        }
+        // Sets fields from `values` (field names); with `mass`, @Guarded fields and a
+        // numbered id are left out, as from user input.
+        static fn fill(obj: any, map: TableMap, values: HashMap<string, any>, mass: bool) {
+            for (k in values.keys()) {
+                let m = map.find(k);
+                if (m != null) {
+                    if (mass && m.guarded) { continue; }
+                    m.field.set(obj, values[k]);
+                    continue;
+                }
+                let f = map.info.field(k);
+                if (f == null) { throw new ValueError(map.info.simpleName() + " has no field '" + k + "'"); }
+                f.set(obj, values[k]);
+            }
+        }
+        // Whether `obj` is not saved yet: its numbered id is still 0 (or null).
+        static fn isNew(obj: any, map: TableMap) -> bool {
+            if (map.id == null || !map.id.auto) { return obj is Model && !(obj as Model).__exists; }
+            let v = map.id.field.get(obj);
+            return v == null || (v is long && (v as long) == 0) || (v is int && (v as int) == 0);
+        }
+        // Inserts `obj` (filling in its id) or updates its row; createdAt and
+        // updatedAt are set when the class has them.
+        static fn save(obj: any, map: TableMap, db: Connection) {
+            let now = DateTime.now();
+            map.fire("saving", obj);
+            if (Persister.isNew(obj, map)) {
+                if (map.createdAt != null && map.createdAt.field.get(obj) == null) { map.createdAt.field.set(obj, now); }
+                if (map.updatedAt != null) { map.updatedAt.field.set(obj, now); }
+                map.fire("creating", obj);
+                if (obj is Model) { (obj as Model).beforeCreate(); }
+                Persister.insert(obj, map, db);
+                if (obj is Model) { (obj as Model).afterCreate(); }
+                map.fire("created", obj);
+            } else {
+                if (map.updatedAt != null) { map.updatedAt.field.set(obj, now); }
+                map.fire("updating", obj);
+                if (obj is Model) { (obj as Model).beforeUpdate(); }
+                if (Persister.update(obj, map, db) == 0 && map.id != null && !map.id.auto) { Persister.insert(obj, map, db); }
+                if (obj is Model) { (obj as Model).afterUpdate(); }
+                map.fire("updated", obj);
+            }
+            map.fire("saved", obj);
+        }
+        static fn insert(obj: any, map: TableMap, db: Connection) {
+            let cols = new Array<string>();
+            let marks = new Array<string>();
+            let args = new Array<any>();
+            let numbered = map.id != null && map.id.auto && Persister.isNew(obj, map);
+            for (m in map.fields) {
+                if (numbered && m.isId) { continue; }
+                cols.push(db.quote(m.column));
+                marks.push("?");
+                args.push(m.field.get(obj));
+            }
+            let sql = "INSERT INTO " + db.quote(map.table) +
+                      (cols.size() == 0 ? (db.driver() == "mysql" ? " () VALUES ()" : " DEFAULT VALUES") : " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")");
+            if (numbered) {
+                if (db.driver() == "postgres") { sql = sql + " RETURNING " + db.quote(map.id.column); }
+                map.id.field.set(obj, db.insert(sql, args));
+            } else {
+                db.execute(sql, args);
+            }
+            if (obj is Model) { (obj as Model).__exists = true; }
+        }
+        // Updates `obj`'s row; how many rows it changed (0 when there is none with its id).
+        static fn update(obj: any, map: TableMap, db: Connection) -> long {
+            let id = map.requireId();
+            let sets = new Array<string>();
+            let args = new Array<any>();
+            for (m in map.fields) {
+                if (m.isId) { continue; }
+                sets.push(db.quote(m.column) + " = ?");
+                args.push(m.field.get(obj));
+            }
+            if (sets.size() == 0) { return 0; }
+            args.push(id.field.get(obj));
+            return db.execute("UPDATE " + db.quote(map.table) + " SET " + Str.join(sets, ", ") + " WHERE " + db.quote(id.column) + " = ?", args);
+        }
+        // Deletes `obj`'s row (with `force` even for a @SoftDeletes class); whether there was one.
+        static fn delete(obj: any, map: TableMap, db: Connection, force: bool) -> bool {
+            let id = map.requireId();
+            map.fire("deleting", obj);
+            if (map.softDelete != null && !force) {
+                map.softDelete.field.set(obj, DateTime.now());
+                let marked = Persister.update(obj, map, db) > 0;
+                map.fire("deleted", obj);
+                return marked;
+            }
+            let args = new Array<any>();
+            args.push(id.field.get(obj));
+            let gone = db.execute("DELETE FROM " + db.quote(map.table) + " WHERE " + db.quote(id.column) + " = ?", args) > 0;
+            if (obj is Model) { (obj as Model).__exists = false; }
+            map.fire("deleted", obj);
+            return gone;
+        }
+        // The field values of `obj` as a map (column values; @Hidden left out;
+        // DateTime as ISO text, Decimal and the rest as they are), with its loaded relations.
+        static fn toMap(obj: any, map: TableMap) -> HashMap<string, any> {
+            let out = new HashMap<string, any>();
+            for (m in map.fields) { if (!m.hidden) { out.put(m.field.name, m.field.get(obj)); } }
+            if (obj is Model) {
+                let model = obj as Model;
+                for (k in model.__extra.keys()) { out.put(k, model.__extra[k]); }
+                for (k in model.__names.keys()) {
+                    let key = model.__names[k];
+                    let v = model.__loaded.getOr(key + "#models", model.__loaded.getOr(key, null));   // (a list as Array<Model>)
+                    out.put(k, Persister.plain(v));
+                }
+            }
+            return out;
+        }
+        // A loaded relation's value for toMap: models as maps, lists of them as lists.
+        static fn plain(v: any) -> any {
+            if (v == null) { return null; }
+            if (v is Model) { let m = v as Model; return Persister.toMap(m, TableMap.of(ClassInfo.of(m))); }
+            if (v is Array<Model>) {
+                let out = new Array<any>();
+                for (x in v as Array<Model>) { out.push(Persister.plain(x)); }
+                return out;
+            }
+            return v;
+        }
+        // A value as JSON.
+        static fn json(v: any) -> JsonValue {
+            if (v == null) { return Json.nil(); }
+            if (v is bool) { return Json.of(v as bool); }
+            if (v is long) { return Json.of(v as long); }
+            if (v is int) { return Json.of((v as int) as long); }
+            if (v is float) { return Json.of(v as float); }
+            if (v is string) { return Json.of(v as string); }
+            if (v is DateTime) { return Json.of((v as DateTime).iso()); }
+            if (v is Decimal) { return Json.of((v as Decimal).toString()); }
+            if (v is JsonValue) { return v as JsonValue; }
+            if (v is Bytes) { return Json.of((v as Bytes).toHex()); }
+            if (v is HashMap<string, any>) {
+                let o = Json.object();
+                let m = v as HashMap<string, any>;
+                for (k in m.keys()) { o.set(k, Persister.json(m[k])); }
+                return o;
+            }
+            if (v is Array<any>) {
+                let a = Json.array();
+                for (x in v as Array<any>) { a.push(Persister.json(x)); }
+                return a;
+            }
+            return Json.of("${v}");
+        }
+    }
+
+    // The base of a mapped class whose objects save and find themselves (see the
+    // top of this file). Its static methods work on the class they are called
+    // on: User.find(1) is a User.
+    class Model {
+        // (Internals: loaded relations by key, their names, extra columns a query
+        // selected, and whether the row exists for a class without a numbered id.)
+        @Ignore public __loaded: HashMap<string, any> = new HashMap<string, any>()
+        @Ignore public __names: HashMap<string, string> = new HashMap<string, string>()
+        @Ignore public __extra: HashMap<string, any> = new HashMap<string, any>()
+        @Ignore public __exists: bool = false
+
+        // ── queries (each starts a Query of this class) ──────────────────────────
+        static fn query() -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))); }
+        static fn where(name: string, op: string, value: any) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).where(name, op, value); }
+        static fn where(name: string, value: any) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).where(name, value); }
+        static fn where(group: fn(Builder)) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).where(group); }
+        static fn whereIn(name: string, values: Array<any>) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).whereIn(name, values); }
+        static fn whereNotIn(name: string, values: Array<any>) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).whereNotIn(name, values); }
+        static fn whereNull(name: string) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).whereNull(name); }
+        static fn whereNotNull(name: string) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).whereNotNull(name); }
+        static fn whereBetween(name: string, lo: any, hi: any) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).whereBetween(name, lo, hi); }
+        static fn whereLike(name: string, pattern: string) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).whereLike(name, pattern); }
+        static fn whereColumn(a: string, op: string, b: string) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).whereColumn(a, op, b); }
+        static fn whereRaw(sql: string, args: Array<any> = new Array<any>()) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).whereRaw(sql, args); }
+        static fn has(relation: string, op: string = ">=", count: int = 1) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).has(relation, op, count); }
+        static fn doesntHave(relation: string) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).doesntHave(relation); }
+        static fn whereHas(relation: string, f: fn(Builder)) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).whereHas(relation, f); }
+        static fn whereDoesntHave(relation: string, f: fn(Builder)) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).whereDoesntHave(relation, f); }
+        static fn with(relation: string) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).with(relation); }
+        static fn with(relations: Array<string>) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).with(relations); }
+        static fn withCount(relation: string) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).withCount(relation); }
+        static fn withTrashed() -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).withTrashed(); }
+        static fn onlyTrashed() -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).onlyTrashed(); }
+        static fn select(names: Array<string>) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).select(names); }
+        static fn orderBy(name: string, direction: string = "asc") -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).orderBy(name, direction); }
+        static fn latest(name: string = "createdAt") -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).latest(name); }
+        static fn oldest(name: string = "createdAt") -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).oldest(name); }
+        static fn limit(n: long) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).limit(n); }
+
+        // ── answers ──────────────────────────────────────────────────────────────
+        static fn all() -> Array<Self> { return new Query<Self>(TableMap.of(reflect(Self))).get(); }
+        static fn first() -> Self { return new Query<Self>(TableMap.of(reflect(Self))).first(); }
+        // The object with id `id`, or null (a soft-deleted one too: null).
+        static fn find(id: any) -> Self { return new Query<Self>(TableMap.of(reflect(Self))).find(id); }
+        static fn findOrFail(id: any) -> Self { return new Query<Self>(TableMap.of(reflect(Self))).findOrFail(id); }
+        static fn findMany(ids: Array<any>) -> Array<Self> { return new Query<Self>(TableMap.of(reflect(Self))).findMany(ids); }
+        static fn count() -> long { return new Query<Self>(TableMap.of(reflect(Self))).count(); }
+        static fn sum(name: string) -> Decimal { return new Query<Self>(TableMap.of(reflect(Self))).sum(name); }
+        static fn avg(name: string) -> float { return new Query<Self>(TableMap.of(reflect(Self))).avg(name); }
+        static fn min(name: string) -> any { return new Query<Self>(TableMap.of(reflect(Self))).min(name); }
+        static fn max(name: string) -> any { return new Query<Self>(TableMap.of(reflect(Self))).max(name); }
+        static fn pluck(name: string) -> Array<any> { return new Query<Self>(TableMap.of(reflect(Self))).pluck(name); }
+        static fn paginate(page: long = 1, perPage: long = 15) -> Page<Self> { return new Query<Self>(TableMap.of(reflect(Self))).paginate(page, perPage); }
+        static fn chunk(size: int, f: fn(Array<Self>)) { new Query<Self>(TableMap.of(reflect(Self))).chunk(size, f); }
+
+        // ── making and changing ─────────────────────────────────────────────────
+        // A new object with these fields set (not @Guarded ones), saved.
+        static fn create(values: HashMap<string, any>) -> Self {
+            let map = TableMap.of(reflect(Self));
+            let obj = map.info.create() as Self;
+            Persister.fill(obj, map, values, true);
+            obj.save();
+            return obj;
+        }
+        // A new object with these fields set, not saved.
+        static fn make(values: HashMap<string, any>) -> Self {
+            let map = TableMap.of(reflect(Self));
+            let obj = map.info.create() as Self;
+            Persister.fill(obj, map, values, true);
+            return obj;
+        }
+        static fn firstOrCreate(attrs: HashMap<string, any>, values: HashMap<string, any> = new HashMap<string, any>()) -> Self {
+            return new Query<Self>(TableMap.of(reflect(Self))).firstOrCreate(attrs, values);
+        }
+        static fn firstOrNew(attrs: HashMap<string, any>, values: HashMap<string, any> = new HashMap<string, any>()) -> Self {
+            return new Query<Self>(TableMap.of(reflect(Self))).firstOrNew(attrs, values);
+        }
+        static fn updateOrCreate(attrs: HashMap<string, any>, values: HashMap<string, any>) -> Self {
+            return new Query<Self>(TableMap.of(reflect(Self))).updateOrCreate(attrs, values);
+        }
+        // Deletes the objects with these ids; how many.
+        static fn destroy(ids: Array<any>) -> long { return new Query<Self>(TableMap.of(reflect(Self))).whereKey(ids).delete(); }
+        // Saves many new objects in one transaction.
+        static fn saveAll(objs: Array<Self>) {
+            let map = TableMap.of(reflect(Self));
+            let db = DB.connection(map.connection);
+            db.transaction(fn() { for (o in objs) { Persister.save(o, map, db); } });
+        }
+
+        // ── the table ────────────────────────────────────────────────────────────
+        // Creates this class's table from its fields (when it does not exist yet).
+        static fn createTable() { let map = TableMap.of(reflect(Self)); Schema.createFor(map, DB.connection(map.connection)); }
+        static fn dropTable() { let map = TableMap.of(reflect(Self)); DB.connection(map.connection).exec("DROP TABLE IF EXISTS " + DB.connection(map.connection).quote(map.table)); }
+        // Deletes every row.
+        static fn truncate() { let map = TableMap.of(reflect(Self)); let db = DB.connection(map.connection); db.exec("DELETE FROM " + db.quote(map.table)); }
+        static fn tableName() -> string { return TableMap.of(reflect(Self)).table; }
+
+        // ── this object ──────────────────────────────────────────────────────────
+        // Inserts it (filling in its id) or, once saved, updates its row.
+        fn save() -> Self {
+            let map = self.__map();
+            self.beforeSave();
+            Persister.save(self, map, self.__db());
+            self.afterSave();
+            return self;
+        }
+        // Sets these fields (not @Guarded ones) and saves.
+        fn update(values: HashMap<string, any>) -> Self { Persister.fill(self, self.__map(), values, true); return self.save(); }
+        // Sets these fields (not @Guarded ones), without saving.
+        fn fill(values: HashMap<string, any>) -> Self { Persister.fill(self, self.__map(), values, true); return self; }
+        // Deletes its row (for a @SoftDeletes class: marks it deleted); whether there was one.
+        fn delete() -> bool {
+            self.beforeDelete();
+            let gone = Persister.delete(self, self.__map(), self.__db(), false);
+            self.afterDelete();
+            return gone;
+        }
+        // Deletes its row, even for a @SoftDeletes class.
+        fn forceDelete() -> bool { return Persister.delete(self, self.__map(), self.__db(), true); }
+        // Undoes a soft delete.
+        fn restore() -> Self {
+            let map = self.__map();
+            if (map.softDelete == null) { throw new StateError(map.info.simpleName() + " is not @SoftDeletes"); }
+            map.softDelete.field.set(self, null);
+            Persister.update(self, map, self.__db());
+            return self;
+        }
+        // Whether a soft delete marked it.
+        fn trashed() -> bool { let sd = self.__map().softDelete; return sd != null && sd.field.get(self) != null; }
+        // Reads its row again (NotFound when it is gone).
+        fn refresh() -> Self {
+            let map = self.__map();
+            let row = new Builder(map, map.table, self.__db()).withTrashed().whereKey(map.requireId().field.get(self)).rows();
+            if (row.size() == 0) { throw new NotFound("the " + map.info.simpleName() + " is no longer in " + map.table); }
+            Persister.read(self, map, row.get(0));
+            self.__loaded.clear();
+            return self;
+        }
+        // Adds `by` to a field, in the object and its row (decrement subtracts).
+        fn increment(name: string, by: long = 1) -> Self { return self.bump(name, by); }
+        fn decrement(name: string, by: long = 1) -> Self { return self.bump(name, 0 - by); }
+        // Saves it with updatedAt set to now.
+        fn touch() -> Self { return self.save(); }
+        // Whether it is not saved yet.
+        fn isNew() -> bool { return Persister.isNew(self, self.__map()); }
+        // Whether `other` is the same row (same class and id).
+        fn isSame(other: Model) -> bool {
+            if (other == null || ClassInfo.of(other) != ClassInfo.of(self)) { return false; }
+            let id = self.__map().id;
+            return id != null && Object.equals(id.field.get(self), id.field.get(other));
+        }
+        // A copy without its id (not saved): cast it to the class (`u.replicate() as User`).
+        fn replicate() -> Model {
+            let map = self.__map();
+            let copy = map.info.create() as Model;
+            for (m in map.fields) { if (!m.isId) { m.field.set(copy, m.field.get(self)); } }
+            return copy;
+        }
+        // Loads `relation` now (as with() does for a query).
+        fn load(relation: string) -> Self {
+            let list = new Array<Model>();
+            list.push(self);
+            Relation.eagerLoad(list, relation);
+            return self;
+        }
+        // Whether `relation` is loaded.
+        fn relationLoaded(relation: string) -> bool { return self.__names.containsKey(relation); }
+        // A count withCount added (`countOf("posts")` for posts_count), or 0.
+        fn countOf(relation: string) -> long { return Builder.toLong(self.__extra.getOr(Naming.snake(relation) + "_count", 0)); }
+        // A column the query selected beyond the fields (selectRaw, withCount, a pivot's columns).
+        fn extra(name: string) -> any { return self.__extra.getOr(name, null); }
+        // Its fields (not @Hidden), and its loaded relations.
+        fn toMap() -> HashMap<string, any> { return Persister.toMap(self, self.__map()); }
+        fn toJson() -> string { return Persister.json(self.toMap()).toJson(); }
+
+        // ── relations (return them from methods: see relations.grav) ────────────
+        // The T objects whose `foreignKey` (default: this class's name, snake_case, + "_id") is this one's id.
+        fn hasMany<T>(foreignKey: string = "", localKey: string = "") -> HasMany<T> { return new HasMany<T>(self, foreignKey, localKey); }
+        fn hasOne<T>(foreignKey: string = "", localKey: string = "") -> HasOne<T> { return new HasOne<T>(self, foreignKey, localKey); }
+        // The T this one's `foreignKey` (default: T's name, snake_case, + "_id") names.
+        fn belongsTo<T>(foreignKey: string = "", ownerKey: string = "") -> BelongsTo<T> { return new BelongsTo<T>(self, foreignKey, ownerKey); }
+        // T objects linked through a pivot table (default: both names, snake_case, in alphabetical order: "role_user").
+        fn belongsToMany<T>(table: string = "", foreignPivotKey: string = "", relatedPivotKey: string = "") -> BelongsToMany<T> {
+            return new BelongsToMany<T>(self, table, foreignPivotKey, relatedPivotKey, "", false);
+        }
+        // Polymorphic: the T objects whose `<name>_id` and `<name>_type` point here.
+        fn morphMany<T>(name: string) -> MorphMany<T> { return new MorphMany<T>(self, name); }
+        fn morphOne<T>(name: string) -> MorphOne<T> { return new MorphOne<T>(self, name); }
+        // Polymorphic: the object `<name>_type` and `<name>_id` point to (any mapped class).
+        fn morphTo(name: string) -> MorphTo { return new MorphTo(self, name); }
+        // Polymorphic many-to-many through `<name>s` ("taggables"): T objects linked
+        // to this one, and (morphedByMany) the T objects linked to a tag.
+        fn morphToMany<T>(name: string, table: string = "") -> BelongsToMany<T> { return new BelongsToMany<T>(self, table, "", "", name, false); }
+        fn morphedByMany<T>(name: string, table: string = "") -> BelongsToMany<T> { return new BelongsToMany<T>(self, table, "", "", name, true); }
+
+        // ── hooks (override them; throw to stop the change) ─────────────────────
+        fn beforeSave() {}
+        fn afterSave() {}
+        fn beforeCreate() {}
+        fn afterCreate() {}
+        fn beforeUpdate() {}
+        fn afterUpdate() {}
+        fn beforeDelete() {}
+        fn afterDelete() {}
+
+        // (Internals.)
+        // Keeps a loaded list also as models, for toMap and toJson (an Array<Post> is not an Array<Model>).
+        fn __keepList(key: string, models: Array<Model>) { self.__loaded.put(key + "#models", models); }
+        fn __map() -> TableMap { return TableMap.of(ClassInfo.of(self)); }
+        fn __db() -> Connection { return DB.connection(self.__map().connection); }
+        private fn bump(name: string, by: long) -> Self {
+            let map = self.__map();
+            let m = map.find(name);
+            if (m == null) { throw new ValueError(map.info.simpleName() + " has no field '" + name + "'"); }
+            let now = m.field.get(self);
+            let n = now is long ? now as long : now is int ? (now as int) as long : 0;
+            m.field.set(self, n + by);
+            new Builder(map, map.table, self.__db()).withTrashed().whereKey(map.requireId().field.get(self)).increment(name, by);
+            if (map.updatedAt != null) { map.updatedAt.field.set(self, DateTime.now()); }
+            return self;
+        }
+    }
+
+    // Saving and finding objects of class T on a given connection, for classes
+    // that do not extend Model (or another database than the default).
+    class Repository<T> {
+        private map: TableMap
+        private db: Connection
+
+        constructor(db: Connection) { self.db = db; self.map = TableMap.of(reflect(T)); }
+
+        fn query() -> Query<T> { let q = new Query<T>(self.map); q.on(self.db); return q; }
+        fn where(name: string, op: string, value: any) -> Query<T> { return self.query().where(name, op, value); }
+        fn where(name: string, value: any) -> Query<T> { return self.query().where(name, value); }
+        fn all() -> Array<T> { return self.query().get(); }
+        fn find(id: any) -> T { return self.query().find(id); }
+        fn findOrFail(id: any) -> T { return self.query().findOrFail(id); }
+        fn count() -> long { return self.query().count(); }
+        // Inserts or updates `obj`.
+        fn save(obj: T) -> T { Persister.save(obj, self.map, self.db); return obj; }
+        // Saves each of `objs`, in one transaction.
+        fn saveAll(objs: Array<T>) {
+            let map = self.map;
+            let db = self.db;
+            db.transaction(fn() { for (o in objs) { Persister.save(o, map, db); } });
+        }
+        fn delete(obj: T) -> bool { return Persister.delete(obj, self.map, self.db, false); }
+        fn createTable() { Schema.createFor(self.map, self.db); }
+        fn dropTable() { self.db.exec("DROP TABLE IF EXISTS " + self.db.quote(self.map.table)); }
+        fn tableName() -> string { return self.map.table; }
+    }
+}

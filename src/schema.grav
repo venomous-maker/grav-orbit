@@ -1,0 +1,379 @@
+// schema.grav — tables: from a model's fields (Model.createTable), or written
+// out with a Blueprint, in each database's SQL.
+//
+//   Schema.create("posts", fn(t: Blueprint) {
+//       t.id()
+//       t.foreignId("user_id").constrained().cascadeOnDelete()
+//       t.varchar("title")
+//       t.text("body").nullable()
+//       t.boolean("published").defaultValue(false)
+//       t.decimal("price", 10, 2)
+//       t.json("meta").nullable()
+//       t.timestamps()
+//       t.softDeletes()
+//       t.index("title")
+//   })
+//   Schema.table("posts", fn(t: Blueprint) { t.varchar("slug").nullable(); t.renameColumn("body", "content") })
+//   Schema.dropIfExists("posts")
+//   if (!Schema.hasTable("posts")) { ... }
+import "std"
+import "grav-db"
+import "mapping.grav"
+import "db.grav"
+import "builder.grav"
+
+namespace orbit {
+
+    // One column of a Blueprint; its methods change it and return it.
+    class ColumnDef {
+        public name: string
+        public kind: string
+        public length: int = 0
+        public precision: int = 0
+        public scale: int = 0
+        public isNullable: bool = false
+        public isUnique: bool = false
+        public isIndexed: bool = false
+        public isPrimary: bool = false
+        public isUnsigned: bool = false
+        public hasDefault: bool = false
+        public defaultSql: string = ""
+        public refTable: string = ""
+        public refColumn: string = "id"
+        public onDeleteAction: string = ""
+        public onUpdateAction: string = ""
+        public changing: bool = false
+
+        constructor(name: string, kind: string) { self.name = Builder.ident(name); self.kind = kind; }
+
+        // NULL allowed (or not).
+        fn nullable(yes: bool = true) -> ColumnDef { self.isNullable = yes; return self; }
+        fn unique() -> ColumnDef { self.isUnique = true; return self; }
+        fn index() -> ColumnDef { self.isIndexed = true; return self; }
+        fn primary() -> ColumnDef { self.isPrimary = true; return self; }
+        fn unsigned() -> ColumnDef { self.isUnsigned = true; return self; }
+        // Its value when an INSERT gives none: a number, bool, string or null.
+        fn defaultValue(v: any) -> ColumnDef { self.hasDefault = true; self.defaultSql = Schema.literal(v); return self; }
+        // A default in SQL (`defaultRaw("CURRENT_TIMESTAMP")`).
+        fn defaultRaw(sql: string) -> ColumnDef { self.hasDefault = true; self.defaultSql = sql; return self; }
+        fn useCurrent() -> ColumnDef { return self.defaultRaw("CURRENT_TIMESTAMP"); }
+        // A foreign key to `table` (by default: this column's name without _id, plural: user_id -> users).
+        fn constrained(table: string = "", column: string = "id") -> ColumnDef {
+            let t = table;
+            if (t == "") {
+                let base = Str.endsWith(self.name, "_id") ? self.name[..self.name.length - 3] : self.name;
+                t = Naming.plural(base);
+            }
+            self.refTable = Builder.ident(t);
+            self.refColumn = Builder.ident(column);
+            return self;
+        }
+        fn references(column: string) -> ColumnDef { self.refColumn = Builder.ident(column); return self; }
+        fn on(table: string) -> ColumnDef { self.refTable = Builder.ident(table); return self; }
+        // What deleting (updating) the referenced row does: "cascade", "set null", "restrict", "no action".
+        fn onDelete(action: string) -> ColumnDef { self.onDeleteAction = Schema.action(action); return self; }
+        fn onUpdate(action: string) -> ColumnDef { self.onUpdateAction = Schema.action(action); return self; }
+        fn cascadeOnDelete() -> ColumnDef { return self.onDelete("cascade"); }
+        fn nullOnDelete() -> ColumnDef { return self.onDelete("set null"); }
+        fn restrictOnDelete() -> ColumnDef { return self.onDelete("restrict"); }
+        fn cascadeOnUpdate() -> ColumnDef { return self.onUpdate("cascade"); }
+        // In Schema.table: changes an existing column to this definition (MySQL, PostgreSQL).
+        fn change() -> ColumnDef { self.changing = true; return self; }
+    }
+
+    // The columns, indexes and changes of one table (see the top of this file).
+    class Blueprint {
+        public table: string
+        public columns: Array<ColumnDef> = new Array<ColumnDef>()
+        private commands: Array<string> = new Array<string>()       // "kind|name|args"
+        private indexCols: Array<Array<string>> = new Array<Array<string>>()
+
+        constructor(table: string) { self.table = Builder.ident(table); }
+
+        fn add(name: string, kind: string) -> ColumnDef { let c = new ColumnDef(name, kind); self.columns.push(c); return c; }
+
+        // ── keys ─────────────────────────────────────────────────────────────────
+        // A numbered BIGINT primary key (`id` by default); increments: an INT one.
+        fn id(name: string = "id") -> ColumnDef { return self.add(name, "bigIncrements"); }
+        fn bigIncrements(name: string) -> ColumnDef { return self.add(name, "bigIncrements"); }
+        fn increments(name: string) -> ColumnDef { return self.add(name, "increments"); }
+        // A BIGINT for a foreign key (then .constrained() for the constraint).
+        fn foreignId(name: string) -> ColumnDef { return self.add(name, "foreignId"); }
+        fn uuid(name: string = "uuid") -> ColumnDef { return self.add(name, "uuid"); }
+        // ── numbers ──────────────────────────────────────────────────────────────
+        fn integer(name: string) -> ColumnDef { return self.add(name, "integer"); }
+        fn bigInteger(name: string) -> ColumnDef { return self.add(name, "bigInteger"); }
+        fn smallInteger(name: string) -> ColumnDef { return self.add(name, "smallInteger"); }
+        fn tinyInteger(name: string) -> ColumnDef { return self.add(name, "tinyInteger"); }
+        fn unsignedInteger(name: string) -> ColumnDef { return self.add(name, "integer").unsigned(); }
+        fn unsignedBigInteger(name: string) -> ColumnDef { return self.add(name, "bigInteger").unsigned(); }
+        fn decimal(name: string, precision: int = 8, scale: int = 2) -> ColumnDef {
+            let c = self.add(name, "decimal");
+            c.precision = precision;
+            c.scale = scale;
+            return c;
+        }
+        fn real(name: string) -> ColumnDef { return self.add(name, "float"); }
+        fn doublePrecision(name: string) -> ColumnDef { return self.add(name, "double"); }
+        fn boolean(name: string) -> ColumnDef { return self.add(name, "boolean"); }
+        // ── text and data ────────────────────────────────────────────────────────
+        fn varchar(name: string, length: int = 255) -> ColumnDef { let c = self.add(name, "string"); c.length = length; return c; }
+        fn fixedChar(name: string, length: int = 255) -> ColumnDef { let c = self.add(name, "char"); c.length = length; return c; }
+        fn text(name: string) -> ColumnDef { return self.add(name, "text"); }
+        fn longText(name: string) -> ColumnDef { return self.add(name, "longText"); }
+        fn json(name: string) -> ColumnDef { return self.add(name, "json"); }
+        fn binary(name: string) -> ColumnDef { return self.add(name, "binary"); }
+        // ── dates ────────────────────────────────────────────────────────────────
+        fn date(name: string) -> ColumnDef { return self.add(name, "date"); }
+        fn dateTime(name: string) -> ColumnDef { return self.add(name, "dateTime"); }
+        fn timestamp(name: string) -> ColumnDef { return self.add(name, "dateTime"); }
+        fn time(name: string) -> ColumnDef { return self.add(name, "time"); }
+        // created_at and updated_at, both nullable (what Model fills in).
+        fn timestamps() {
+            self.add("created_at", "dateTime").nullable();
+            self.add("updated_at", "dateTime").nullable();
+        }
+        // deleted_at, nullable (for @SoftDeletes).
+        fn softDeletes(name: string = "deleted_at") -> ColumnDef { return self.add(name, "dateTime").nullable(); }
+        // <name>_id and <name>_type, indexed together (a polymorphic relation's columns).
+        fn morphs(name: string) {
+            self.add(name + "_id", "bigInteger").unsigned();
+            self.add(name + "_type", "string");
+            let cols = new Array<string>();
+            cols.push(name + "_type");
+            cols.push(name + "_id");
+            self.index(cols);
+        }
+        fn nullableMorphs(name: string) {
+            self.add(name + "_id", "bigInteger").unsigned().nullable();
+            self.add(name + "_type", "string").nullable();
+            let cols = new Array<string>();
+            cols.push(name + "_type");
+            cols.push(name + "_id");
+            self.index(cols);
+        }
+        // ── indexes ──────────────────────────────────────────────────────────────
+        fn index(column: string) { let a = new Array<string>(); a.push(column); self.index(a); }
+        fn index(columns: Array<string>) { self.addIndex("index", columns); }
+        fn unique(columns: Array<string>) { self.addIndex("unique", columns); }
+        fn primary(columns: Array<string>) { self.addIndex("primary", columns); }
+        // ── changes (Schema.table) ───────────────────────────────────────────────
+        fn dropColumn(name: string) { self.commands.push("dropColumn|" + Builder.ident(name)); }
+        fn renameColumn(from: string, to: string) { self.commands.push("renameColumn|" + Builder.ident(from) + "|" + Builder.ident(to)); }
+        fn dropIndex(name: string) { self.commands.push("dropIndex|" + Builder.ident(name)); }
+        fn dropTimestamps() { self.dropColumn("created_at"); self.dropColumn("updated_at"); }
+        fn dropSoftDeletes() { self.dropColumn("deleted_at"); }
+
+        // The SQL to create the table on `db`.
+        fn createSql(db: Connection) -> Array<string> {
+            let d = db.driver();
+            let parts = new Array<string>();
+            let keys = new Array<string>();
+            for (c in self.columns) {
+                parts.push(Schema.columnSql(c, d, db));
+                if (c.refTable != "") { keys.push(Schema.foreignSql(c, db)); }
+            }
+            for (i, cols in self.indexCols) {
+                if (self.indexKind(i) == "primary") { parts.push("PRIMARY KEY (" + Schema.quoted(cols, db) + ")"); }
+            }
+            for (k in keys) { parts.push(k); }
+            let out = new Array<string>();
+            out.push("CREATE TABLE " + db.quote(self.table) + " (" + Str.join(parts, ", ") + ")");
+            for (s in self.indexSql(db)) { out.push(s); }
+            return out;
+        }
+        // The SQL to change the table on `db`.
+        fn alterSql(db: Connection) -> Array<string> {
+            let d = db.driver();
+            let t = db.quote(self.table);
+            let out = new Array<string>();
+            for (c in self.columns) {
+                if (c.changing) {
+                    if (d == "sqlite") { throw new StateError("SQLite cannot change a column: create a new table and copy the rows"); }
+                    if (d == "mysql") { out.push("ALTER TABLE " + t + " MODIFY " + Schema.columnSql(c, d, db)); }
+                    else {
+                        out.push("ALTER TABLE " + t + " ALTER COLUMN " + db.quote(c.name) + " TYPE " + Schema.typeSql(c, d));
+                        out.push("ALTER TABLE " + t + " ALTER COLUMN " + db.quote(c.name) + (c.isNullable ? " DROP NOT NULL" : " SET NOT NULL"));
+                    }
+                    continue;
+                }
+                out.push("ALTER TABLE " + t + " ADD COLUMN " + Schema.columnSql(c, d, db));
+                if (c.refTable != "") {
+                    if (d == "sqlite") { throw new StateError("SQLite cannot add a foreign key to an existing table"); }
+                    out.push("ALTER TABLE " + t + " ADD " + Schema.foreignSql(c, db));
+                }
+            }
+            for (cmd in self.commands) {
+                let p = Str.split(cmd, "|");
+                if (p[0] == "dropColumn") { out.push("ALTER TABLE " + t + " DROP COLUMN " + db.quote(p[1])); }
+                else if (p[0] == "renameColumn") { out.push("ALTER TABLE " + t + " RENAME COLUMN " + db.quote(p[1]) + " TO " + db.quote(p[2])); }
+                else if (p[0] == "dropIndex") { out.push(d == "mysql" ? "DROP INDEX " + db.quote(p[1]) + " ON " + t : "DROP INDEX " + db.quote(p[1])); }
+            }
+            for (s in self.indexSql(db)) { out.push(s); }
+            return out;
+        }
+
+        private fn addIndex(kind: string, columns: Array<string>) {
+            let cols = new Array<string>();
+            for (c in columns) { cols.push(Builder.ident(c)); }
+            self.indexCols.push(cols);
+            self.commands.push("index|" + kind);
+        }
+        private fn indexKind(i: int) -> string {
+            let n = 0;
+            for (cmd in self.commands) {
+                if (Str.startsWith(cmd, "index|")) {
+                    if (n == i) { return cmd[6..]; }
+                    n += 1;
+                }
+            }
+            return "index";
+        }
+        private fn indexSql(db: Connection) -> Array<string> {
+            let out = new Array<string>();
+            for (c in self.columns) {
+                if (c.isIndexed) { out.push("CREATE INDEX " + db.quote(self.table + "_" + c.name + "_index") + " ON " + db.quote(self.table) + " (" + db.quote(c.name) + ")"); }
+            }
+            for (i, cols in self.indexCols) {
+                let kind = self.indexKind(i);
+                if (kind == "primary") { continue; }
+                let name = self.table + "_" + Str.join(cols, "_") + (kind == "unique" ? "_unique" : "_index");
+                out.push((kind == "unique" ? "CREATE UNIQUE INDEX " : "CREATE INDEX ") + db.quote(name) + " ON " + db.quote(self.table) + " (" + Schema.quoted(cols, db) + ")");
+            }
+            return out;
+        }
+    }
+
+    // Creating, changing and inspecting tables (see the top of this file). Each
+    // runs on the default connection, or `on` a given one.
+    class Schema {
+        static fn create(table: string, f: fn(Blueprint)) { Schema.createOn(DB.connection(), table, f); }
+        static fn createOn(db: Connection, table: string, f: fn(Blueprint)) {
+            let b = new Blueprint(table);
+            f(b);
+            for (s in b.createSql(db)) { db.exec(s); }
+        }
+        // Changes table `table`: new columns, and the changes the Blueprint lists.
+        static fn table(table: string, f: fn(Blueprint)) { Schema.tableOn(DB.connection(), table, f); }
+        static fn tableOn(db: Connection, table: string, f: fn(Blueprint)) {
+            let b = new Blueprint(table);
+            f(b);
+            for (s in b.alterSql(db)) { db.exec(s); }
+        }
+        static fn drop(table: string) { let db = DB.connection(); db.exec("DROP TABLE " + db.quote(Builder.ident(table))); }
+        static fn dropIfExists(table: string) { let db = DB.connection(); db.exec("DROP TABLE IF EXISTS " + db.quote(Builder.ident(table))); }
+        static fn rename(from: string, to: string) {
+            let db = DB.connection();
+            db.exec("ALTER TABLE " + db.quote(Builder.ident(from)) + " RENAME TO " + db.quote(Builder.ident(to)));
+        }
+        static fn hasTable(table: string) -> bool { return Schema.hasTableOn(DB.connection(), table); }
+        static fn hasTableOn(db: Connection, table: string) -> bool {
+            let a = new Array<any>();
+            a.push(table);
+            let d = db.driver();
+            let sql = d == "sqlite" ? "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?"
+                    : d == "mysql" ? "SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?"
+                    : "SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = ?";
+            return db.queryOne(sql, a) != null;
+        }
+        static fn hasColumn(table: string, column: string) -> bool {
+            for (c in Schema.columns(table)) { if (c == column) { return true; } }
+            return false;
+        }
+        // The column names of `table`, in order.
+        static fn columns(table: string) -> Array<string> {
+            let db = DB.connection();
+            let a = new Array<any>();
+            a.push(Builder.ident(table));
+            let d = db.driver();
+            let sql = d == "sqlite" ? "SELECT name FROM pragma_table_info(?) ORDER BY cid"
+                    : d == "mysql" ? "SELECT column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? ORDER BY ordinal_position"
+                    : "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ? ORDER BY ordinal_position";
+            let out = new Array<string>();
+            for (row in db.query(sql, a)) { out.push(row.getString(row.columns()[0])); }
+            return out;
+        }
+
+        // A model's table from its mapping (Model.createTable), when it does not exist.
+        static fn createFor(map: TableMap, db: Connection) {
+            let d = db.driver();
+            let cols = new Array<string>();
+            for (m in map.fields) {
+                let def = db.quote(m.column) + " " + TableMap.sqlType(m, d);
+                if (m.isId) { def = def + " PRIMARY KEY"; }
+                else {
+                    if (!m.nullable) { def = def + " NOT NULL"; }
+                    if (m.unique) { def = def + " UNIQUE"; }
+                }
+                cols.push(def);
+            }
+            db.exec("CREATE TABLE IF NOT EXISTS " + db.quote(map.table) + " (" + Str.join(cols, ", ") + ")");
+        }
+
+        // ── SQL pieces ───────────────────────────────────────────────────────────
+        static fn columnSql(c: ColumnDef, d: string, db: Connection) -> string {
+            let s = db.quote(c.name) + " " + Schema.typeSql(c, d);
+            if (c.kind == "bigIncrements" || c.kind == "increments") { return s; }
+            if (!c.isNullable) { s = s + " NOT NULL"; }
+            if (c.hasDefault) { s = s + " DEFAULT " + (d == "sqlite" && c.defaultSql == "TRUE" ? "1" : d == "sqlite" && c.defaultSql == "FALSE" ? "0" : c.defaultSql); }
+            if (c.isUnique) { s = s + " UNIQUE"; }
+            if (c.isPrimary) { s = s + " PRIMARY KEY"; }
+            return s;
+        }
+        static fn typeSql(c: ColumnDef, d: string) -> string {
+            let my = d == "mysql";
+            let pg = d == "postgres";
+            let lite = d == "sqlite";
+            let u = my && c.isUnsigned ? " UNSIGNED" : "";
+            switch (c.kind) {
+                case "bigIncrements": return pg ? "BIGSERIAL PRIMARY KEY" : my ? "BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY" : "INTEGER PRIMARY KEY AUTOINCREMENT"
+                case "increments": return pg ? "SERIAL PRIMARY KEY" : my ? "INT UNSIGNED AUTO_INCREMENT PRIMARY KEY" : "INTEGER PRIMARY KEY AUTOINCREMENT"
+                case "foreignId": return lite ? "INTEGER" : my ? "BIGINT UNSIGNED" : "BIGINT"
+                case "integer": return (my ? "INT" : "INTEGER") + u
+                case "bigInteger": return (lite ? "INTEGER" : "BIGINT") + u
+                case "smallInteger": return (lite ? "INTEGER" : "SMALLINT") + u
+                case "tinyInteger": return my ? "TINYINT" + u : lite ? "INTEGER" : "SMALLINT"
+                case "decimal": return (pg ? "NUMERIC" : "DECIMAL") + "(${c.precision}, ${c.scale})"
+                case "float": return my ? "FLOAT" : "REAL"
+                case "double": return pg ? "DOUBLE PRECISION" : my ? "DOUBLE" : "REAL"
+                case "boolean": return "BOOLEAN"
+                case "string": return "VARCHAR(${c.length > 0 ? c.length : 255})"
+                case "char": return "CHAR(${c.length > 0 ? c.length : 255})"
+                case "text": return "TEXT"
+                case "longText": return my ? "LONGTEXT" : "TEXT"
+                case "json": return pg ? "JSONB" : "JSON"
+                case "binary": return pg ? "BYTEA" : my ? "LONGBLOB" : "BLOB"
+                case "date": return "DATE"
+                case "dateTime": return pg ? "TIMESTAMPTZ" : my ? "DATETIME(6)" : "DATETIME"
+                case "time": return "TIME"
+                case "uuid": return pg ? "UUID" : my ? "CHAR(36)" : "TEXT"
+            }
+            return "TEXT";
+        }
+        static fn foreignSql(c: ColumnDef, db: Connection) -> string {
+            let s = "FOREIGN KEY (" + db.quote(c.name) + ") REFERENCES " + db.quote(c.refTable) + " (" + db.quote(c.refColumn) + ")";
+            if (c.onDeleteAction != "") { s = s + " ON DELETE " + c.onDeleteAction; }
+            if (c.onUpdateAction != "") { s = s + " ON UPDATE " + c.onUpdateAction; }
+            return s;
+        }
+        static fn quoted(cols: Array<string>, db: Connection) -> string {
+            let q = new Array<string>();
+            for (c in cols) { q.push(db.quote(c)); }
+            return Str.join(q, ", ");
+        }
+        // A value as an SQL literal for DEFAULT.
+        static fn literal(v: any) -> string {
+            if (v == null) { return "NULL"; }
+            if (v is bool) { return (v as bool) ? "TRUE" : "FALSE"; }
+            if (v is long || v is int || v is float || v is Decimal) { return "${v}"; }
+            return "'" + Str.replace("${v}", "'", "''") + "'";
+        }
+        static fn action(a: string) -> string {
+            let x = Str.upper(Str.trim(a));
+            if (x != "CASCADE" && x != "SET NULL" && x != "RESTRICT" && x != "NO ACTION" && x != "SET DEFAULT") {
+                throw new ValueError("not a foreign key action: '" + a + "' (cascade, set null, restrict, no action, set default)");
+            }
+            return x;
+        }
+    }
+}

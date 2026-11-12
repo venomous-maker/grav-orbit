@@ -1,0 +1,165 @@
+// factory.grav — test and demo data: Fake (made-up names, emails, text,
+// numbers, dates), Factory<T> (models from a definition), and Seeder.
+//
+//   let users = new Factory<User>(fn(f: Fake) -> HashMap<string, any> {
+//       return fields("name", f.name(), "email", f.uniqueEmail(), "age", f.number(18, 90))
+//   })
+//   users.count(10).create()                                   // ten saved Users
+//   users.state(fields("admin", true)).create()                // one admin
+//   let draft = users.make()                                   // not saved
+//
+//   class DatabaseSeeder extends Seeder {
+//       fn run() { self.call(new UserSeeder()); self.call(new PostSeeder()) }
+//   }
+//   Seeder.seed(new DatabaseSeeder())                          // in a transaction
+import "std"
+import "grav-db"
+import "mapping.grav"
+import "db.grav"
+import "model.grav"
+
+namespace orbit {
+
+    // Made-up values. Seeded (Fake.seed(42) or new Fake(42)) it gives the same values each run.
+    class Fake {
+        private rng: Rng
+        private counter: long = 0
+        private static shared: Fake = new Fake(20260101)
+
+        constructor(seed: long) { self.rng = new Rng(seed); }
+        // The Fake factories use.
+        static fn shared() -> Fake { return Fake.shared; }
+        static fn seed(n: long) { Fake.shared = new Fake(n); }
+
+        static fn firstNames() -> Array<string> { return ["Ada", "Alan", "Grace", "Linus", "Margaret", "Dennis", "Barbara", "Ken", "Frances", "Edsger", "Radia", "Niklaus", "Hedy", "Donald", "Sophie", "Tim", "Katherine", "John", "Mary", "Wanjiru", "Kofi", "Amara", "Chen", "Priya"]; }
+        static fn lastNames() -> Array<string> { return ["Lovelace", "Turing", "Hopper", "Torvalds", "Hamilton", "Ritchie", "Liskov", "Thompson", "Allen", "Dijkstra", "Perlman", "Wirth", "Lamarr", "Knuth", "Wilson", "Berners-Lee", "Johnson", "McCarthy", "Kenyatta", "Mensah", "Okafor", "Wei", "Sharma", "Mwangi"]; }
+        static fn words() -> Array<string> { return ["orbit", "gravity", "planet", "signal", "harbor", "lantern", "meadow", "copper", "river", "summit", "velvet", "ember", "cedar", "quartz", "tide", "falcon", "prism", "atlas", "nova", "ridge", "willow", "beacon", "delta", "zephyr"]; }
+        static fn cities() -> Array<string> { return ["Nairobi", "Lagos", "Accra", "Cairo", "Lisbon", "Oslo", "Kyoto", "Lima", "Quito", "Perth", "Austin", "Dublin", "Mombasa", "Kigali", "Seoul", "Porto"]; }
+
+        fn firstName() -> string { return self.pick(Fake.firstNames()); }
+        fn lastName() -> string { return self.pick(Fake.lastNames()); }
+        fn name() -> string { return self.firstName() + " " + self.lastName(); }
+        fn userName() -> string { return Str.lower(self.firstName()) + "${self.number(1, 999)}"; }
+        fn email() -> string { return Str.lower(self.firstName() + "." + Str.replace(self.lastName(), "-", "")) + "${self.number(1, 99)}@example.com"; }
+        // An email no other call of this Fake gives.
+        fn uniqueEmail() -> string {
+            self.counter += 1;
+            return Str.lower(self.firstName()) + ".${self.counter}@example.com";
+        }
+        fn word() -> string { return self.pick(Fake.words()); }
+        fn sentence(words: int = 6) -> string {
+            let parts = new Array<string>();
+            for (i in 0..words) { parts.push(self.word()); }
+            let s = Str.join(parts, " ");
+            return Str.capitalize(s) + ".";
+        }
+        fn paragraph(sentences: int = 3) -> string {
+            let parts = new Array<string>();
+            for (i in 0..sentences) { parts.push(self.sentence(self.number(4, 10) as int)); }
+            return Str.join(parts, " ");
+        }
+        fn city() -> string { return self.pick(Fake.cities()); }
+        fn phone() -> string { return "+254 7${self.number(10, 99)} ${self.number(100, 999)} ${self.number(100, 999)}"; }
+        fn url() -> string { return "https://" + self.word() + ".example.com/" + self.word(); }
+        // A whole number in [min, max].
+        fn number(min: long, max: long) -> long { return self.rng.nextLong(min, max); }
+        // A float in [min, max), rounded to `decimals` places.
+        fn real(min: float, max: float, decimals: int = 2) -> float { return Float.round(min + self.rng.nextFloat() * (max - min), decimals); }
+        // An exact amount in [min, max] with `scale` decimals (money).
+        fn decimal(min: long, max: long, scale: int = 2) -> Decimal {
+            let p = Integer.pow(10, scale);
+            return Decimal.of(self.rng.nextLong(min * p, max * p), scale);
+        }
+        // True with probability `percent` / 100.
+        fn boolean(percent: int = 50) -> bool { return self.rng.nextLong(1, 100) <= (percent as long); }
+        // One of `xs`.
+        fn pick(xs: Array<string>) -> string { return xs[self.rng.nextInt(0, xs.size() - 1)]; }
+        // A moment in the last `days` days, or the next.
+        fn pastDate(days: int = 365) -> DateTime { return DateTime.fromUnix(DateTime.now().unix() - self.rng.nextLong(0, (days as long) * 86400)); }
+        fn futureDate(days: int = 365) -> DateTime { return DateTime.fromUnix(DateTime.now().unix() + self.rng.nextLong(0, (days as long) * 86400)); }
+        // A random UUID (version 4).
+        fn uuid() -> string {
+            let hex = "0123456789abcdef";
+            let sb = new StringBuilder();
+            for (i in 0..36) {
+                if (i == 8 || i == 13 || i == 18 || i == 23) { sb.append("-"); continue; }
+                if (i == 14) { sb.append("4"); continue; }
+                let n = self.rng.nextInt(0, 15);
+                if (i == 19) { n = 8 + n % 4; }
+                sb.append(hex[n..n + 1]);
+            }
+            return sb.toString();
+        }
+    }
+
+    // Objects of T made from a definition: new ones (make), or saved (create).
+    class Factory<T> {
+        private definition: fn(Fake) -> HashMap<string, any>
+        private states: Array<fn(Fake) -> HashMap<string, any>> = new Array<fn(Fake) -> HashMap<string, any>>()
+        private sequences: Array<fn(int) -> HashMap<string, any>> = new Array<fn(int) -> HashMap<string, any>>()
+        private after: Array<fn(T)> = new Array<fn(T)>()
+        private times: int = 1
+        private made: int = 0
+        private fake: Fake = null
+
+        constructor(definition: fn(Fake) -> HashMap<string, any>) { self.definition = definition; }
+
+        // How many create and make give (createMany, makeMany).
+        fn count(n: int) -> Factory<T> { self.times = n; return self; }
+        // Fields set after the definition's (a variant: an admin, an unverified user).
+        fn state(values: HashMap<string, any>) -> Factory<T> { self.states.push(fn(f: Fake) -> HashMap<string, any> => values); return self; }
+        fn state(f: fn(Fake) -> HashMap<string, any>) -> Factory<T> { self.states.push(f); return self; }
+        // Fields from the object's number (0, 1, ...): `sequence(fn(i) => fields("rank", i))`.
+        fn sequence(f: fn(int) -> HashMap<string, any>) -> Factory<T> { self.sequences.push(f); return self; }
+        // Runs after each object is saved (to give it related objects).
+        fn afterCreating(f: fn(T)) -> Factory<T> { self.after.push(f); return self; }
+        // Uses `fake` (a seeded one) instead of the shared Fake.
+        fn using(fake: Fake) -> Factory<T> { self.fake = fake; return self; }
+
+        // The fields one object would get.
+        fn raw() -> HashMap<string, any> {
+            let f = self.fake == null ? Fake.shared() : self.fake;
+            let v = self.definition(f);
+            for (s in self.states) { let more = s(f); for (k in more.keys()) { v.put(k, more[k]); } }
+            for (s in self.sequences) { let more = s(self.made); for (k in more.keys()) { v.put(k, more[k]); } }
+            self.made += 1;
+            return v;
+        }
+        // One object, not saved (with `overrides` set last).
+        fn make(overrides: HashMap<string, any> = new HashMap<string, any>()) -> T {
+            let map = TableMap.of(reflect(T));
+            let obj = map.info.create() as T;
+            Persister.fill(obj, map, self.raw(), false);
+            Persister.fill(obj, map, overrides, false);
+            return obj;
+        }
+        fn makeMany(overrides: HashMap<string, any> = new HashMap<string, any>()) -> Array<T> {
+            let out = new Array<T>();
+            for (i in 0..self.times) { out.push(self.make(overrides)); }
+            return out;
+        }
+        // One object, saved.
+        fn create(overrides: HashMap<string, any> = new HashMap<string, any>()) -> T {
+            let map = TableMap.of(reflect(T));
+            let obj = self.make(overrides);
+            Persister.save(obj, map, DB.connection(map.connection));
+            for (f in self.after) { f(obj); }
+            return obj;
+        }
+        // `count` objects, saved in one transaction.
+        fn createMany(overrides: HashMap<string, any> = new HashMap<string, any>()) -> Array<T> {
+            let map = TableMap.of(reflect(T));
+            let out = new Array<T>();
+            DB.connection(map.connection).transaction(fn() { for (i in 0..self.times) { out.push(self.create(overrides)); } });
+            return out;
+        }
+    }
+
+    // Puts data in the database: override run; call runs other seeders.
+    abstract class Seeder {
+        abstract fn run()
+        fn call(other: Seeder) { other.run(); }
+        // Runs `s` in one transaction.
+        static fn seed(s: Seeder) { DB.transaction(fn() { s.run(); }); }
+    }
+}

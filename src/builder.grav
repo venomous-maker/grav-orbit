@@ -1,0 +1,734 @@
+// builder.grav — building SQL queries: the clauses (Builder), queries for a
+// model class (Query<T>) and for a table without one (TableQuery). Values are
+// always `?` arguments, never SQL text; names are checked against the model's
+// fields (or must be plain identifiers), so a typo is an error, not SQL.
+//
+//   User.where("age", ">=", 18)
+//       .where(fn(q: Builder) { q.where("role", "admin").orWhere("role", "editor") })
+//       .whereNotNull("verifiedAt")
+//       .whereHas("posts", fn(p: Builder) { p.where("published", true) })
+//       .with("posts.comments")
+//       .orderBy("name").limit(20)
+//       .all()
+import "std"
+import "grav-db"
+import "mapping.grav"
+import "db.grav"
+import "model.grav"
+import "relations.grav"
+
+namespace orbit {
+
+    // The clauses of a query, shared by Query<T> and TableQuery (see the top of
+    // this file). Each method adds to the query and returns it.
+    class Builder {
+        // (Internals, read by relations and subqueries.)
+        public __map: TableMap
+        public __table: string
+        public __alias: string
+        public __db: Connection
+        public __depth: int = 0
+        private conds: Array<string> = new Array<string>()
+        private ops: Array<string> = new Array<string>()
+        private args: Array<any> = new Array<any>()
+        private selects: Array<string> = new Array<string>()
+        private selectArgs: Array<any> = new Array<any>()
+        private extraSelects: Array<string> = new Array<string>()   // (withCount: after the columns)
+        private distinctRows: bool = false
+        private joinSql: Array<string> = new Array<string>()
+        private groups: Array<string> = new Array<string>()
+        private havings: Array<string> = new Array<string>()
+        private havingOps: Array<string> = new Array<string>()
+        private havingArgs: Array<any> = new Array<any>()
+        private orders: Array<string> = new Array<string>()
+        private lim: long = -1
+        private off: long = -1
+        private lockRows: bool = false
+        public __withs: Array<string> = new Array<string>()
+        // Global scopes (behaviors' apply), by name: their conditions and arguments.
+        private scopeNames: Array<string> = new Array<string>()
+        private scopeSqls: Array<string> = new Array<string>()
+        private scopeArgs: Array<Array<any>> = new Array<Array<any>>()
+        // selectRaw's `expr AS alias` pairs: having("alias", ...) puts the expression
+        // back, since PostgreSQL takes no aliases in HAVING.
+        private aliases: HashMap<string, string> = new HashMap<string, string>()
+        // 0: rows a soft delete removed are left out; 1: with them; 2: only them.
+        public __trashed: int = 0
+
+        constructor(map: TableMap, table: string, db: Connection) {
+            self.__map = map;
+            self.__table = table;
+            self.__alias = table;
+            self.__db = db;
+        }
+
+        // Runs on `db` instead of the default connection.
+        fn on(db: Connection) -> Self { self.__db = db; return self; }
+
+        // ── where ───────────────────────────────────────────────────────────────
+        // `name op value`: op is =, !=, <>, <, <=, >, >=, like, not like, ilike.
+        fn where(name: string, op: string, value: any) -> Self { return self.compare(" AND ", name, op, value); }
+        // `name = value` (IS NULL for null).
+        fn where(name: string, value: any) -> Self { return self.compare(" AND ", name, "=", value); }
+        // A group in parentheses: `where(fn(q) { q.where(a).orWhere(b) })`.
+        fn where(group: fn(Builder)) -> Self { return self.nest(" AND ", group, false); }
+        fn orWhere(name: string, op: string, value: any) -> Self { return self.compare(" OR ", name, op, value); }
+        fn orWhere(name: string, value: any) -> Self { return self.compare(" OR ", name, "=", value); }
+        fn orWhere(group: fn(Builder)) -> Self { return self.nest(" OR ", group, false); }
+        // `name != value` (IS NOT NULL for null), and NOT (group).
+        fn whereNot(name: string, value: any) -> Self { return self.compare(" AND ", name, "!=", value); }
+        fn whereNot(group: fn(Builder)) -> Self { return self.nest(" AND ", group, true); }
+        fn orWhereNot(group: fn(Builder)) -> Self { return self.nest(" OR ", group, true); }
+        // `name` is (not) one of `values` (none: no rows; for whereNotIn, all rows).
+        fn whereIn(name: string, values: Array<any>) -> Self { return self.inList(" AND ", name, values, false); }
+        fn whereNotIn(name: string, values: Array<any>) -> Self { return self.inList(" AND ", name, values, true); }
+        fn orWhereIn(name: string, values: Array<any>) -> Self { return self.inList(" OR ", name, values, false); }
+        fn orWhereNotIn(name: string, values: Array<any>) -> Self { return self.inList(" OR ", name, values, true); }
+        fn whereNull(name: string) -> Self { return self.cond(" AND ", self.col(name) + " IS NULL"); }
+        fn whereNotNull(name: string) -> Self { return self.cond(" AND ", self.col(name) + " IS NOT NULL"); }
+        fn orWhereNull(name: string) -> Self { return self.cond(" OR ", self.col(name) + " IS NULL"); }
+        fn orWhereNotNull(name: string) -> Self { return self.cond(" OR ", self.col(name) + " IS NOT NULL"); }
+        // lo <= name <= hi (and the NOT form).
+        fn whereBetween(name: string, lo: any, hi: any) -> Self { return self.between(" AND ", name, lo, hi, false); }
+        fn whereNotBetween(name: string, lo: any, hi: any) -> Self { return self.between(" AND ", name, lo, hi, true); }
+        fn orWhereBetween(name: string, lo: any, hi: any) -> Self { return self.between(" OR ", name, lo, hi, false); }
+        fn orWhereNotBetween(name: string, lo: any, hi: any) -> Self { return self.between(" OR ", name, lo, hi, true); }
+        // Two columns compared: `whereColumn("updatedAt", ">", "createdAt")`.
+        fn whereColumn(a: string, op: string, b: string) -> Self { return self.cond(" AND ", self.col(a) + " " + Builder.operator(op) + " " + self.col(b)); }
+        fn orWhereColumn(a: string, op: string, b: string) -> Self { return self.cond(" OR ", self.col(a) + " " + Builder.operator(op) + " " + self.col(b)); }
+        // A LIKE pattern (% any text, _ one character).
+        fn whereLike(name: string, pattern: string) -> Self { return self.compare(" AND ", name, "like", pattern); }
+        fn whereNotLike(name: string, pattern: string) -> Self { return self.compare(" AND ", name, "not like", pattern); }
+        fn orWhereLike(name: string, pattern: string) -> Self { return self.compare(" OR ", name, "like", pattern); }
+        // The date part of a date-time column: `whereDate("createdAt", ">=", "2024-01-01")`.
+        fn whereDate(name: string, op: string, value: any) -> Self {
+            let v: any = value is DateTime ? (value as DateTime).date() as any : value;
+            return self.condArgs(" AND ", self.datePart("date", self.col(name)) + " " + Builder.operator(op) + " ?", Builder.one(v));
+        }
+        // The year of a date-time column.
+        fn whereYear(name: string, op: string, year: int) -> Self {
+            return self.condArgs(" AND ", self.datePart("year", self.col(name)) + " " + Builder.operator(op) + " ?", Builder.one(year));
+        }
+        // The row whose id is `id` (or one of `ids`).
+        fn whereKey(id: any) -> Self { return self.where(self.idName(), id); }
+        fn whereKey(ids: Array<any>) -> Self { return self.whereIn(self.idName(), ids); }
+        // A condition in SQL, with `?` for its arguments.
+        fn whereRaw(sql: string, args: Array<any> = new Array<any>()) -> Self { return self.condArgs(" AND ", "(" + sql + ")", args); }
+        fn orWhereRaw(sql: string, args: Array<any> = new Array<any>()) -> Self { return self.condArgs(" OR ", "(" + sql + ")", args); }
+        // Applies `f` when `condition` holds (a filter that is optional).
+        fn when(condition: bool, f: fn(Builder)) -> Self { if (condition) { f(self); } return self; }
+        // Applies `f` (a scope kept in a function).
+        fn tap(f: fn(Builder)) -> Self { f(self); return self; }
+
+        // ── relations (see relations.grav) ──────────────────────────────────────
+        // Rows with at least one `relation` (op and count: `has("posts", ">=", 3)`).
+        fn has(relation: string, op: string = ">=", count: int = 1) -> Self { return self.relCond(" AND ", relation, null, op, count, false); }
+        fn orHas(relation: string, op: string = ">=", count: int = 1) -> Self { return self.relCond(" OR ", relation, null, op, count, false); }
+        fn doesntHave(relation: string) -> Self { return self.relCond(" AND ", relation, null, ">=", 1, true); }
+        // Rows with a `relation` matching `f` ("posts.comments" goes through both).
+        fn whereHas(relation: string, f: fn(Builder)) -> Self { return self.relCond(" AND ", relation, f, ">=", 1, false); }
+        fn whereHas(relation: string, f: fn(Builder), op: string, count: int) -> Self { return self.relCond(" AND ", relation, f, op, count, false); }
+        fn orWhereHas(relation: string, f: fn(Builder)) -> Self { return self.relCond(" OR ", relation, f, ">=", 1, false); }
+        fn whereDoesntHave(relation: string, f: fn(Builder)) -> Self { return self.relCond(" AND ", relation, f, ">=", 1, true); }
+        fn orWhereDoesntHave(relation: string, f: fn(Builder)) -> Self { return self.relCond(" OR ", relation, f, ">=", 1, true); }
+        // Loads `relation` (one query for all the rows; "posts.comments" loads both) with the results.
+        fn with(relation: string) -> Self { self.__withs.push(relation); return self; }
+        fn with(relations: Array<string>) -> Self { for (r in relations) { self.__withs.push(r); } return self; }
+        // Adds `<relation>_count` (snake_case) to each row: how many it has; read with model.countOf("posts").
+        fn withCount(relation: string) -> Self { return self.withCount(relation, null); }
+        fn withCount(relation: string, f: fn(Builder)) -> Self {
+            let inner = self.relationExistence(relation);
+            if (f != null) { f(inner); }
+            self.extraSelects.push("(" + inner.__subSql("COUNT(*)") + ") AS " + self.q(Naming.snake(relation) + "_count"));
+            for (a in inner.__bindings()) { self.selectArgs.push(a); }
+            return self;
+        }
+
+        // ── soft deletes (@SoftDeletes models) ─────────────────────────────────
+        fn withTrashed() -> Self { self.__trashed = 1; return self; }
+        // Without the global scope of behavior `name` (or of all of them).
+        fn withoutScope(name: string) -> Self {
+            for (i in 0..self.scopeNames.size()) {
+                if (self.scopeNames[i] == name) { self.scopeSqls[i] = ""; self.scopeArgs[i] = new Array<any>(); }
+            }
+            return self;
+        }
+        fn withoutScopes() -> Self {
+            for (i in 0..self.scopeNames.size()) { self.scopeSqls[i] = ""; self.scopeArgs[i] = new Array<any>(); }
+            return self;
+        }
+        // Adds the global scopes of the model's behaviors (Query and relation subqueries do).
+        fn __applyScopes() {
+            if (self.__map == null) { return; }
+            for (u in self.__map.behaviors) {
+                let inner = new Builder(self.__map, self.__table, self.__db);
+                inner.__alias = self.__alias;
+                inner.__trashed = 1;
+                u.behavior.apply(inner, self.__map, u.decorator);
+                if (inner.conds.size() == 0) { continue; }
+                self.scopeNames.push(u.name);
+                self.scopeSqls.push("(" + inner.whereSql(false)[7..] + ")");
+                self.scopeArgs.push(inner.args);
+            }
+        }
+        fn onlyTrashed() -> Self { self.__trashed = 2; return self; }
+
+        // ── columns, joins, groups ──────────────────────────────────────────────
+        // Only these columns (field names, or `table.column` with joins).
+        fn select(names: Array<string>) -> Self { for (n in names) { self.selects.push(self.col(n)); } return self; }
+        // A column expression in SQL (`selectRaw("COUNT(*) AS total")`).
+        fn selectRaw(sql: string, args: Array<any> = new Array<any>()) -> Self {
+            self.selects.push(sql);
+            let depth = 0;
+            let start = 0;
+            for (i in 0..sql.length + 1) {
+                let c = i < sql.length ? sql[i] : (',' as byte);
+                if (c == ('(' as byte)) { depth += 1; }
+                else if (c == (')' as byte)) { depth -= 1; }
+                else if (c == (',' as byte) && depth == 0) {
+                    let piece = Str.trim(sql[start..i]);
+                    let at = Str.lastIndexOf(Str.lower(piece), " as ");
+                    if (at > 0) { self.aliases.put(Str.trim(piece[at + 4..]), Str.trim(piece[..at])); }
+                    start = i + 1;
+                }
+            }
+            for (a in args) { self.selectArgs.push(a); }
+            return self;
+        }
+        fn distinct() -> Self { self.distinctRows = true; return self; }
+        // INNER JOIN `table` ON first op second (`join("posts", "users.id", "=", "posts.user_id")`).
+        fn join(table: string, first: string, op: string, second: string) -> Self { return self.joinWith("INNER", table, first, op, second); }
+        fn leftJoin(table: string, first: string, op: string, second: string) -> Self { return self.joinWith("LEFT", table, first, op, second); }
+        fn rightJoin(table: string, first: string, op: string, second: string) -> Self { return self.joinWith("RIGHT", table, first, op, second); }
+        fn groupBy(name: string) -> Self { self.groups.push(self.col(name)); return self; }
+        // `having("total", ">", 10)` (a selected alias or a field), or havingRaw for an expression.
+        fn having(name: string, op: string, value: any) -> Self {
+            let lhs = self.__map != null && self.__map.find(name) != null ? self.col(name)
+                    : self.aliases.containsKey(name) ? self.aliases[name] : self.q(Builder.ident(name));
+            self.havingOps.push(" AND ");
+            self.havings.push(lhs + " " + Builder.operator(op) + " ?");
+            self.havingArgs.push(value);
+            return self;
+        }
+        fn havingRaw(sql: string, args: Array<any> = new Array<any>()) -> Self {
+            self.havingOps.push(" AND ");
+            self.havings.push("(" + sql + ")");
+            for (a in args) { self.havingArgs.push(a); }
+            return self;
+        }
+
+        // ── order and paging ─────────────────────────────────────────────────────
+        // By `name`, "asc" (the default) or "desc".
+        fn orderBy(name: string, direction: string = "asc") -> Self {
+            let d = Str.lower(direction);
+            if (d != "asc" && d != "desc") { throw new ValueError("an order is \"asc\" or \"desc\", not \"" + direction + "\""); }
+            self.orders.push(self.col(name) + (d == "desc" ? " DESC" : " ASC"));
+            return self;
+        }
+        fn orderByDesc(name: string) -> Self { return self.orderBy(name, "desc"); }
+        fn orderByRaw(sql: string) -> Self { self.orders.push(sql); return self; }
+        // Newest (or oldest) first, by `name` (createdAt by default).
+        fn latest(name: string = "createdAt") -> Self { return self.orderBy(name, "desc"); }
+        fn oldest(name: string = "createdAt") -> Self { return self.orderBy(name, "asc"); }
+        fn inRandomOrder() -> Self { self.orders.push(self.conn().driver() == "mysql" ? "RAND()" : "RANDOM()"); return self; }
+        // Drops the order given so far.
+        fn reorder() -> Self { self.orders.clear(); return self; }
+        // At most `n` rows (take is the same); skip the first `n` (skip is the same).
+        fn limit(n: long) -> Self { self.lim = n; return self; }
+        fn take(n: long) -> Self { self.lim = n; return self; }
+        fn offset(n: long) -> Self { self.off = n; return self; }
+        fn skip(n: long) -> Self { self.off = n; return self; }
+        // Page `page` (from 1) of `perPage` rows.
+        fn forPage(page: long, perPage: long) -> Self { self.lim = perPage; self.off = (page - 1) * perPage; return self; }
+        // Locks the rows it reads until the transaction ends (MySQL, PostgreSQL).
+        fn lockForUpdate() -> Self { self.lockRows = true; return self; }
+
+        // ── answers ──────────────────────────────────────────────────────────────
+        fn count() -> long { return Builder.toLong(self.aggregate("COUNT(*)")); }
+        fn exists() -> bool {
+            let keep = self.lim;
+            self.lim = 1;
+            let found = self.conn().queryOne(self.__sql("1"), self.__bindings()) != null;
+            self.lim = keep;
+            return found;
+        }
+        fn doesntExist() -> bool { return !self.exists(); }
+        // The total of a column, exactly (0 for no rows).
+        fn sum(name: string) -> Decimal {
+            let v = self.aggregate("SUM(" + self.col(name) + ")");
+            return v == null ? Decimal.of(0) : v is Decimal ? v as Decimal : v is long ? Decimal.of(v as long) :
+                   v is float ? Decimal.fromFloat(v as float) : Decimal.parse("${v}");
+        }
+        // The mean of a column (0 for no rows).
+        fn avg(name: string) -> float {
+            let v = self.aggregate("AVG(" + self.col(name) + ")");
+            return v == null ? 0.0 : v is float ? v as float : v is Decimal ? (v as Decimal).toFloat() : v is long ? (v as long) as float : Format.toFloatOr("${v}", 0.0);
+        }
+        // The smallest and largest value of a column (null for no rows).
+        fn min(name: string) -> any { return self.aggregate("MIN(" + self.col(name) + ")"); }
+        fn max(name: string) -> any { return self.aggregate("MAX(" + self.col(name) + ")"); }
+        // One column of every row, in order.
+        fn pluck(name: string) -> Array<any> {
+            let out = new Array<any>();
+            let keep = self.selects;
+            self.selects = new Array<string>();
+            self.selects.push(self.col(name));
+            let rows = self.conn().query(self.__sql(""), self.__bindings());
+            self.selects = keep;
+            for (row in rows) { out.push(row.at(0)); }
+            return out;
+        }
+        // One column of the first row (null for none).
+        fn value(name: string) -> any {
+            let keep = self.lim;
+            self.lim = 1;
+            let all = self.pluck(name);
+            self.lim = keep;
+            return all.size() == 0 ? null : all[0];
+        }
+        // The rows as they come (columns by name), for any query.
+        fn rows() -> ResultSet { return self.conn().query(self.__sql(""), self.__bindings()); }
+        // Deletes the matches (for a @SoftDeletes model: marks them deleted); how many.
+        fn delete() -> long {
+            if (self.__map != null && self.__map.softDelete != null) {
+                let v = new HashMap<string, any>();
+                v.put(self.__map.softDelete.field.name, DateTime.now());
+                return self.update(v);
+            }
+            return self.forceDelete();
+        }
+        // Deletes the matches, even of a @SoftDeletes model.
+        fn forceDelete() -> long {
+            let db = self.conn();
+            return db.execute("DELETE FROM " + db.quote(self.__table) + self.whereSql(false), self.whereArgs());
+        }
+        // Undoes a soft delete of the matches.
+        fn restore() -> long {
+            if (self.__map == null || self.__map.softDelete == null) { throw new StateError("restore is for @SoftDeletes models"); }
+            self.__trashed = 2;
+            let v = new HashMap<string, any>();
+            v.put(self.__map.softDelete.field.name, null);
+            return self.update(v);
+        }
+        // Sets columns (field names) on the matches; how many rows it changed. A
+        // model's updatedAt is set too.
+        fn update(values: HashMap<string, any>) -> long {
+            let db = self.conn();
+            let sets = new Array<string>();
+            let a = new Array<any>();
+            for (k in values.keys()) { sets.push(db.quote(self.column(k)) + " = ?"); a.push(values[k]); }
+            if (self.__map != null && self.__map.updatedAt != null && !values.containsKey(self.__map.updatedAt.field.name)) {
+                sets.push(db.quote(self.__map.updatedAt.column) + " = ?");
+                a.push(DateTime.now());
+            }
+            if (sets.size() == 0) { return 0; }
+            for (x in self.whereArgs()) { a.push(x); }
+            return db.execute("UPDATE " + db.quote(self.__table) + " SET " + Str.join(sets, ", ") + self.whereSql(true), a);
+        }
+        // Adds `by` to a column of the matches (subtracts, for decrement); the rows changed.
+        fn increment(name: string, by: long = 1) -> long { return self.bump(name, by); }
+        fn decrement(name: string, by: long = 1) -> long { return self.bump(name, 0 - by); }
+        // The SQL it runs, and its arguments (for logs).
+        fn toSql() -> string { return self.__sql(""); }
+        fn getBindings() -> Array<any> { return self.__bindings(); }
+
+        // ── the SQL (internals) ─────────────────────────────────────────────────
+        fn conn() -> Connection {
+            if (self.__db != null) { return self.__db; }
+            return DB.connection(self.__map == null ? "default" : self.__map.connection);
+        }
+        fn __bindings() -> Array<any> {
+            let all = new Array<any>();
+            for (a in self.selectArgs) { all.push(a); }
+            for (a in self.args) { all.push(a); }
+            for (sa in self.scopeArgs) { for (a in sa) { all.push(a); } }
+            for (a in self.havingArgs) { all.push(a); }
+            return all;
+        }
+        // SELECT `what` (its columns when "") FROM ... with every clause.
+        fn __sql(what: string) -> string {
+            let db = self.conn();
+            let sb = new StringBuilder();
+            sb.append(self.distinctRows ? "SELECT DISTINCT " : "SELECT ");
+            if (what != "") { sb.append(what); }
+            else {
+                sb.append(self.selects.size() > 0 ? Str.join(self.selects, ", ") : db.quote(self.__alias) + ".*");
+                for (x in self.extraSelects) { sb.append(", "); sb.append(x); }
+            }
+            sb.append(self.fromSql());
+            sb.append(self.whereSql(true));
+            if (self.groups.size() > 0) { sb.append(" GROUP BY "); sb.append(Str.join(self.groups, ", ")); }
+            if (self.havings.size() > 0) {
+                sb.append(" HAVING ");
+                for (i, h in self.havings) { if (i > 0) { sb.append(self.havingOps[i]); } sb.append(h); }
+            }
+            if (self.orders.size() > 0 && !Str.startsWith(what, "COUNT(") ) { sb.append(" ORDER BY "); sb.append(Str.join(self.orders, ", ")); }
+            if (self.lim >= 0) { sb.append(" LIMIT ${self.lim}"); }
+            if (self.off > 0) {
+                if (self.lim < 0) {
+                    let d = db.driver();
+                    sb.append(d == "mysql" ? " LIMIT 18446744073709551615" : d == "sqlite" ? " LIMIT -1" : "");
+                }
+                sb.append(" OFFSET ${self.off}");
+            }
+            if (self.lockRows && db.driver() != "sqlite") { sb.append(" FOR UPDATE"); }
+            return sb.toString();
+        }
+        // A subquery: SELECT `what` FROM ... WHERE ... (no order or paging).
+        fn __subSql(what: string) -> string { return "SELECT " + what + self.fromSql() + self.whereSql(true); }
+        // The conditions as one SQL expression ("1 = 1" for none), with __bindings' cond part.
+        fn __condSql() -> string {
+            let w = self.whereSql(true);
+            return w == "" ? "1 = 1" : w[7..];
+        }
+        fn __condArgs() -> Array<any> { return self.whereArgs(); }
+        // The arguments of the WHERE clause: the conditions', then the scopes'.
+        fn whereArgs() -> Array<any> {
+            let all = new Array<any>();
+            for (a in self.args) { all.push(a); }
+            for (sa in self.scopeArgs) { for (a in sa) { all.push(a); } }
+            return all;
+        }
+        // Adds an already-built condition (relations use it).
+        fn __addCond(join: string, sql: string, values: Array<any>) -> Self { return self.condArgs(join, sql, values); }
+        // A builder over `map`'s table under alias `alias`, nested one level deeper.
+        fn __sub(map: TableMap, alias: string) -> Builder {
+            let b = new Builder(map, map.table, self.conn());
+            b.__alias = alias;
+            b.__depth = self.__depth + 1;
+            b.__applyScopes();
+            return b;
+        }
+        // `table.column` (quoted) for a field name, column name or `table.column`.
+        fn col(name: string) -> string {
+            let dot = Str.indexOf(name, ".");
+            if (dot > 0) {
+                let t = Builder.ident(name[..dot]);
+                let c = name[dot + 1..];
+                if ((t == self.__alias || t == self.__table) && self.__map != null) { return self.q(self.__alias) + "." + self.q(self.column(c)); }
+                return self.q(t) + "." + self.q(Builder.ident(c));
+            }
+            return self.q(self.__alias) + "." + self.q(self.column(name));
+        }
+        // The column for a field name (or a column name; any identifier without a model).
+        fn column(name: string) -> string {
+            if (self.__map == null) { return Builder.ident(name); }
+            let m = self.__map.find(name);
+            if (m == null) { throw new ValueError(self.__map.info.simpleName() + " has no field or column '" + name + "' (whereRaw takes SQL)"); }
+            return m.column;
+        }
+        fn q(name: string) -> string { return self.conn().quote(name); }
+
+        private fn idName() -> string {
+            if (self.__map == null || self.__map.id == null) { return "id"; }
+            return self.__map.id.field.name;
+        }
+        private fn fromSql() -> string {
+            let from = " FROM " + self.q(self.__table) + (self.__alias != self.__table ? " AS " + self.q(self.__alias) : "");
+            return self.joinSql.size() == 0 ? from : from + " " + Str.join(self.joinSql, " ");
+        }
+        // " WHERE ..." for the conditions (and the soft-delete one when `scoped`), or "".
+        private fn whereSql(scoped: bool) -> string {
+            let parts = new StringBuilder();
+            for (i, c in self.conds) {
+                if (i > 0) { parts.append(self.ops[i]); }
+                parts.append(c);
+            }
+            let body = parts.toString();
+            for (sq in self.scopeSqls) { if (sq != "") { body = body == "" ? sq : "(" + body + ") AND " + sq; } }
+            if (scoped && self.__map != null && self.__map.softDelete != null && self.__trashed != 1) {
+                let sd = self.q(self.__alias) + "." + self.q(self.__map.softDelete.column) + (self.__trashed == 2 ? " IS NOT NULL" : " IS NULL");
+                body = body == "" ? sd : "(" + body + ") AND " + sd;
+            }
+            return body == "" ? "" : " WHERE " + body;
+        }
+        private fn cond(join: string, sql: string) -> Self { return self.condArgs(join, sql, new Array<any>()); }
+        private fn condArgs(join: string, sql: string, values: Array<any>) -> Self {
+            self.ops.push(join);
+            self.conds.push(sql);
+            for (v in values) { self.args.push(v); }
+            return self;
+        }
+        private fn compare(join: string, name: string, op: string, value: any) -> Self {
+            let o = Builder.operator(op);
+            let c = self.col(name);
+            if (value == null) {
+                if (o == "=") { return self.cond(join, c + " IS NULL"); }
+                if (o == "!=" || o == "<>") { return self.cond(join, c + " IS NOT NULL"); }
+            }
+            if (o == "ILIKE" && self.conn().driver() != "postgres") { return self.condArgs(join, "LOWER(" + c + ") LIKE LOWER(?)", Builder.one(value)); }
+            return self.condArgs(join, c + " " + o + " ?", Builder.one(value));
+        }
+        private fn nest(join: string, group: fn(Builder), negate: bool) -> Self {
+            let inner = new Builder(self.__map, self.__table, self.__db);
+            inner.__alias = self.__alias;
+            inner.__depth = self.__depth;
+            inner.__trashed = 1;                                      // (the outer query adds that condition once)
+            group(inner);
+            if (inner.conds.size() == 0) { return self; }
+            return self.condArgs(join, (negate ? "NOT (" : "(") + inner.whereSql(false)[7..] + ")", inner.args);
+        }
+        private fn inList(join: string, name: string, values: Array<any>, negate: bool) -> Self {
+            if (values.size() == 0) { return self.cond(join, negate ? "1 = 1" : "1 = 0"); }
+            let marks = new StringBuilder();
+            for (i in 0..values.size()) { marks.append(i == 0 ? "?" : ", ?"); }
+            return self.condArgs(join, self.col(name) + (negate ? " NOT IN (" : " IN (") + marks.toString() + ")", values);
+        }
+        private fn between(join: string, name: string, lo: any, hi: any, negate: bool) -> Self {
+            let a = new Array<any>();
+            a.push(lo);
+            a.push(hi);
+            return self.condArgs(join, self.col(name) + (negate ? " NOT BETWEEN ? AND ?" : " BETWEEN ? AND ?"), a);
+        }
+        private fn datePart(part: string, c: string) -> string {
+            let d = self.conn().driver();
+            if (part == "date") { return d == "postgres" ? "CAST(" + c + " AS DATE)" : d == "mysql" ? "DATE(" + c + ")" : "date(" + c + ")"; }
+            return d == "sqlite" ? "CAST(strftime('%Y', " + c + ") AS INTEGER)" : "EXTRACT(YEAR FROM " + c + ")";
+        }
+        private fn joinWith(kind: string, table: string, first: string, op: string, second: string) -> Self {
+            self.joinSql.push(kind + " JOIN " + self.q(Builder.ident(table)) + " ON " + self.col(first) + " " + Builder.operator(op) + " " + self.col(second));
+            return self;
+        }
+        private fn bump(name: string, by: long) -> long {
+            let db = self.conn();
+            let c = db.quote(self.column(name));
+            let a = new Array<any>();
+            a.push(by);
+            let sets = c + " = " + c + " + ?";
+            if (self.__map != null && self.__map.updatedAt != null) {
+                sets = sets + ", " + db.quote(self.__map.updatedAt.column) + " = ?";
+                a.push(DateTime.now());
+            }
+            for (x in self.whereArgs()) { a.push(x); }
+            return db.execute("UPDATE " + db.quote(self.__table) + " SET " + sets + self.whereSql(true), a);
+        }
+        private fn aggregate(expr: string) -> any {
+            if (self.groups.size() > 0 || self.distinctRows) {
+                let inner = self.__sql("");
+                return self.conn().queryValue("SELECT " + Str.replace(expr, self.q(self.__alias) + ".", "") + " FROM (" + inner + ") AS " + self.q("__orbit_agg"), self.__bindings());
+            }
+            let keep = self.orders;
+            self.orders = new Array<string>();
+            let v = self.conn().queryValue(self.__sql(expr), self.__bindings());
+            self.orders = keep;
+            return v;
+        }
+        // The inner query of a relation condition (see relations.grav).
+        fn relationExistence(path: string) -> Builder {
+            let dot = Str.indexOf(path, ".");
+            let first = dot > 0 ? path[..dot] : path;
+            let rel = Relation.named(self.__map, first);
+            let inner = rel.existence(self);
+            if (dot > 0) { inner.whereHas(path[dot + 1..], fn(b: Builder) {}); }
+            return inner;
+        }
+        private fn relCond(join: string, path: string, f: fn(Builder), op: string, count: int, negate: bool) -> Self {
+            if (self.__map == null) { throw new StateError("relations need a model: DB.table queries have none"); }
+            let dot = Str.indexOf(path, ".");
+            let first = dot > 0 ? path[..dot] : path;
+            let rel = Relation.named(self.__map, first);
+            let inner = rel.existence(self);
+            if (dot > 0) {
+                let rest = path[dot + 1..];
+                if (f == null) { inner.has(rest, op, count); } else { inner.whereHas(rest, f); }
+            } else if (f != null) {
+                f(inner);
+            }
+            let o = Builder.operator(op);
+            let plain = dot > 0 || (o == ">=" && count == 1);
+            let sql = plain ? "EXISTS (" + inner.__subSql("1") + ")" : "(" + inner.__subSql("COUNT(*)") + ") " + o + " " + str(count);
+            return self.condArgs(join, negate ? "NOT " + sql : sql, inner.__bindings());
+        }
+
+        // A comparison operator, checked (=, !=, <>, <, <=, >, >=, like, not like, ilike).
+        static fn operator(op: string) -> string {
+            let o = Str.lower(Str.trim(op));
+            if (o == "=" || o == "!=" || o == "<>" || o == "<" || o == "<=" || o == ">" || o == ">=") { return o; }
+            if (o == "like" || o == "not like" || o == "ilike") { return Str.upper(o); }
+            throw new ValueError("not a comparison: '" + op + "' (=, !=, <>, <, <=, >, >=, like, not like, ilike)");
+        }
+        // `name` when it is a plain identifier (letters, digits, _); ValueError otherwise.
+        static fn ident(name: string) -> string {
+            let ok = name.length > 0 && !name[0].isDigit();
+            for (i in 0..name.length) { if (!(name[i].isLetterOrDigit() || name[i] == ('_' as byte))) { ok = false; } }
+            if (!ok) { throw new ValueError("not a column or table name: '" + name + "' (whereRaw and selectRaw take SQL)"); }
+            return name;
+        }
+        static fn one(v: any) -> Array<any> { let a = new Array<any>(); a.push(v); return a; }
+        static fn toLong(v: any) -> long { return v is long ? v as long : v is Decimal ? (v as Decimal).toLong() : v is int ? (v as int) as long : v == null ? 0 : Integer.parseOr("${v}", 0); }
+    }
+
+    // A page of results: its items, and where it is among all of them.
+    class Page<T> {
+        public items: Array<T>
+        public total: long
+        public page: long
+        public perPage: long
+        constructor(items: Array<T>, total: long, page: long, perPage: long) { self.items = items; self.total = total; self.page = page; self.perPage = perPage; }
+        // The number of the last page (1 when there are no results).
+        fn lastPage() -> long { return self.total <= 0 ? 1 : (self.total + self.perPage - 1) / self.perPage; }
+        fn hasMorePages() -> bool { return self.page < self.lastPage(); }
+        fn isEmpty() -> bool { return self.items.size() == 0; }
+    }
+
+    // A query for objects of model class T: the clauses of Builder, and answers as Ts.
+    class Query<T> extends Builder {
+        constructor(map: TableMap) { super(map, map.table, null); self.__applyScopes(); }
+
+        // Every match.
+        fn all() -> Array<T> { return self.get(); }
+        fn get() -> Array<T> {
+            let rows = self.conn().query(self.__sql(""), self.__bindings());
+            let out = new Array<T>();
+            out.reserve(rows.size());
+            let extras = self.extraColumns(rows.columns);
+            for (row in rows) { out.push(self.hydrate(row, extras) as T); }
+            if (self.__withs.size() > 0 && out.size() > 0) {
+                let models = new Array<Model>();
+                for (o in out) { models.push(o as Model); }
+                for (w in self.__withs) { Relation.eagerLoad(models, w); }
+            }
+            return out;
+        }
+        // The first match, or null.
+        fn first() -> T {
+            let keep = self.__limit();
+            self.limit(1);
+            let all = self.get();
+            self.__restoreLimit(keep);
+            return all.size() == 0 ? null : all[0];
+        }
+        // The first match; NotFound when there is none.
+        fn firstOrFail() -> T {
+            let one = self.first();
+            if (one == null) { throw new NotFound("no " + self.__map.info.simpleName() + " matches"); }
+            return one;
+        }
+        // The one match: NotFound for none, StateError for more than one.
+        fn sole() -> T {
+            let keep = self.__limit();
+            self.limit(2);
+            let all = self.get();
+            self.__restoreLimit(keep);
+            if (all.size() == 0) { throw new NotFound("no " + self.__map.info.simpleName() + " matches"); }
+            if (all.size() > 1) { throw new StateError("more than one " + self.__map.info.simpleName() + " matches"); }
+            return all[0];
+        }
+        // The match with id `id`, or null; with ids, those that exist.
+        fn find(id: any) -> T { return self.whereKey(id).first(); }
+        fn findMany(ids: Array<any>) -> Array<T> { return self.whereKey(ids).get(); }
+        fn findOrFail(id: any) -> T {
+            let one = self.whereKey(id).first();
+            if (one == null) { throw new NotFound("no " + self.__map.info.simpleName() + " with id ${id}"); }
+            return one;
+        }
+        // Each match in turn, read `size` at a time (in id order), as lists.
+        fn chunk(size: int, f: fn(Array<T>)) {
+            if (self.__map.id != null) { self.reorder().orderBy(self.__map.id.field.name); }
+            let page = 1 as long;
+            while (true) {
+                self.forPage(page, size as long);
+                let part = self.get();
+                if (part.size() == 0) { return; }
+                f(part);
+                if (part.size() < size) { return; }
+                page += 1;
+            }
+        }
+        // Each match, one at a time.
+        fn each(f: fn(T)) { self.chunk(500, fn(part: Array<T>) { for (x in part) { f(x); } }); }
+        // Page `page` (from 1) of `perPage` matches, with the total.
+        fn paginate(page: long = 1, perPage: long = 15) -> Page<T> {
+            let total = self.count();
+            self.forPage(page, perPage);
+            return new Page<T>(self.get(), total, page, perPage);
+        }
+        // The first match of `attrs` (field names), or a new one with `attrs` and
+        // `values` set, saved (firstOrNew: not saved).
+        fn firstOrCreate(attrs: HashMap<string, any>, values: HashMap<string, any> = new HashMap<string, any>()) -> T {
+            let found = self.matching(attrs).first();
+            if (found != null) { return found; }
+            let made = self.make(attrs, values);
+            Persister.save(made, self.__map, self.conn());
+            return made;
+        }
+        fn firstOrNew(attrs: HashMap<string, any>, values: HashMap<string, any> = new HashMap<string, any>()) -> T {
+            let found = self.matching(attrs).first();
+            return found != null ? found : self.make(attrs, values);
+        }
+        // The first match of `attrs` with `values` set and saved, or a new one.
+        fn updateOrCreate(attrs: HashMap<string, any>, values: HashMap<string, any>) -> T {
+            let found = self.matching(attrs).first();
+            if (found == null) { found = self.make(attrs, new HashMap<string, any>()); }
+            Persister.fill(found, self.__map, values, true);
+            Persister.save(found, self.__map, self.conn());
+            return found;
+        }
+
+        fn __limit() -> long { return -2; }
+        fn __restoreLimit(keep: long) { self.limit(-1); }
+        private fn matching(attrs: HashMap<string, any>) -> Query<T> {
+            let q = new Query<T>(self.__map);
+            q.__db = self.__db;
+            for (k in attrs.keys()) { q.where(k, attrs[k]); }
+            return q;
+        }
+        private fn make(attrs: HashMap<string, any>, values: HashMap<string, any>) -> T {
+            let obj = self.__map.info.create() as T;
+            Persister.fill(obj, self.__map, attrs, false);
+            Persister.fill(obj, self.__map, values, false);
+            return obj;
+        }
+        private fn extraColumns(cols: Array<string>) -> Array<string> {
+            let out = new Array<string>();
+            for (c in cols) { if (self.__map.find(c) == null) { out.push(c); } }
+            return out;
+        }
+        private fn hydrate(row: Row, extras: Array<string>) -> any {
+            let obj = Persister.load(self.__map, row);
+            if (extras.size() > 0 && obj is Model) {
+                let m = obj as Model;
+                for (c in extras) { m.__extra.put(c, row.get(c)); }
+            }
+            return obj;
+        }
+    }
+
+    // A query on a table without a model (DB.table): the clauses of Builder,
+    // with rows as answers, and inserts.
+    class TableQuery extends Builder {
+        constructor(table: string, db: Connection) { super(null, Builder.ident(table), db); }
+
+        fn get() -> ResultSet { return self.rows(); }
+        fn first() -> Row {
+            let rows = self.limit(1).rows();
+            return rows.size() == 0 ? null : rows.get(0);
+        }
+        fn find(id: any) -> Row { return self.where("id", id).first(); }
+        // Inserts a row; its id (when the table numbers its rows).
+        fn insert(values: HashMap<string, any>) -> long {
+            let db = self.conn();
+            let cols = new Array<string>();
+            let marks = new Array<string>();
+            let args = new Array<any>();
+            for (k in values.keys()) { cols.push(db.quote(Builder.ident(k))); marks.push("?"); args.push(values[k]); }
+            return db.insert("INSERT INTO " + db.quote(self.__table) + " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")", args);
+        }
+        // Inserts the rows (all with the same columns as the first), batched; how many.
+        fn insertMany(rows: Array<HashMap<string, any>>) -> long {
+            if (rows.size() == 0) { return 0; }
+            let db = self.conn();
+            let keys = rows[0].keys();
+            let cols = new Array<string>();
+            let marks = new Array<string>();
+            for (k in keys) { cols.push(db.quote(Builder.ident(k))); marks.push("?"); }
+            let all = new Array<Array<any>>();
+            for (r in rows) {
+                let a = new Array<any>();
+                for (k in keys) { a.push(r.getOr(k, null)); }
+                all.push(a);
+            }
+            return db.executeMany("INSERT INTO " + db.quote(self.__table) + " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")", all);
+        }
+    }
+}

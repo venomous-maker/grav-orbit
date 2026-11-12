@@ -1,0 +1,157 @@
+// behaviors.grav — model traits: code a class gets by wearing a decorator, as
+// @SoftDeletes gives soft deletes. Write one by extending Behavior, register it
+// under its decorator's name, and put that decorator on any model (or on a base
+// class: its subclasses wear it too).
+//
+//   class Sluggable extends Behavior {
+//       // Before each save: slug = the source field (@Sluggable("title")), lower-case, dashed.
+//       fn saving(m: Model, d: Decorator) {
+//           let info = ClassInfo.of(m)
+//           let text = "${info.field(d.text(0)).get(m)}"
+//           info.field("slug").set(m, Str.replace(Str.lower(Str.trim(text)), " ", "-"))
+//       }
+//   }
+//   class Published extends Behavior {
+//       // A global scope: every query of the class sees only published rows.
+//       fn apply(q: Builder, map: TableMap, d: Decorator) { q.where("published", true) }
+//   }
+//
+//   Behaviors.register("Sluggable", new Sluggable())
+//   Behaviors.register("Published", new Published())
+//
+//   @Sluggable("title") @Published
+//   class Article extends Model { public id: long = 0; public title: string = ""; public slug: string = ""; public published: bool = false }
+//
+//   Article.withoutScope("Published").count()     // every article
+//
+// Built in: SoftDeletes, Timestamps (on unless @NoTimestamps) and Uuids
+// (@Uuids, or @Uuids("field"): a new row gets a random UUID there).
+import "std"
+import "grav-db"
+import "mapping.grav"
+import "builder.grav"
+import "model.grav"
+
+namespace orbit {
+
+    // A model trait (see the top of this file). Each hook gets the model and the
+    // decorator that put the behavior on its class (for its arguments); override
+    // the ones you need. Throw from a "-ing" hook to stop the change.
+    abstract class Behavior {
+        // Once, when a class wearing it is first used: change its mapping.
+        fn boot(map: TableMap, d: Decorator) {}
+        // A global scope: conditions every query of the class gets
+        // (`withoutScope("Name")` on a query drops it, `withoutScopes()` all).
+        fn apply(q: Builder, map: TableMap, d: Decorator) {}
+        fn saving(m: Model, d: Decorator) {}
+        fn saved(m: Model, d: Decorator) {}
+        fn creating(m: Model, d: Decorator) {}
+        fn created(m: Model, d: Decorator) {}
+        fn updating(m: Model, d: Decorator) {}
+        fn updated(m: Model, d: Decorator) {}
+        fn deleting(m: Model, d: Decorator) {}
+        fn deleted(m: Model, d: Decorator) {}
+        // After a row is read into a model.
+        fn retrieved(m: Model, d: Decorator) {}
+    }
+
+    // A behavior a class wears: its name, the behavior, and the decorator.
+    class BehaviorUse {
+        public name: string
+        public behavior: Behavior
+        public decorator: Decorator
+        constructor(name: string, behavior: Behavior, decorator: Decorator) { self.name = name; self.behavior = behavior; self.decorator = decorator; }
+    }
+
+    // The behaviors, by decorator name.
+    class Behaviors {
+        private static registry: HashMap<string, Behavior> = new HashMap<string, Behavior>()
+        private static lock: Mutex = new Mutex()
+        private static builtIn: bool = false
+
+        // Puts `b` on every model class wearing `@<name>` (classes mapped before
+        // this keep what they had: register behaviors at start-up).
+        static fn register(name: string, b: Behavior) {
+            Behaviors.lock.lock();
+            Behaviors.registry.put(name, b);
+            Behaviors.lock.unlock();
+        }
+        static fn isRegistered(name: string) -> bool {
+            Behaviors.ensureBuiltIns();
+            Behaviors.lock.lock();
+            let yes = Behaviors.registry.containsKey(name);
+            Behaviors.lock.unlock();
+            return yes;
+        }
+        // The behaviors `info`'s class wears: its decorators that name one, and its base classes'.
+        static fn on(info: ClassInfo) -> Array<BehaviorUse> {
+            Behaviors.ensureBuiltIns();
+            let out = new Array<BehaviorUse>();
+            let seen = new HashSet<string>();
+            let c = info;
+            Behaviors.lock.lock();
+            while (c != null) {
+                for (d in c.decorators()) {
+                    let b = Behaviors.registry.getOr(d.name, null);
+                    if (b != null && !seen.contains(d.name)) { seen.add(d.name); out.push(new BehaviorUse(d.name, b, d)); }
+                }
+                c = c.base();
+            }
+            Behaviors.lock.unlock();
+            // Timestamps is on unless a class says @NoTimestamps.
+            if (!seen.contains("Timestamps") && !info.has("NoTimestamps")) {
+                out.push(new BehaviorUse("Timestamps", Behaviors.registry["Timestamps"], new Decorator("Timestamps")));
+            }
+            return out;
+        }
+        private static fn ensureBuiltIns() {
+            Behaviors.lock.lock();
+            if (!Behaviors.builtIn) {
+                Behaviors.builtIn = true;
+                if (!Behaviors.registry.containsKey("SoftDeletes")) { Behaviors.registry.put("SoftDeletes", new SoftDeletes()); }
+                if (!Behaviors.registry.containsKey("Timestamps")) { Behaviors.registry.put("Timestamps", new Timestamps()); }
+                if (!Behaviors.registry.containsKey("Uuids")) { Behaviors.registry.put("Uuids", new Uuids()); }
+            }
+            Behaviors.lock.unlock();
+        }
+    }
+
+    // @SoftDeletes, or @SoftDeletes("removedAt"): delete() marks the row (in a
+    // `DateTime?` field, deletedAt by default) instead of removing it, and
+    // queries leave marked rows out (withTrashed, onlyTrashed, restore, forceDelete).
+    class SoftDeletes extends Behavior {
+        fn boot(map: TableMap, d: Decorator) {
+            let name = d.args.size() > 0 ? d.text(0) : "deletedAt";
+            let m = map.find(name);
+            if (m == null || m.kind != "datetime") {
+                throw new StateError(map.info.simpleName() + " is @SoftDeletes but has no `" + name + ": DateTime?` field");
+            }
+            m.nullable = true;
+            map.softDelete = m;
+        }
+    }
+
+    // Timestamps: createdAt and updatedAt (DateTime fields; or
+    // @Timestamps("created", "updated")) are set on insert, and updatedAt on update.
+    class Timestamps extends Behavior {
+        fn boot(map: TableMap, d: Decorator) {
+            let c = map.find(d.args.size() > 0 ? d.text(0) : "createdAt");
+            let u = map.find(d.args.size() > 1 ? d.text(1) : "updatedAt");
+            if (c != null && c.kind == "datetime") { map.createdAt = c; }
+            if (u != null && u.kind == "datetime") { map.updatedAt = u; }
+        }
+    }
+
+    // @Uuids, or @Uuids("field"): a new row gets a random UUID (v4) in that
+    // string field (uuid by default) when it is empty.
+    class Uuids extends Behavior {
+        fn creating(m: Model, d: Decorator) {
+            let info = ClassInfo.of(m);
+            let name = d.args.size() > 0 ? d.text(0) : "uuid";
+            let f = info.field(name);
+            if (f == null) { throw new StateError(info.simpleName() + " is @Uuids but has no `" + name + ": string` field"); }
+            let v = f.get(m);
+            if (v == null || "${v}" == "") { f.set(m, Uuid.v4()); }
+        }
+    }
+}

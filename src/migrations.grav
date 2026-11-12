@@ -1,0 +1,131 @@
+// migrations.grav — changes to the database kept as code, run once each, in
+// order, and undone in reverse.
+//
+//   class CreatePosts extends Migration {
+//       fn up() { Schema.create("posts", fn(t: Blueprint) { t.id(); t.varchar("title"); t.timestamps() }) }
+//       fn down() { Schema.dropIfExists("posts") }
+//   }
+//
+//   let m = new Migrator()
+//   m.add(new CreateUsers()); m.add(new CreatePosts())
+//   m.migrate()          // runs those not run yet, as one batch
+//   m.rollback()         // undoes the last batch
+//   m.status()           // ["CreateUsers: ran (batch 1)", "CreatePosts: pending"]
+import "std"
+import "grav-db"
+import "db.grav"
+
+namespace orbit {
+
+    // One change to the database: up makes it, down undoes it.
+    abstract class Migration {
+        abstract fn up()
+        abstract fn down()
+        // Its name in the migrations table (its class name, by default).
+        fn name() -> string { return ClassInfo.of(self).simpleName(); }
+    }
+
+    // Runs migrations and keeps track of them in the `migrations` table.
+    class Migrator {
+        private list: Array<Migration> = new Array<Migration>()
+        private db: Connection = null
+        public table: string = "migrations"
+
+        // Uses `db` instead of the default connection.
+        fn on(db: Connection) -> Migrator { self.db = db; return self; }
+        // Adds a migration (they run in the order added).
+        fn add(m: Migration) -> Migrator { self.list.push(m); return self; }
+
+        // Runs the migrations not run yet, as one batch; their names.
+        fn migrate() -> Array<string> {
+            let db = self.conn();
+            self.prepare(db);
+            let done = self.ran(db);
+            let batch = self.lastBatch(db) + 1;
+            let out = new Array<string>();
+            for (m in self.list) {
+                let name = m.name();
+                if (done.containsKey(name)) { continue; }
+                db.transaction(fn() {
+                    m.up();
+                    let a = new Array<any>();
+                    a.push(name);
+                    a.push(batch);
+                    db.execute("INSERT INTO " + db.quote(self.table) + " (" + db.quote("migration") + ", " + db.quote("batch") + ") VALUES (?, ?)", a);
+                });
+                out.push(name);
+            }
+            return out;
+        }
+        // Undoes the last `steps` batches, newest first; the names undone.
+        fn rollback(steps: int = 1) -> Array<string> {
+            let db = self.conn();
+            self.prepare(db);
+            let out = new Array<string>();
+            for (i in 0..steps) {
+                let batch = self.lastBatch(db);
+                if (batch == 0) { break; }
+                let a = new Array<any>();
+                a.push(batch);
+                let names = new Array<string>();
+                for (row in db.query("SELECT " + db.quote("migration") + " FROM " + db.quote(self.table) + " WHERE " + db.quote("batch") + " = ? ORDER BY " + db.quote("id") + " DESC", a)) {
+                    names.push(row.getString("migration"));
+                }
+                for (n in names) { self.undo(db, n); out.push(n); }
+            }
+            return out;
+        }
+        // Undoes every migration run.
+        fn reset() -> Array<string> {
+            self.prepare(self.conn());
+            let out = new Array<string>();
+            while (self.lastBatch(self.conn()) > 0) { for (n in self.rollback(1)) { out.push(n); } }
+            return out;
+        }
+        // Undoes everything, then runs everything.
+        fn refresh() -> Array<string> { self.reset(); return self.migrate(); }
+        // Each migration, "name: ran (batch n)" or "name: pending".
+        fn status() -> Array<string> {
+            let db = self.conn();
+            self.prepare(db);
+            let done = self.ran(db);
+            let out = new Array<string>();
+            for (m in self.list) {
+                let n = m.name();
+                out.push(done.containsKey(n) ? n + ": ran (batch ${done[n]})" : n + ": pending");
+            }
+            return out;
+        }
+
+        private fn conn() -> Connection { return self.db == null ? DB.connection() : self.db; }
+        private fn prepare(db: Connection) {
+            let d = db.driver();
+            let id = d == "postgres" ? "BIGSERIAL PRIMARY KEY" : d == "mysql" ? "BIGINT AUTO_INCREMENT PRIMARY KEY" : "INTEGER PRIMARY KEY AUTOINCREMENT";
+            db.exec("CREATE TABLE IF NOT EXISTS " + db.quote(self.table) + " (" + db.quote("id") + " " + id + ", " +
+                    db.quote("migration") + " VARCHAR(255) NOT NULL, " + db.quote("batch") + " INTEGER NOT NULL)");
+        }
+        private fn ran(db: Connection) -> HashMap<string, long> {
+            let out = new HashMap<string, long>();
+            for (row in db.query("SELECT " + db.quote("migration") + ", " + db.quote("batch") + " FROM " + db.quote(self.table))) {
+                out.put(row.getString("migration"), row.getInt("batch"));
+            }
+            return out;
+        }
+        private fn lastBatch(db: Connection) -> long {
+            let v = db.queryValue("SELECT MAX(" + db.quote("batch") + ") FROM " + db.quote(self.table));
+            return v == null ? 0 : v is long ? v as long : Integer.parseOr("${v}", 0);
+        }
+        private fn undo(db: Connection, name: string) {
+            let found: Migration = null;
+            for (m in self.list) { if (m.name() == name) { found = m; } }
+            if (found == null) { throw new StateError("migration '" + name + "' was run but is not in this Migrator"); }
+            let m = found;
+            db.transaction(fn() {
+                m.down();
+                let a = new Array<any>();
+                a.push(name);
+                db.execute("DELETE FROM " + db.quote(self.table) + " WHERE " + db.quote("migration") + " = ?", a);
+            });
+        }
+    }
+}

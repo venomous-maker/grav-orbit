@@ -1,0 +1,265 @@
+// mapping.grav — how a class maps to a table: its name, its columns, its id,
+// and each column's SQL type for each database.
+//
+//   @Table("people")                    // default: the class name, snake_case, plural ("users")
+//   class User extends Model {
+//       @Id public id: long = 0         // default: a field called id; an integer id is numbered by the database
+//       @Column("email_address", length: 255, unique: true)
+//       public email: string = ""
+//       public nickName: string? = null // column nick_name, NULL allowed (the `?`)
+//       @Ignore public cache: string = ""
+//   }
+//
+// Fields map to columns when they hold numbers, bools, strings, enums,
+// DateTime, Decimal, Bytes, JsonValue or `any` (as `T?` too); fields holding
+// other objects (lists, models) are not columns. @Column takes the column name
+// first, then any of length, unique, precision, scale, type (the SQL type,
+// as written) and nullable. On fields also: @Ignore (not a column), @Hidden
+// (left out of toMap and toJson), @Guarded (not set by fill or create),
+// @NotNull, @Unique. On classes: @Table("name"), @SoftDeletes (needs a
+// `deletedAt: DateTime?` field), @NoTimestamps (createdAt and updatedAt fields
+// are otherwise filled in on save), @Connection("name") (a DB connection by
+// name), @MorphName("post") (its name in polymorphic relations; the class name
+// otherwise).
+import "std"
+import "grav-db"
+import "behaviors.grav"
+
+namespace orbit {
+
+    // Turning names into table and column names.
+    class Naming {
+        // "createdAt" -> "created_at", "HTTPServer" -> "http_server", "OrderItem" -> "order_item".
+        static fn snake(name: string) -> string {
+            let out = new StringBuilder();
+            let n = name.length;
+            for (i in 0..n) {
+                let c = name[i];
+                let upper = c.isUpper();
+                if (upper && i > 0) {
+                    let prevLower = name[i - 1].isLower() || name[i - 1].isDigit();
+                    let nextLower = i + 1 < n && name[i + 1].isLower();
+                    if (prevLower || (nextLower && name[i - 1].isUpper())) { out.append("_"); }
+                }
+                out.append(upper ? c.toLower().toChar() : c.toChar());
+            }
+            return out.toString();
+        }
+        // English plurals for table names: "user" -> "users", "category" ->
+        // "categories", "box" -> "boxes", "address" -> "addresses".
+        static fn plural(word: string) -> string {
+            let n = word.length;
+            if (n == 0) { return word; }
+            if (word.endsWith("y") && n > 1 && !Naming.isVowel(word[n - 2])) { return word[..n - 1] + "ies"; }
+            if (word.endsWith("s") || word.endsWith("x") || word.endsWith("z") || word.endsWith("ch") || word.endsWith("sh")) { return word + "es"; }
+            return word + "s";
+        }
+        private static fn isVowel(c: byte) -> bool {
+            let l = c.toLower();
+            return l == ('a' as byte) || l == ('e' as byte) || l == ('i' as byte) || l == ('o' as byte) || l == ('u' as byte);
+        }
+    }
+
+    // One mapped field: its column and what the column is like.
+    class FieldMap {
+        public field: FieldInfo
+        public column: string
+        // "int", "long", "float", "bool", "string", "datetime", "decimal", "bytes", "json", "enum" or "any".
+        public kind: string
+        public isId: bool = false
+        // The database numbers it (an integer id, unless @Id(auto: false)).
+        public auto: bool = false
+        public nullable: bool = false
+        public unique: bool = false
+        public length: int = 0
+        public precision: int = 0
+        public scale: int = 0
+        // @Column(type: "...") as written ("" to let Orbit choose).
+        public sqlType: string = ""
+        // Left out of toMap and toJson (@Hidden); not set by fill and create (@Guarded, and a numbered id).
+        public hidden: bool = false
+        public guarded: bool = false
+
+        constructor(field: FieldInfo, column: string, kind: string) {
+            self.field = field;
+            self.column = column;
+            self.kind = kind;
+        }
+    }
+
+    // A class's table: built once per class from its fields and decorators.
+    class TableMap {
+        public info: ClassInfo
+        public table: string
+        public fields: Array<FieldMap> = new Array<FieldMap>()
+        // The id column (null when the class has none).
+        public id: FieldMap = null
+        // deletedAt with @SoftDeletes; createdAt and updatedAt filled in on save (null when not).
+        public softDelete: FieldMap = null
+        public createdAt: FieldMap = null
+        public updatedAt: FieldMap = null
+        // Its name in polymorphic relations, and the DB connection it uses ("" for the default).
+        public morphName: string
+        public connection: string = ""
+        // The behaviors its class wears (behaviors.grav).
+        public behaviors: Array<BehaviorUse> = new Array<BehaviorUse>()
+        private byName: HashMap<string, FieldMap> = new HashMap<string, FieldMap>()
+
+        private static cache: HashMap<string, TableMap> = new HashMap<string, TableMap>()
+        private static morphs: HashMap<string, ClassInfo> = new HashMap<string, ClassInfo>()
+        private static lock: Mutex = new Mutex()
+
+        constructor(info: ClassInfo) {
+            self.info = info;
+            let t = info.decorator("Table");
+            self.table = t != null && t.text(0) != "" ? t.text(0) : Naming.plural(Naming.snake(info.simpleName()));
+            let mn = info.decorator("MorphName");
+            self.morphName = mn != null ? mn.text(0) : info.simpleName();
+            let cn = info.decorator("Connection");
+            if (cn != null) { self.connection = cn.text(0); }
+            let explicitId = false;
+            for (f in info.fields()) { if (f.has("Id")) { explicitId = true; } }
+            for (f in info.fields()) {
+                if (f.has("Ignore")) { continue; }
+                let kind = TableMap.kindOf(f);
+                if (kind == "") { continue; }
+                let c = f.decorator("Column");
+                let column = c != null && c.args.size() > 0 && c.keys[0] == "" ? c.text(0) : Naming.snake(f.name);
+                let m = new FieldMap(f, column, kind);
+                m.nullable = f.isNullable() || (c != null && c.flag("nullable", false));
+                if (f.has("NotNull")) { m.nullable = false; }
+                if (c != null) {
+                    m.unique = c.flag("unique", false);
+                    m.length = c.number("length", 0) as int;
+                    m.precision = c.number("precision", 0) as int;
+                    m.scale = c.number("scale", 0) as int;
+                    m.sqlType = c.text("type");
+                }
+                if (f.has("Unique")) { m.unique = true; }
+                m.hidden = f.has("Hidden");
+                m.guarded = f.has("Guarded");
+                let id = f.decorator("Id");
+                if (id != null || (!explicitId && f.name == "id")) {
+                    m.isId = true;
+                    m.auto = (kind == "int" || kind == "long") && (id == null || id.flag("auto", true));
+                    m.nullable = false;
+                    if (m.auto) { m.guarded = true; }
+                    self.id = m;
+                }
+                self.fields.push(m);
+                self.byName.put(f.name, m);
+                if (!self.byName.containsKey(column)) { self.byName.put(column, m); }
+            }
+            // Its behaviors (decorators naming one: @SoftDeletes, yours), each booted once.
+            self.behaviors = Behaviors.on(info);
+            for (u in self.behaviors) { u.behavior.boot(self, u.decorator); }
+        }
+        // Runs hook `hook` ("saving", "created", ...) of each behavior on `obj` (a Model).
+        fn fire(hook: string, obj: any) {
+            if (self.behaviors.size() == 0 || !(obj is Model)) { return; }
+            let m = obj as Model;
+            for (u in self.behaviors) {
+                let b = u.behavior;
+                let d = u.decorator;
+                switch (hook) {
+                    case "saving": b.saving(m, d)
+                    case "saved": b.saved(m, d)
+                    case "creating": b.creating(m, d)
+                    case "created": b.created(m, d)
+                    case "updating": b.updating(m, d)
+                    case "updated": b.updated(m, d)
+                    case "deleting": b.deleting(m, d)
+                    case "deleted": b.deleted(m, d)
+                    case "retrieved": b.retrieved(m, d)
+                    default: throw new ValueError("no behavior hook '" + hook + "'")
+                }
+            }
+        }
+        // Whether it wears behavior `name`.
+        fn wears(name: string) -> bool { for (u in self.behaviors) { if (u.name == name) { return true; } } return false; }
+
+        // The mapping of `info`'s class (made the first time, then shared).
+        static fn of(info: ClassInfo) -> TableMap {
+            TableMap.lock.lock();
+            let m = TableMap.cache.getOr(info.name, null);
+            if (m == null) {
+                try { m = new TableMap(info); } catch (e: Exception) { TableMap.lock.unlock(); throw e; }
+                TableMap.cache.put(info.name, m);
+                if (!TableMap.morphs.containsKey(m.morphName)) { TableMap.morphs.put(m.morphName, info); }
+            }
+            TableMap.lock.unlock();
+            return m;
+        }
+        // The class a polymorphic relation's type column names (`Post`), or null when
+        // no mapped class has that name yet (see Orbit.morphMap).
+        static fn morphed(name: string) -> ClassInfo {
+            TableMap.lock.lock();
+            let info = TableMap.morphs.getOr(name, null);
+            TableMap.lock.unlock();
+            return info;
+        }
+        // Registers `info` under `name` for polymorphic relations.
+        static fn registerMorph(name: string, info: ClassInfo) {
+            TableMap.lock.lock();
+            TableMap.morphs.put(name, info);
+            TableMap.lock.unlock();
+        }
+
+        // The field mapped by field name or column name, or null.
+        fn find(name: string) -> FieldMap { return self.byName.getOr(name, null); }
+        // The column for `name`: a field's column, or `name` itself (a column, or an expression).
+        fn column(name: string) -> string { let m = self.find(name); return m == null ? name : m.column; }
+        // The id, or a StateError naming the class (for find, save, delete).
+        fn requireId() -> FieldMap {
+            if (self.id == null) { throw new StateError(self.info.simpleName() + " has no id: mark a field @Id, or call one id"); }
+            return self.id;
+        }
+
+        // The column kind of a field's type ("" when it is not a column).
+        static fn kindOf(f: FieldInfo) -> string {
+            let t = f.typeName;
+            if (Str.endsWith(t, "?")) { t = t[..t.length - 1]; }
+            if (f.isEnum()) { return "enum"; }
+            switch (t) {
+                case "int", "byte", "short", "uint", "ushort", "int8", "int16", "int32", "uint8", "uint16", "uint32": return "int"
+                case "long", "ulong", "int64", "uint64": return "long"
+                case "float", "double", "float32", "float64": return "float"
+                case "bool": return "bool"
+                case "string": return "string"
+                case "any": return "any"
+            }
+            let simple = Str.lastIndexOf(t, ".") >= 0 ? t[Str.lastIndexOf(t, ".") + 1..] : t;
+            switch (simple) {
+                case "DateTime": return "datetime"
+                case "Decimal": return "decimal"
+                case "Bytes": return "bytes"
+                case "JsonValue": return "json"
+                default: return ""
+            }
+        }
+
+        // The SQL type of a column for `driver` ("sqlite", "mysql", "postgres").
+        static fn sqlType(m: FieldMap, driver: string) -> string {
+            if (m.sqlType != "") { return m.sqlType; }
+            let my = driver == "mysql";
+            let pg = driver == "postgres";
+            if (m.isId && m.auto) {
+                if (pg) { return m.kind == "long" ? "BIGSERIAL" : "SERIAL"; }
+                if (my) { return (m.kind == "long" ? "BIGINT" : "INT") + " AUTO_INCREMENT"; }
+                return "INTEGER";                                    // (SQLite: the rowid)
+            }
+            switch (m.kind) {
+                case "int", "enum": return my ? "INT" : "INTEGER"
+                case "long": return driver == "sqlite" ? "INTEGER" : "BIGINT"
+                case "float": return my ? "DOUBLE" : driver == "sqlite" ? "REAL" : "DOUBLE PRECISION"
+                case "bool": return "BOOLEAN"
+                case "string": return m.length > 0 ? "VARCHAR(${m.length})" : my && (m.unique || m.isId) ? "VARCHAR(255)" : "TEXT"   // (MySQL indexes no TEXT)
+                case "datetime": return pg ? "TIMESTAMPTZ" : my ? "DATETIME(6)" : "DATETIME"
+                case "decimal": return m.precision > 0 ? "DECIMAL(${m.precision}, ${m.scale})" : pg ? "NUMERIC" : my ? "DECIMAL(38, 10)" : "DECIMAL"
+                case "bytes": return pg ? "BYTEA" : my ? "LONGBLOB" : "BLOB"
+                case "json": return pg ? "JSONB" : "JSON"
+                default: return "TEXT"
+            }
+        }
+    }
+}
