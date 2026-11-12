@@ -1,4 +1,8 @@
-# Orbit
+<p align="center">
+  <img src="docs/orbit-logo.svg" width="128" height="128" alt="Orbit logo">
+</p>
+
+<h1 align="center">Orbit</h1>
 
 An ORM for [Grav](https://github.com/venomous-maker/grav), in the manner of
 Laravel's Eloquent: models that save and find themselves, a query builder,

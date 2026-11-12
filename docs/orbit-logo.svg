@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120" role="img" aria-label="Orbit">
+  <title>Orbit</title>
+  <style>
+    .ring { fill: none; stroke: #0F766E; stroke-width: 3.2; stroke-linecap: round; }
+    .back { opacity: 0.45; }
+    @media (prefers-color-scheme: dark) { .ring { stroke: #5EEAD4; } }
+  </style>
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#0F766E"/>
+      <stop offset="0.45" stop-color="#2DD4BF"/>
+      <stop offset="1" stop-color="#115E59"/>
+    </linearGradient>
+    <radialGradient id="sat" cx="0.35" cy="0.3" r="0.8">
+      <stop offset="0" stop-color="#FED7AA"/>
+      <stop offset="1" stop-color="#EA580C"/>
+    </radialGradient>
+  </defs>
+  <!-- the orbit, behind the database -->
+  <g transform="rotate(-18 60 60)">
+    <path class="ring back" d="M6 60 A54 19 0 0 1 114 60"/>
+  </g>
+  <!-- the database -->
+  <path d="M38 40 v40 a22 7 0 0 0 44 0 v-40 z" fill="url(#body)"/>
+  <ellipse cx="60" cy="40" rx="22" ry="7" fill="#99F6E4"/>
+  <path d="M38 53.5 a22 7 0 0 0 44 0 M38 67 a22 7 0 0 0 44 0" fill="none" stroke="#CCFBF1" stroke-width="1.6" opacity="0.7"/>
+  <!-- the orbit in front, and its satellite -->
+  <g transform="rotate(-18 60 60)">
+    <path class="ring" d="M114 60 A54 19 0 0 1 6 60"/>
+    <circle cx="101.4" cy="72.2" r="7" fill="url(#sat)"/>
+  </g>
+</svg>
