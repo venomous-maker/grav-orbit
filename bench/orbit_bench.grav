@@ -1,0 +1,125 @@
+// The Eloquent comparison: the same work as eloquent_bench.php, phase by phase.
+//   BENCH_DB=<url> grav run bench/orbit_bench.grav      (SQLite file by default)
+import "std"
+import "../src/orbit.grav"
+
+use orbit.*
+
+class User extends Model implements HasTimestamps {
+    public id: long = 0
+    public name: string = ""
+    public email: string = ""
+    public age: int = 0
+    public active: bool = true
+    fn posts() -> HasMany<Post> { return self.hasMany() }
+}
+
+class Post extends Model implements HasTimestamps {
+    public id: long = 0
+    public userId: long = 0
+    public title: string = ""
+    public views: int = 0
+}
+
+let N: int = 10000
+
+fn connect() -> Connection {
+    let url = env("BENCH_DB")
+    if (url == "") { return Sqlite.open("/tmp/orbit_bench.db") }
+    if (Str.startsWith(url, "mysql://")) { return MySql.open(url) }
+    return Postgres.open(url)
+}
+
+fn schema(db: Connection) {
+    let d = db.driver()
+    let id = d == "postgres" ? "BIGSERIAL PRIMARY KEY" : d == "mysql" ? "BIGINT AUTO_INCREMENT PRIMARY KEY" : "INTEGER PRIMARY KEY AUTOINCREMENT"
+    let ts = d == "postgres" ? "TIMESTAMP" : "DATETIME"
+    db.exec("DROP TABLE IF EXISTS posts")
+    db.exec("DROP TABLE IF EXISTS users")
+    db.exec("CREATE TABLE users (id ${id}, name VARCHAR(100) NOT NULL, email VARCHAR(190) NOT NULL, age INTEGER NOT NULL, active BOOLEAN NOT NULL, created_at ${ts} NULL, updated_at ${ts} NULL)")
+    db.exec("CREATE TABLE posts (id ${id}, user_id BIGINT NOT NULL, title VARCHAR(200) NOT NULL, views INTEGER NOT NULL, created_at ${ts} NULL, updated_at ${ts} NULL)")
+    db.exec("CREATE INDEX posts_user_id ON posts (user_id)")
+    db.exec("CREATE INDEX users_age ON users (age)")
+}
+
+fn phase(name: string, sw: Stopwatch) {
+    print("${name}\t${sw.elapsedMs()}")
+}
+
+fn main() {
+    let db = connect()
+    DB.connect(db)
+    schema(db)
+    let total = new Stopwatch()
+
+    // 1. create, one model at a time (in a transaction)
+    let sw = new Stopwatch()
+    DB.transaction(fn() {
+        for (i in 0..N) {
+            User.create(fields("name", "user ${i}", "email", "user${i}@example.com", "age", 18 + i % 60, "active", i % 3 != 0))
+        }
+    })
+    phase("create", sw)
+
+    // 2. bulk insert: 5 posts for each of the first 2000 users
+    sw = new Stopwatch()
+    let rows = new Array<HashMap<string, any>>()
+    for (i in 0..N) {
+        rows.push(fields("user_id", i / 5 + 1, "title", "post ${i}", "views", i % 1000))
+    }
+    DB.table("posts").insertMany(rows)
+    phase("bulk_insert", sw)
+
+    // 3. find by primary key
+    sw = new Stopwatch()
+    let found = 0
+    for (i in 0..N) {
+        let u = User.find((i * 7919) % N + 1)
+        if (u != null) { found += 1 }
+    }
+    phase("find", sw)
+
+    // 4. filtered, ordered, limited queries
+    sw = new Stopwatch()
+    let seen = 0
+    for (i in 0..1000) {
+        seen += User.where("active", true).where("age", ">", 18 + i % 40).orderBy("age").limit(50).get().size()
+    }
+    phase("where", sw)
+
+    // 5. load every row as a model
+    sw = new Stopwatch()
+    let all = 0
+    for (i in 0..5) { all += User.all().size() }
+    phase("all", sw)
+
+    // 6. change and save 2000 loaded models (in a transaction)
+    sw = new Stopwatch()
+    DB.transaction(fn() {
+        for (u in User.query().orderBy("id").limit(2000).get()) {
+            u.age = u.age + 1
+            u.save()
+        }
+    })
+    phase("update", sw)
+
+    // 7. eager loading: 2000 users with their posts
+    sw = new Stopwatch()
+    let posts = 0
+    for (i in 0..5) {
+        for (u in User.with("posts").orderBy("id").limit(2000).get()) { posts += u.posts().get().size() }
+    }
+    phase("eager", sw)
+
+    // 8. aggregates
+    sw = new Stopwatch()
+    let agg = 0.0
+    for (i in 0..1000) {
+        agg += User.where("age", ">", i % 60).count() as float
+        agg += User.where("active", true).avg("age")
+    }
+    phase("aggregate", sw)
+
+    print("total\t${total.elapsedMs()}")
+    print("check\t${found} ${seen} ${all} ${posts} ${agg > 0.0}")
+}

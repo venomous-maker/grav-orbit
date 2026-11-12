@@ -53,6 +53,22 @@ fn main() {
 }
 ```
 
+## Performance
+
+On the same work, Orbit runs 2.4–2.6× as fast as Laravel's Eloquent (PHP 8.5
+with JIT) and 3.6–4.5× as fast as SQLAlchemy 2.0, using about half their memory:
+
+| Total time | SQLite | PostgreSQL | MariaDB |
+|---|---:|---:|---:|
+| **Orbit** | **2.3 s** | **5.6 s** | **14.9 s** |
+| Eloquent 13 | 6.1 s | 13.6 s | 25.6 s |
+| SQLAlchemy 2.0 | 10.4 s | 20.3 s | 33.0 s |
+
+The ratios are for SQLite and PostgreSQL. On MariaDB the server's own time
+dominates, and Orbit is 1.7× and 2.2× as fast.
+[bench/](bench/README.md) has the programs, each phase's times and how they
+were run.
+
 ## Install
 
 From GitHub:

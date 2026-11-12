@@ -1,0 +1,200 @@
+{
+ "sqlite": {
+  "Orbit (grav --release)": {
+   "phases": {
+    "create": 95,
+    "bulk_insert": 32,
+    "find": 305,
+    "where": 347,
+    "all": 316,
+    "update": 31,
+    "eager": 289,
+    "aggregate": 812,
+    "total": 2319
+   },
+   "rss_mb": 41.5,
+   "cpu_s": 2.37,
+   "check": "10000 50000 50000 50000 true"
+  },
+  "Orbit (grav build)": {
+   "phases": {
+    "create": 128,
+    "bulk_insert": 35,
+    "find": 349,
+    "where": 408,
+    "all": 374,
+    "update": 38,
+    "eager": 351,
+    "aggregate": 833,
+    "total": 2591
+   },
+   "rss_mb": 41.4,
+   "cpu_s": 2.64,
+   "check": "10000 50000 50000 50000 true"
+  },
+  "Eloquent 13 (PHP 8.5 + JIT)": {
+   "phases": {
+    "create": 1388,
+    "bulk_insert": 30,
+    "find": 1203,
+    "where": 611,
+    "all": 500,
+    "update": 400,
+    "eager": 846,
+    "aggregate": 1017,
+    "total": 6073
+   },
+   "rss_mb": 87.3,
+   "cpu_s": 6.22,
+   "check": "10000 50000 50000 50000 true"
+  },
+  "SQLAlchemy 2.0 (Python 3.13)": {
+   "phases": {
+    "create": 3004,
+    "bulk_insert": 34,
+    "find": 2964,
+    "where": 744,
+    "all": 456,
+    "update": 78,
+    "eager": 961,
+    "aggregate": 1592,
+    "total": 10412
+   },
+   "rss_mb": 72.5,
+   "cpu_s": 10.92,
+   "check": "10000 50000 50000 50000 true"
+  }
+ },
+ "mariadb": {
+  "Orbit (grav --release)": {
+   "phases": {
+    "create": 3921,
+    "bulk_insert": 560,
+    "find": 1328,
+    "where": 932,
+    "all": 366,
+    "update": 371,
+    "eager": 359,
+    "aggregate": 5260,
+    "total": 14923
+   },
+   "rss_mb": 44.6,
+   "cpu_s": 2.55,
+   "check": "10000 50000 50000 50000 true"
+  },
+  "Orbit (grav build)": {
+   "phases": {
+    "create": 5871,
+    "bulk_insert": 634,
+    "find": 1404,
+    "where": 1023,
+    "all": 460,
+    "update": 303,
+    "eager": 468,
+    "aggregate": 5774,
+    "total": 16831
+   },
+   "rss_mb": 44.2,
+   "cpu_s": 3.04,
+   "check": "10000 50000 50000 50000 true"
+  },
+  "Eloquent 13 (PHP 8.5 + JIT)": {
+   "phases": {
+    "create": 11987,
+    "bulk_insert": 980,
+    "find": 2797,
+    "where": 1567,
+    "all": 669,
+    "update": 927,
+    "eager": 1017,
+    "aggregate": 5287,
+    "total": 25595
+   },
+   "rss_mb": 83.8,
+   "cpu_s": 9.44,
+   "check": "10000 50000 50000 50000 true"
+  },
+  "SQLAlchemy 2.0 (Python 3.13)": {
+   "phases": {
+    "create": 14210,
+    "bulk_insert": 729,
+    "find": 5069,
+    "where": 1257,
+    "all": 579,
+    "update": 361,
+    "eager": 1109,
+    "aggregate": 5472,
+    "total": 32992
+   },
+   "rss_mb": 71.3,
+   "cpu_s": 13.81,
+   "check": "10000 50000 50000 50000 true"
+  }
+ },
+ "postgres": {
+  "Orbit (grav --release)": {
+   "phases": {
+    "create": 690,
+    "bulk_insert": 141,
+    "find": 794,
+    "where": 562,
+    "all": 377,
+    "update": 156,
+    "eager": 321,
+    "aggregate": 2488,
+    "total": 5628
+   },
+   "rss_mb": 41.0,
+   "cpu_s": 1.96,
+   "check": "10000 50000 50000 50000 true"
+  },
+  "Orbit (grav build)": {
+   "phases": {
+    "create": 702,
+    "bulk_insert": 89,
+    "find": 802,
+    "where": 602,
+    "all": 425,
+    "update": 159,
+    "eager": 400,
+    "aggregate": 2586,
+    "total": 5868
+   },
+   "rss_mb": 41.2,
+   "cpu_s": 2.28,
+   "check": "10000 50000 50000 50000 true"
+  },
+  "Eloquent 13 (PHP 8.5 + JIT)": {
+   "phases": {
+    "create": 2847,
+    "bulk_insert": 153,
+    "find": 2715,
+    "where": 1136,
+    "all": 477,
+    "update": 719,
+    "eager": 842,
+    "aggregate": 3073,
+    "total": 13555
+   },
+   "rss_mb": 85.3,
+   "cpu_s": 7.17,
+   "check": "10000 50000 50000 50000 true"
+  },
+  "SQLAlchemy 2.0 (Python 3.13)": {
+   "phases": {
+    "create": 6483,
+    "bulk_insert": 172,
+    "find": 5856,
+    "where": 1206,
+    "all": 534,
+    "update": 268,
+    "eager": 1053,
+    "aggregate": 3903,
+    "total": 20297
+   },
+   "rss_mb": 74.0,
+   "cpu_s": 13.47,
+   "check": "10000 50000 50000 50000 true"
+  }
+ }
+}
