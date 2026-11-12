@@ -132,6 +132,11 @@ namespace orbit {
         }
         fn where(name: string, op: string, value: any) -> Query<T> { return self.query().where(name, op, value); }
         fn where(name: string, value: any) -> Query<T> { return self.query().where(name, value); }
+        fn whereIn(name: string, values: Array<any>) -> Query<T> { return self.query().whereIn(name, values); }
+        fn orderBy(name: string, direction: string = "asc") -> Query<T> { return self.query().orderBy(name, direction); }
+        fn latest(name: string = "createdAt") -> Query<T> { return self.query().latest(name); }
+        fn limit(n: long) -> Query<T> { return self.query().limit(n); }
+        fn with(relation: string) -> Query<T> { return self.query().with(relation); }
         // The related objects (loaded ones when with() loaded them).
         fn get() -> Array<T> {
             if (self.loaded()) { return self.parent.__loaded[self.key()] as Array<T>; }
@@ -145,7 +150,7 @@ namespace orbit {
         fn save(child: T) -> T {
             self.foreignKey.field.set(child, self.localKey.field.get(self.parent));
             Persister.save(child, self.relatedMap, self.db());
-            self.parent.__loaded.remove(self.key());
+            self.parent.__forget(self.key());
             return child;
         }
         fn saveMany(children: Array<T>) { for (c in children) { self.save(c); } }
@@ -286,6 +291,10 @@ namespace orbit {
         public typeValue: string = ""
         public parentKey: FieldMap
         public relatedKey: FieldMap
+        // withPivot's columns, wherePivot's conditions (column, op, value), withTimestamps.
+        private pivotCols: Array<string> = new Array<string>()
+        private pivotWheres: Array<Array<any>> = new Array<Array<any>>()
+        private pivotTimes: bool = false
 
         constructor(parent: Model, table: string, foreignPivotKey: string, relatedPivotKey: string, morph: string, inverse: bool) {
             super(parent, reflect(T));
@@ -312,7 +321,65 @@ namespace orbit {
             self.parentKey = self.parentMap.requireId();
             self.relatedKey = self.relatedMap.requireId();
         }
-        fn key() -> string { return "belongsToMany:" + self.table + "." + self.foreignPivotKey + "." + self.typeValue; }
+        fn key() -> string {
+            let where = new StringBuilder();
+            for (w in self.pivotWheres) { where.append("${w[0]}${w[1]}${w[2]};"); }
+            return "belongsToMany:" + self.table + "." + self.foreignPivotKey + "." + self.typeValue + "|" + Str.join(self.pivotCols, ",") + "|" + where.toString();
+        }
+        // Also reads these pivot columns (each object's pivot("level")).
+        fn withPivot(columns: Array<string>) -> BelongsToMany<T> { for (c in columns) { self.pivotCols.push(Builder.ident(c)); } return self; }
+        // Only links whose pivot column matches (`wherePivot("level", ">", 2)`).
+        fn wherePivot(column: string, op: string, value: any) -> BelongsToMany<T> {
+            let w = new Array<any>();
+            w.push(Builder.ident(column));
+            w.push(Builder.operator(op));
+            w.push(value);
+            self.pivotWheres.push(w);
+            return self;
+        }
+        fn wherePivot(column: string, value: any) -> BelongsToMany<T> { return self.wherePivot(column, "=", value); }
+        // attach fills the pivot's created_at and updated_at (and reads them back).
+        fn withTimestamps() -> BelongsToMany<T> {
+            if (self.pivotTimes) { return self; }
+            self.pivotTimes = true;
+            self.pivotCols.push("created_at");
+            self.pivotCols.push("updated_at");
+            return self;
+        }
+        // Sets pivot columns of the link to `id`; how many links changed.
+        fn updateExistingPivot(id: any, values: HashMap<string, any>) -> long {
+            let db = self.db();
+            let sets = new Array<string>();
+            let args = new Array<any>();
+            for (k in values.keys()) { sets.push(db.quote(Builder.ident(k)) + " = ?"); args.push(values[k]); }
+            if (self.pivotTimes && !values.containsKey("updated_at")) { sets.push(db.quote("updated_at") + " = ?"); args.push(DateTime.now()); }
+            if (sets.size() == 0) { return 0; }
+            args.push(self.parentKey.field.get(self.parent));
+            args.push(self.keyOf(id));
+            let sql = "UPDATE " + db.quote(self.table) + " SET " + Str.join(sets, ", ") + " WHERE " + db.quote(self.foreignPivotKey) + " = ? AND " + db.quote(self.relatedPivotKey) + " = ?";
+            if (self.typeColumn != "") { sql = sql + " AND " + db.quote(self.typeColumn) + " = ?"; args.push(self.typeValue); }
+            self.parent.__forget(self.key());
+            return db.execute(sql, args);
+        }
+        // Attaches those of `ids` not linked yet, and detaches nothing.
+        fn syncWithoutDetaching(ids: Array<any>) {
+            let have = new HashSet<string>();
+            for (v in self.linkedKeys()) { have.add("${v}"); }
+            let fresh = new Array<any>();
+            for (id in ids) { if (!have.contains("${self.keyOf(id)}")) { fresh.push(self.keyOf(id)); } }
+            self.attachMany(fresh);
+        }
+        // The keys of the linked objects, read from the pivot.
+        fn linkedKeys() -> Array<any> {
+            let db = self.db();
+            let args = new Array<any>();
+            args.push(self.parentKey.field.get(self.parent));
+            let sql = "SELECT " + db.quote(self.relatedPivotKey) + " FROM " + db.quote(self.table) + " WHERE " + db.quote(self.foreignPivotKey) + " = ?";
+            if (self.typeColumn != "") { sql = sql + " AND " + db.quote(self.typeColumn) + " = ?"; args.push(self.typeValue); }
+            let out = new Array<any>();
+            for (row in db.query(sql, args)) { out.push(row.at(0)); }
+            return out;
+        }
         // A query for the linked objects; each has the pivot's columns in extra("pivot_<column>").
         fn query() -> Query<T> {
             let q = new Query<T>(self.relatedMap);
@@ -322,6 +389,11 @@ namespace orbit {
         }
         fn where(name: string, op: string, value: any) -> Query<T> { return self.query().where(name, op, value); }
         fn where(name: string, value: any) -> Query<T> { return self.query().where(name, value); }
+        fn whereIn(name: string, values: Array<any>) -> Query<T> { return self.query().whereIn(name, values); }
+        fn orderBy(name: string, direction: string = "asc") -> Query<T> { return self.query().orderBy(name, direction); }
+        fn latest(name: string = "createdAt") -> Query<T> { return self.query().latest(name); }
+        fn limit(n: long) -> Query<T> { return self.query().limit(n); }
+        fn with(relation: string) -> Query<T> { return self.query().with(relation); }
         // The linked objects (loaded ones when with() loaded them).
         fn get() -> Array<T> {
             if (self.loaded()) { return self.parent.__loaded[self.key()] as Array<T>; }
@@ -346,6 +418,8 @@ namespace orbit {
             if (self.typeColumn != "") { cols.push(db.quote(self.typeColumn)); }
             let keys = extra.keys();
             for (k in keys) { cols.push(db.quote(Builder.ident(k))); }
+            let now = DateTime.now();
+            if (self.pivotTimes) { cols.push(db.quote("created_at")); cols.push(db.quote("updated_at")); }
             let marks = new Array<string>();
             for (c in cols) { marks.push("?"); }
             let rows = new Array<Array<any>>();
@@ -356,10 +430,11 @@ namespace orbit {
                 r.push(self.keyOf(id));
                 if (self.typeColumn != "") { r.push(self.typeValue); }
                 for (k in keys) { r.push(extra[k]); }
+                if (self.pivotTimes) { r.push(now); r.push(now); }
                 rows.push(r);
             }
             db.executeMany("INSERT INTO " + db.quote(self.table) + " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")", rows);
-            self.parent.__loaded.remove(self.key());
+            self.parent.__forget(self.key());
         }
         // Unlinks `id` (an object or key), or every linked object; how many links went.
         fn detach(id: any) -> long {
@@ -380,7 +455,7 @@ namespace orbit {
                 for (id in ids) { marks.push("?"); args.push(self.keyOf(id)); }
                 sql = sql + " AND " + db.quote(self.relatedPivotKey) + " IN (" + Str.join(marks, ", ") + ")";
             }
-            self.parent.__loaded.remove(self.key());
+            self.parent.__forget(self.key());
             return db.execute(sql, args);
         }
         // Links exactly `ids`: those missing are attached, others detached.
@@ -407,7 +482,7 @@ namespace orbit {
         // Attaches what is not linked, detaches what is.
         fn toggle(ids: Array<any>) {
             let now = new HashSet<string>();
-            for (o in self.query().get()) { now.add("${self.relatedKey.field.get(o)}"); }
+            for (v in self.linkedKeys()) { now.add("${v}"); }
             let on = new Array<any>();
             let off = new Array<any>();
             for (id in ids) { if (now.contains("${self.keyOf(id)}")) { off.push(id); } else { on.push(id); } }
@@ -420,6 +495,7 @@ namespace orbit {
             inner.join(self.table, alias + "." + self.relatedKey.field.name, "=", self.table + "." + self.relatedPivotKey);
             inner.__addCond(" AND ", inner.q(self.table) + "." + inner.q(self.foreignPivotKey) + " = " + Relation.on(outer, self.parentKey), new Array<any>());
             if (self.typeColumn != "") { inner.where(self.table + "." + self.typeColumn, self.typeValue); }
+            for (w in self.pivotWheres) { inner.where(self.table + "." + (w[0] as string), w[1] as string, w[2]); }
             return inner;
         }
         fn eager(parents: Array<Model>, nested: string) {
@@ -441,11 +517,107 @@ namespace orbit {
             q.join(self.table, self.relatedMap.table + "." + self.relatedKey.field.name, "=", self.table + "." + self.relatedPivotKey);
             q.selectRaw(db.quote(self.relatedMap.table) + ".*, " + db.quote(self.table) + "." + db.quote(self.foreignPivotKey) +
                         " AS " + db.quote("pivot_" + self.foreignPivotKey));
+            for (c in self.pivotCols) { q.selectRaw(db.quote(self.table) + "." + db.quote(c) + " AS " + db.quote("pivot_" + c)); }
             if (self.typeColumn != "") { q.where(self.table + "." + self.typeColumn, self.typeValue); }
+            for (w in self.pivotWheres) { q.where(self.table + "." + (w[0] as string), w[1] as string, w[2]); }
         }
         private fn keyOf(id: any) -> any {
             if (id is Model) { return self.relatedKey.field.get(id); }
             return id;
+        }
+    }
+
+    // The T objects reached through U objects: Country -> users (country_id) ->
+    // posts (user_id): `fn posts() -> HasManyThrough<Post, User> { return self.hasManyThrough() }`.
+    class HasManyThrough<T, U> extends Relation {
+        public throughMap: TableMap
+        public firstKey: FieldMap            // on U: points to the owner (users.country_id)
+        public secondKey: FieldMap           // on T: points to U (posts.user_id)
+        public localKey: FieldMap            // the owner's key
+        public secondLocalKey: FieldMap      // U's key
+
+        constructor(parent: Model, firstKey: string, secondKey: string, localKey: string, secondLocalKey: string) {
+            super(parent, reflect(T));
+            self.throughMap = TableMap.of(reflect(U));
+            let fk = firstKey != "" ? firstKey : Naming.snake(self.parentMap.info.simpleName()) + "_id";
+            let sk = secondKey != "" ? secondKey : Naming.snake(self.throughMap.info.simpleName()) + "_id";
+            self.firstKey = Relation.field(self.throughMap, fk, "the key of " + self.throughMap.info.simpleName() + " on its owner");
+            self.secondKey = Relation.field(self.relatedMap, sk, "the key of " + self.relatedMap.info.simpleName() + " on " + self.throughMap.info.simpleName());
+            self.localKey = localKey != "" ? Relation.field(self.parentMap, localKey, "a local key") : self.parentMap.requireId();
+            self.secondLocalKey = secondLocalKey != "" ? Relation.field(self.throughMap, secondLocalKey, "a key") : self.throughMap.requireId();
+        }
+        fn key() -> string { return "through:" + self.relatedMap.table + "." + self.throughMap.table + "." + self.firstKey.column; }
+        fn query() -> Query<T> {
+            let q = new Query<T>(self.relatedMap);
+            self.joinThrough(q);
+            q.where(self.throughMap.table + "." + self.firstKey.column, self.localKey.field.get(self.parent));
+            return q;
+        }
+        fn where(name: string, op: string, value: any) -> Query<T> { return self.query().where(name, op, value); }
+        fn where(name: string, value: any) -> Query<T> { return self.query().where(name, value); }
+        fn whereIn(name: string, values: Array<any>) -> Query<T> { return self.query().whereIn(name, values); }
+        fn orderBy(name: string, direction: string = "asc") -> Query<T> { return self.query().orderBy(name, direction); }
+        fn latest(name: string = "createdAt") -> Query<T> { return self.query().latest(name); }
+        fn limit(n: long) -> Query<T> { return self.query().limit(n); }
+        fn with(relation: string) -> Query<T> { return self.query().with(relation); }
+        fn get() -> Array<T> {
+            if (self.loaded()) { return self.parent.__loaded[self.key()] as Array<T>; }
+            return self.query().get();
+        }
+        fn first() -> T { return self.query().first(); }
+        fn count() -> long { return self.loaded() ? (self.get().size() as long) : self.query().count(); }
+        fn pluck(name: string) -> Array<any> { return self.query().pluck(name); }
+        fn existence(outer: Builder) -> Builder {
+            let alias = "__orbit_${outer.__depth + 1}";
+            let inner = outer.__sub(self.relatedMap, alias);
+            inner.join(self.throughMap.table, self.throughMap.table + "." + self.secondLocalKey.column, "=", alias + "." + self.secondKey.column);
+            inner.__addCond(" AND ", inner.q(self.throughMap.table) + "." + inner.q(self.firstKey.column) + " = " + Relation.on(outer, self.localKey), new Array<any>());
+            return inner;
+        }
+        fn eager(parents: Array<Model>, nested: string) {
+            let q = new Query<T>(self.relatedMap);
+            self.joinThrough(q);
+            q.whereIn(self.throughMap.table + "." + self.firstKey.column, Relation.keysOf(parents, self.localKey));
+            if (nested != "") { q.with(nested); }
+            let groups = new HashMap<string, Array<T>>();
+            for (o in q.get()) {
+                let k = "${(o as Model).extra("__through_key")}";
+                if (!groups.containsKey(k)) { groups.put(k, new Array<T>()); }
+                groups[k].push(o);
+            }
+            for (p in parents) {
+                let mine = groups.getOr("${self.localKey.field.get(p)}", new Array<T>());
+                p.__keepList(self.key(), Relation.models::<T>(mine));
+                p.__loaded.put(self.key(), mine);
+            }
+        }
+        private fn joinThrough(q: Builder) {
+            let db = q.conn();
+            q.join(self.throughMap.table, self.throughMap.table + "." + self.secondLocalKey.column, "=", self.relatedMap.table + "." + self.secondKey.column);
+            q.selectRaw(db.quote(self.relatedMap.table) + ".*, " + db.quote(self.throughMap.table) + "." + db.quote(self.firstKey.column) + " AS " + db.quote("__through_key"));
+        }
+    }
+
+    // The one T object reached through a U object (see HasManyThrough).
+    class HasOneThrough<T, U> extends Relation {
+        public many: HasManyThrough<T, U>
+        constructor(parent: Model, firstKey: string, secondKey: string, localKey: string, secondLocalKey: string) {
+            super(parent, reflect(T));
+            self.many = new HasManyThrough<T, U>(parent, firstKey, secondKey, localKey, secondLocalKey);
+        }
+        fn key() -> string { return "oneThrough:" + self.many.key(); }
+        fn query() -> Query<T> { return self.many.query(); }
+        fn get() -> T {
+            if (self.loaded()) { return self.parent.__loaded[self.key()] as T; }
+            return self.many.query().first();
+        }
+        fn existence(outer: Builder) -> Builder { return self.many.existence(outer); }
+        fn eager(parents: Array<Model>, nested: string) {
+            self.many.eager(parents, nested);
+            for (p in parents) {
+                let all = p.__loaded[self.many.key()] as Array<T>;
+                p.__loaded.put(self.key(), all.size() == 0 ? null : all[0]);
+            }
         }
     }
 
@@ -479,7 +651,7 @@ namespace orbit {
             self.idField.field.set(child, self.localKey.field.get(self.parent));
             self.typeField.field.set(child, self.parentMap.morphName);
             Persister.save(child, self.relatedMap, self.db());
-            self.parent.__loaded.remove(self.key());
+            self.parent.__forget(self.key());
             return child;
         }
         fn create(values: HashMap<string, any>) -> T {
