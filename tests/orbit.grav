@@ -23,6 +23,8 @@ class User extends Model {
     fn posts() -> HasMany<Post> { return self.hasMany() }
     fn profile() -> HasOne<Profile> { return self.hasOne() }
     fn roles() -> BelongsToMany<Role> { return self.belongsToMany() }
+    fn rankedRoles() -> BelongsToMany<Role> { return self.belongsToMany::<Role>().withPivot(["level"]).withTimestamps() }
+    fn seniorRoles() -> BelongsToMany<Role> { return self.belongsToMany::<Role>().withPivot(["level"]).wherePivot("level", ">=", 3) }
 }
 
 @SoftDeletes
@@ -373,4 +375,98 @@ test "behaviors: traits on models" {
     assertEq("${audit.log}", "[\"created Article\", \"created Article\", \"deleting Article\"]")   // (inherited from Content)
     assertEq(Behaviors.isRegistered("SoftDeletes") && Behaviors.isRegistered("Sluggable"), true)
     Schema.drop("articles")
+}
+
+class Country extends Model {
+    public id: long = 0
+    public name: string = ""
+    fn notes() -> HasManyThrough<Note, Citizen> { return self.hasManyThrough() }
+    fn firstNote() -> HasOneThrough<Note, Citizen> { return self.hasOneThrough() }
+}
+class Citizen extends Model {
+    public id: long = 0
+    public countryId: long = 0
+    public name: string = ""
+}
+class Note extends Model {
+    public id: long = 0
+    public citizenId: long = 0
+    public text: string = ""
+}
+
+test "more of Eloquent: changes, upserts, pivots, through, schema" {
+    setUp()
+    // Changes: what differs from the row, what a save changed, and no UPDATE when nothing did.
+    let ada = User.firstWhere("email", "ada@example.com")
+    assertEq("${ada.isDirty()} ${ada.isClean("name")}", "false true")
+    ada.name = "Ada K."
+    assertEq("${ada.isDirty()} ${ada.isDirty("name")} ${ada.isDirty("age")} ${ada.getOriginal("name")} ${ada.getDirty().keys()}", "true true false Ada [\"name\"]")
+    ada.save()
+    assertEq("${ada.wasChanged("name")} ${ada.wasChanged("age")} ${ada.isDirty()} ${ada.getOriginal("name")}", "true false false Ada K.")
+    let stamp = ada.updatedAt
+    ada.save()                                                                   // (clean: no UPDATE, updatedAt unchanged)
+    assertEq("${ada.wasChanged()} ${ada.updatedAt == stamp}", "false true")
+    ada.age = 37
+    ada.saveQuietly()
+    assertEq(User.find(ada.id).age, 37)
+    // Maps of some fields, and per-object hiding.
+    assertEq("${ada.only(["name", "age"]).size()} ${ada.except(["secret"]).containsKey("secret")} ${ada.toMap().containsKey("secret")}", "2 false false")
+    assertEq("${ada.makeVisible(["secret"]).toMap().containsKey("secret")} ${ada.makeHidden(["age"]).toMap().containsKey("age")}", "true false")
+    // findOrNew, firstOr, upsert, insertOrIgnore, chunkById.
+    assertEq("${User.findOrNew(999999).isNew()} ${User.query().where("name", "Nobody").firstOr(fn() -> User => User.make(fields("name", "fallback"))).name}", "true fallback")
+    let rows = new Array<HashMap<string, any>>()
+    rows.push(fields("name", "Ada again", "email", "ada@example.com", "age", 50))
+    rows.push(fields("name", "Zed", "email", "zed@example.com", "age", 22))
+    User.upsert(rows, ["email"], ["name", "age"])
+    assertEq("${User.firstWhere("email", "ada@example.com").name} ${User.firstWhere("email", "zed@example.com").age} ${User.count()}", "Ada again 22 4")
+    let dup = new Array<HashMap<string, any>>()
+    dup.push(fields("name", "Zed twice", "email", "zed@example.com"))
+    dup.push(fields("name", "Yan", "email", "yan@example.com"))
+    User.insertOrIgnore(dup)
+    assertEq("${User.firstWhere("email", "zed@example.com").name} ${User.count()}", "Zed 5")
+    let seen = new Array<string>()
+    User.chunkById(2, fn(part: Array<User>) { for (u in part) { seen.push(u.name) } })
+    assertEq(seen.size(), 5)
+    // Relation filters and aggregates; loading on an object.
+    assertEq("${User.whereRelation("posts", "views", ">", 7).pluck("name")}", "[Ada again]")
+    let withSums = User.withSum("posts", "views").withExists("profile").orderBy("id").get()
+    assertEq("${Decimal.parse("${withSums[0].extra("posts_sum_views")}").toLong()} ${withSums[0].extra("profile_exists")} ${withSums[1].extra("profile_exists")}", "15 1 0")
+    let one = User.firstWhere("email", "ada@example.com")
+    assertEq("${one.loadCount("posts").countOf("posts")} ${one.relationLoaded("posts")} ${one.loadMissing("posts").relationLoaded("posts")}", "3 false true")
+    one.posts().get()[0].title = "Pushed"
+    one.push()
+    assertEq(Post.where("title", "Pushed").count(), 1 as long)
+    // Pivot columns, conditions, timestamps.
+    Schema.alter("role_user", fn(t: Blueprint) { t.integer("level").nullable(); t.dateTime("created_at").nullable(); t.dateTime("updated_at").nullable() })
+    assertEq(Schema.hasColumns("role_user", ["level", "created_at"]), true)
+    let admin = Role.create(fields("name", "admin"))
+    let editor = Role.create(fields("name", "editor"))
+    one.rankedRoles().attach(admin, fields("level", 5))
+    one.rankedRoles().syncWithoutDetaching([admin.id, editor.id])
+    one.rankedRoles().updateExistingPivot(editor.id, fields("level", 1))
+    let ranked = one.rankedRoles().orderBy("name").get()
+    assertEq("${ranked.size()} ${ranked[0].pivot("level")} ${ranked[1].pivot("level")} ${ranked[0].pivot("created_at") != null}", "2 5 1 true")
+    assertEq("${one.seniorRoles().pluck("name")} ${User.with("seniorRoles").firstWhere("email", "ada@example.com").seniorRoles().get().size()}", "[admin] 1")
+    // Through relations.
+    Schema.create("countries", fn(t: Blueprint) { t.id(); t.varchar("name") })
+    Schema.create("citizens", fn(t: Blueprint) { t.id(); t.foreignId("country_id"); t.varchar("name") })
+    Schema.create("notes", fn(t: Blueprint) { t.id(); t.foreignId("citizen_id"); t.varchar("text") })
+    let ke = Country.create(fields("name", "Kenya"))
+    let fr = Country.create(fields("name", "France"))
+    let c1 = Citizen.create(fields("countryId", ke.id, "name", "Wanjiru"))
+    Citizen.create(fields("countryId", fr.id, "name", "Luc"))
+    Note.create(fields("citizenId", c1.id, "text", "a"))
+    Note.create(fields("citizenId", c1.id, "text", "b"))
+    assertEq("${ke.notes().count()} ${fr.notes().count()} ${ke.firstNote().get().text} ${fr.firstNote().get() == null}", "2 0 a true")
+    let countries = Country.with("notes").has("notes").get()
+    assertEq("${countries.size()} ${countries[0].notes().get().size()}", "1 2")
+    // Schema: enumerations, the tables, alter.
+    Schema.create("shirts", fn(t: Blueprint) { t.id(); t.enumeration("size", ["S", "M", "L"]).defaultValue("M"); t.ipAddress(); t.rememberToken() })
+    DB.table("shirts").insert(fields("size", "L", "ip_address", "10.0.0.1"))
+    let bad = false
+    try { DB.table("shirts").insert(fields("size", "XXL", "ip_address", "")) } catch (e: DbError) { bad = true }
+    assertEq("${bad} ${Schema.getTables().contains("shirts")} ${Schema.hasColumn("shirts", "remember_token")}", "true true true")
+    Schema.alter("shirts", fn(t: Blueprint) { t.dropRememberToken() })
+    assertEq(Schema.hasColumn("shirts", "remember_token"), false)
+    for (t in ["shirts", "notes", "citizens", "countries"]) { Schema.dropIfExists(t) }
 }
