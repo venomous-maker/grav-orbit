@@ -624,3 +624,91 @@ test "query gaps: constrained eager loads, scopes, ofMany, subqueries, unions, J
     let c2 = User.cursorPaginate(2, c1.nextCursor)
     assertEq("${c1.items[0].name} ${c1.items[1].name} ${c1.hasMorePages()} ${c2.items.size()} ${c2.items[0].name} ${c2.hasMorePages()}", "Ada Bob true 1 Cy false")
 }
+
+// Remaining Eloquent infrastructure: observers, Prunable, $touches, transaction
+// retries, and a read/write connection split.
+class Note2 extends Model {
+    public id: long = 0
+    public text: string = ""
+    public countryId: long = 0
+    fn country() -> BelongsTo<Country> { return self.belongsTo::<Country>("country_id") }
+    // Prunable: rows older (by id, as a stand-in for age here) than a cutoff.
+    fn prunable() -> Query<Note2> { return Note2.where("text", "old") }
+    fn pruning() { Note2Log.seen.push(self.text) }
+}
+@Touches("target")
+class Citizen2 extends TouchChild {}
+class Note2Log { static seen: Array<string> = new Array<string>() }
+class TouchTarget extends Model implements HasTimestamps {
+    public id: long = 0
+    public name: string = ""
+}
+class TouchChild extends Model {
+    public id: long = 0
+    public targetId: long = 0
+    public name: string = ""
+    fn target() -> BelongsTo<TouchTarget> { return self.belongsTo::<TouchTarget>("target_id") }
+}
+class CountingObserver extends Behavior {
+    static created: int = 0
+    static deleted: int = 0
+    fn created(m: Model, d: Decorator) { CountingObserver.created += 1 }
+    fn deleted(m: Model, d: Decorator) { CountingObserver.deleted += 1 }
+}
+
+test "observers, Prunable, touches, transaction retries, read/write connections" {
+    setUp()
+    Schema.dropIfExists("note2s")
+    Schema.dropIfExists("citizen2s")
+    Schema.dropIfExists("touch_targets")
+    Note2.createTable()
+    Citizen2.createTable()
+    TouchTarget.createTable()
+    // Observers: the same hooks as a Behavior, attached by call, inherited by subclasses too.
+    User.observe(new CountingObserver())
+    let before = CountingObserver.created;
+    let u = User.create(fields("name", "Zoe", "email", "zoe@example.com"))
+    assertEq(CountingObserver.created, before + 1)
+    u.delete()                                                        // User has no soft deletes
+    assertEq(CountingObserver.deleted, 1)
+    // Prunable: prune() runs pruning() then forceDelete()s the matches.
+    Note2.create(fields("text", "old"))
+    Note2.create(fields("text", "old"))
+    Note2.create(fields("text", "new"))
+    Note2Log.seen.clear()
+    let pruned = Note2.prune()
+    assertEq("${pruned} ${Note2.count()} ${Note2Log.seen}", "2 1 [\"old\", \"old\"]")
+    let bare = ""
+    try { Country.prune() } catch (e: StateError) { bare = e.message() }
+    assertEq(bare, "Country is not prunable: define `fn prunable() -> Query<Self> { ... }` (the rows prune() deletes for good)")
+    // $touches: saving a Citizen2 touches its TouchTarget's updatedAt.
+    let target = TouchTarget.create(fields("name", "Touchland"))
+    let c = Citizen2.create(fields("targetId", target.id, "name", "Kim"))
+    let stamp1 = target.updatedAt
+    Time.sleepMs(1100)                                              // DateTime.now() keeps whole seconds
+    c.name = "Kimi"
+    c.save()
+    let touched = TouchTarget.find(target.id)
+    assertEq(touched.updatedAt != stamp1, true)
+    // Transaction retries: succeeds without retrying when nothing throws, and
+    // reports a deadlock as retryable.
+    let runs = new Array<bool>()
+    DB.transaction(fn() { runs.push(true); User.create(fields("name", "Retried", "email", "retried@example.com")) }, 3)
+    assertEq("${runs.size()} ${User.firstWhere("email", "retried@example.com") != null}", "1 true")
+    let deadlock = new DbError("deadlock", 1213, "")
+    deadlock.state = "40001"
+    assertEq("${DB.isDeadlock(deadlock)} ${DB.isDeadlock(new DbError("syntax error", 1, ""))}", "true false")
+    // Read/write connections: a plain connect has no replica (reads == writes);
+    // connect(write, read) gives select/selectOne/scalar and a query's reads the
+    // read connection, but inside a transaction everything goes to the write one.
+    assertEq(DB.readConnection() == DB.connection(), true)
+    let primary = connect()
+    let replica = connect()
+    DB.connect(primary, replica, "split")
+    assertEq(DB.readConnection("split") == replica, true)
+    DB.transaction("split", fn() { assertEq(DB.readConnection("split") == primary, true) })
+    DB.disconnect("split")
+    Schema.dropIfExists("note2s")
+    Schema.dropIfExists("citizen2s")
+    Schema.dropIfExists("touch_targets")
+}
