@@ -82,12 +82,14 @@ namespace orbit {
         // PostgreSQL's or MySQL's SQLSTATE for one (40001 serialization failure,
         // 40P01 deadlock_detected), MySQL's own deadlock/lock-wait-timeout codes
         // (1213, 1205), or, for SQLite (which has no SQLSTATE), SQLITE_BUSY or
-        // SQLITE_LOCKED (5, 6) on the connection named `name`. Pass no name (or one
+        // SQLITE_LOCKED (5, 6, and their extended codes) on the connection named `name`. Pass no name (or one
         // with no connection) to check only the driver-agnostic SQLSTATEs.
         static fn isDeadlock(e: DbError, name: string = "") -> bool {
             if (e.state == "40001" || e.state == "40P01") { return true; }
             let driver = name != "" && DB.hasConnection(name) ? DB.connection(name).driver() : "";
-            if (driver == "sqlite") { return e.code == 5 || e.code == 6; }
+            // (grav-db reports SQLite's extended codes — 517 SQLITE_BUSY_SNAPSHOT, 261
+            // SQLITE_BUSY_RECOVERY, 262 SQLITE_LOCKED_SHAREDCACHE...: the low byte is the primary one.)
+            if (driver == "sqlite") { let primary = e.code & 0xFF; return primary == 5 || primary == 6; }
             if (driver == "mysql" || driver == "") { return e.code == 1213 || e.code == 1205; }
             return false;
         }
