@@ -118,6 +118,9 @@ namespace orbit {
         public behaviors: Array<BehaviorUse> = new Array<BehaviorUse>()
         // Properties put into toMap and toJson (`@Appended get x()`, or @Appends("x", ...) on the class).
         public appends: Array<PropertyInfo> = new Array<PropertyInfo>()
+        // `@Touches("post", ...)`: relation methods (belongsTo, hasOne, morphOne,
+        // morphTo) whose single related object is touched after this class saves.
+        public touches: Array<string> = new Array<string>()
         private byName: HashMap<string, FieldMap> = new HashMap<string, FieldMap>()
 
         private static cache: HashMap<string, TableMap> = new HashMap<string, TableMap>()
@@ -174,6 +177,8 @@ namespace orbit {
                 self.byName.put(f.name, m);
                 if (!self.byName.containsKey(column)) { self.byName.put(column, m); }
             }
+            let touchesDeco = info.decorator("Touches");
+            if (touchesDeco != null) { for (a in touchesDeco.args) { self.touches.push("${a}"); } }
             // Properties in toMap: those marked @Appended, and those @Appends names.
             let named = new HashSet<string>();
             let c: ClassInfo = info;
@@ -190,25 +195,27 @@ namespace orbit {
             self.behaviors = Behaviors.on(info);
             for (u in self.behaviors) { u.behavior.boot(self, u.decorator); }
         }
-        // Runs hook `hook` ("saving", "created", ...) of each behavior on `obj` (a Model).
+        private static noDeco: Decorator = new Decorator("Observer")
+        // Runs hook `hook` ("saving", "created", ...) of each behavior on `obj` (a
+        // Model), then of each observer registered for its class (Observers.of).
         fn fire(hook: string, obj: any) {
-            if (self.behaviors.size() == 0 || !(obj is Model)) { return; }
+            if (!(obj is Model)) { return; }
             let m = obj as Model;
-            for (u in self.behaviors) {
-                let b = u.behavior;
-                let d = u.decorator;
-                switch (hook) {
-                    case "saving": b.saving(m, d)
-                    case "saved": b.saved(m, d)
-                    case "creating": b.creating(m, d)
-                    case "created": b.created(m, d)
-                    case "updating": b.updating(m, d)
-                    case "updated": b.updated(m, d)
-                    case "deleting": b.deleting(m, d)
-                    case "deleted": b.deleted(m, d)
-                    case "retrieved": b.retrieved(m, d)
-                    default: throw new ValueError("no behavior hook '" + hook + "'")
-                }
+            for (u in self.behaviors) { TableMap.run(hook, u.behavior, m, u.decorator); }
+            if (Observers.any()) { for (o in Observers.of(self.info)) { TableMap.run(hook, o, m, TableMap.noDeco); } }
+        }
+        private static fn run(hook: string, b: Behavior, m: Model, d: Decorator) {
+            switch (hook) {
+                case "saving": b.saving(m, d)
+                case "saved": b.saved(m, d)
+                case "creating": b.creating(m, d)
+                case "created": b.created(m, d)
+                case "updating": b.updating(m, d)
+                case "updated": b.updated(m, d)
+                case "deleting": b.deleting(m, d)
+                case "deleted": b.deleted(m, d)
+                case "retrieved": b.retrieved(m, d)
+                default: throw new ValueError("no behavior hook '" + hook + "'")
             }
         }
         // Whether it wears behavior `name`.

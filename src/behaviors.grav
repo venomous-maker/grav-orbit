@@ -117,6 +117,49 @@ namespace orbit {
         }
     }
 
+    // A model observer: the same hooks as a Behavior (saving, created, deleting,
+    // ...), attached to a class by a call instead of a decorator:
+    //
+    //   class UserObserver extends Behavior {
+    //       fn created(m: Model, d: Decorator) { Mail.send(...) }
+    //   }
+    //   User.observe(new UserObserver())           // runs for User, and any subclass
+    //
+    // `d` is a placeholder (its name is "Observer"): an observer has no decorator
+    // of its own to read arguments from.
+    class Observers {
+        private static byClass: HashMap<string, Array<Behavior>> = new HashMap<string, Array<Behavior>>()
+        private static lock: Mutex = new Mutex()
+        // Set once anything is registered, so fire() can skip the lookup otherwise
+        // (an approximate check across threads is fine: it only ever turns true).
+        private static anyRegistered: bool = false
+
+        // Whether any observer has been registered (fire()'s fast path).
+        static fn any() -> bool { return Observers.anyRegistered; }
+        // Makes `o`'s hooks run for the class named `classFq` and its subclasses.
+        static fn register(classFq: string, o: Behavior) {
+            Observers.anyRegistered = true;
+            Observers.lock.lock();
+            if (!Observers.byClass.containsKey(classFq)) { Observers.byClass.put(classFq, new Array<Behavior>()); }
+            Observers.byClass[classFq].push(o);
+            Observers.lock.unlock();
+        }
+        // The observers of `info`'s class: its own, and its base classes'.
+        static fn of(info: ClassInfo) -> Array<Behavior> {
+            let out = new Array<Behavior>();
+            if (!Observers.anyRegistered) { return out; }
+            Observers.lock.lock();
+            let c: ClassInfo = info;
+            while (c != null) {
+                let list = Observers.byClass.getOr(c.name, null);
+                if (list != null) { for (o in list) { out.push(o); } }
+                c = c.base();
+            }
+            Observers.lock.unlock();
+            return out;
+        }
+    }
+
     // @SoftDeletes, or @SoftDeletes("removedAt"): delete() marks the row (in a
     // `DateTime?` field, deletedAt by default) instead of removing it, and
     // queries leave marked rows out (withTrashed, onlyTrashed, restore, forceDelete).
