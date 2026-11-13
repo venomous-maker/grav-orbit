@@ -7,8 +7,9 @@
 An ORM for [Grav](https://github.com/venomous-maker/grav), in the manner of
 Laravel's Eloquent: models that save and find themselves, a query builder,
 relations (polymorphic ones too) with eager loading, soft deletes, timestamps,
-change tracking, model traits by decorator, a schema builder, migrations, and
-factories and seeders. It sits on
+change tracking, model traits by decorator, a schema builder, migrations,
+factories and seeders, read replicas, and a query log, debugbar, N+1 detection
+and query cache for seeing what it sends. It sits on
 [grav-db](https://github.com/venomous-maker/grav-db), so the same code runs on
 **SQLite**, **MySQL/MariaDB** and **PostgreSQL**. Values always go to the
 database as `?` arguments, and the names in a query are checked against the
@@ -572,6 +573,9 @@ DB.transaction(fn() {
 `lockForUpdate` does nothing on SQLite, whose transactions lock the whole
 database.
 
+To see every statement a program sends, with its time, use
+[the query log](#watching-the-queries).
+
 ### What the static methods offer
 
 `User.where(...)` and its kin are shortcuts for `User.query().where(...)`.
@@ -587,6 +591,105 @@ They cover the common starts: `query`, `where` (all three forms), `whereIn`,
 `pluck`, `paginate`, `simplePaginate`, `cursorPaginate`, `chunk`, `chunkById`,
 `cursor`, `lazy`, `upsert` and `insertOrIgnore`. Anything else starts with `User.query()`:
 `User.query().whereDate(...)`, `User.query().when(...)`.
+
+## Watching the queries
+
+Every statement Orbit sends (a model's save, a query, a relation's load, raw
+`DB.select`) goes through one place that can log it, time it, answer it from a
+cache and count it. With none of that switched on, it costs nothing.
+
+### The query log and listeners
+
+```grav
+DB.enableQueryLog()
+User.with("posts").where("active", true).get()
+for (q in DB.getQueryLog()) {
+    print(q.toString())    // SELECT "users".* FROM "users" WHERE "users"."active" = ? [true] (0.21 ms)
+}
+DB.flushQueryLog()
+DB.disableQueryLog()
+
+DB.listen(fn(q: QueryEvent) {                      // every statement, logged or not
+    if (q.ms > 100.0) { Log.warn("slow query: " + q.toString()) }
+})
+```
+
+A `QueryEvent` has the `sql`, its `bindings`, the `connection` name, `ms`,
+`rows` (read, or changed), whether it was a `read`, went to a `replica`, came
+from the `cached` results, its `batch` size (`insertMany`, `upsert`), and the
+`error` when it failed (a failed statement is logged too, and still throws).
+The log keeps the newest `Sql.logLimit` events (10000), so a long-running
+program can leave it on.
+
+### The debugbar
+
+`Debugbar` reads the log and points at what deserves a look: the same query
+shape run again and again with only its arguments changing (the mark of an
+N+1), exact duplicates, relations lazy-loaded one object at a time, failures,
+and the slowest statements.
+
+```grav
+Debugbar.enable()
+for (u in User.all()) { print(u.posts().count()) }       // one COUNT per user
+print(Debugbar.report())
+// orbit: 51 statements in 4.20 ms (51 reads, 0 writes)
+//   N+1: User.posts() lazy-loaded 50× on objects read together — with("posts")
+//   repeated 50× (3.90 ms): SELECT COUNT(*) FROM "posts" WHERE ...
+//   slowest: ...
+
+Debugbar.reset()                                          // a new request
+print(Debugbar.measure(fn() { User.with("posts").get() }))  // run something and report on it alone
+let st = Debugbar.stats()                                 // the figures (DebugStats)
+let json = Debugbar.toJson()                              // every statement too, for a panel of your own
+page = page + Debugbar.html()                             // a panel fixed to the bottom of a page
+```
+
+`Debugbar.repeatThreshold` (3) is how many runs make a shape "repeated". The
+HTML panel shows the SQL and its arguments: keep it off production pages.
+
+### N+1 detection
+
+A relation read with `get()` (or `count()`) on an object that its query read
+together with others, without `with(...)`, runs one more query for each of
+them: an N+1. Orbit can stop it, warn about it, or count it:
+
+```grav
+Orbit.preventLazyLoading()            // throws LazyLoadingViolation (model, relation)
+Orbit.warnOnLazyLoading()             // or: one line on stderr per Class.relation
+Orbit.handleLazyLoadingViolationsUsing(fn(m: Model, relation: string) {
+    Log.warn("N+1: " + ClassInfo.of(m).simpleName() + "." + relation)
+})
+Orbit.detectLazyLoading()             // or only count them: Orbit.lazyLoads(), the debugbar
+```
+
+Objects read alone (`find`, `first`) still lazy-load freely: that is one query,
+not N. Relations loaded by `with` (or `load`) are never lazy.
+
+### Remembered results (the query cache)
+
+`remember(seconds)` keeps a query's results in the query cache: the first run
+reads the database, identical runs after it (the same SQL with the same
+arguments) the cache, until the time is up or Orbit writes to a table the query
+reads — a model's save or delete, a query's update, delete or insert, or a
+pivot change on that table drops the results that read it. Relations its
+`with` loads are remembered as long.
+
+```grav
+Orbit.cacheQueries()                                          // in memory, up to 1000 results
+let popular = Post.where("views", ">", 1000).with("author").remember(60).get()
+let n = User.where("active", true).remember(300).count()      // counts, pluck, exists too
+Post.where("id", 7).update(fields("views", 0))               // posts' remembered results go
+Orbit.flushQueryCache()                                       // or all of them, by hand
+Orbit.forgetCachedTable("users")                              // or those that read one table
+```
+
+The cache is per process; a write made elsewhere (another process, a
+database trigger) is seen once the time is up. Raw writes (`DB.statement`,
+`DB.update`, ...) drop every remembered result of their connection, since Orbit
+cannot tell which tables they change. Nothing is cached, or read from the
+cache, inside a transaction; what a transaction writes is invalidated again
+when it ends. `Orbit.useQueryCache(store)` takes a `QueryCache` of your own;
+`MemoryQueryCache` counts its `hits` and `misses`.
 
 ## Relations
 
@@ -1327,6 +1430,36 @@ DB.transaction(fn() { User.create(fields("name", "Ada")) })   // writes, and rea
 A query that names its own connection (`.on(db)`, a `@Connection`) always uses
 exactly that one.
 
+**Several read replicas.** Give `connect` a list, or add them one at a time:
+reads take them in turn (round robin), pass over any that is closed, and use
+the write connection when none is open. `DB.stickyReads(seconds)` keeps a
+connection's reads on its writer for a while after each write, so a program
+reads back what it just wrote even while the replicas lag behind:
+
+```grav
+DB.connect(MySql.open(writeUrl), [MySql.open(replica1), MySql.open(replica2)])
+DB.addReadReplica(MySql.open(replica3))
+DB.stickyReads(2.0)                   // 2 s after a write, reads stay on the writer
+DB.readReplicas()                     // the three of them
+```
+
+**One connection per thread.** A grav-db connection is for one thread at a
+time, so a thread that uses Orbit while others do gives itself its own (and, if
+wanted, its own replica): until it calls `DB.leaveThread()`, its models and
+queries use them, and other threads keep theirs or the shared one.
+
+```grav
+Thread.spawn(fn() {
+    DB.useOnThisThread(MySql.open(writeUrl), MySql.open(readUrl))
+    Order.create(fields("total", 10))
+    DB.leaveThread()
+})
+```
+
+The query log, the query cache, N+1 counting and the model mappings are shared
+by every thread (each behind its own lock); set them up before starting
+threads.
+
 **Raw SQL**, with `?` arguments, on the default connection:
 
 | Call | Gives |
@@ -1677,6 +1810,7 @@ Most of Eloquent's names are here and mean the same. What differs:
 
 ```bash
 grav test tests/orbit.grav
+grav test tests/diagnostics.grav
 ORBIT_DB='mysql://user:password@localhost/orbit_test' grav test tests/orbit.grav
 ORBIT_DB='postgresql://user:password@localhost/orbit_test' grav test tests/orbit.grav
 ```
@@ -1688,6 +1822,40 @@ through ones too), eager loading, `whereHas` and `withCount`, aggregates of
 relations, pivot columns, soft deletes, timestamps, change tracking, upserts,
 transactions, behaviors and their scopes, the schema builder, migrations, and
 factories and seeders.
+
+`tests/diagnostics.grav` covers the query log, the debugbar, N+1 detection,
+remembered results and their invalidation, read replicas and per-thread
+connections (on SQLite files in the temporary directory).
+
+**Fuzzing.** `tests/fuzz.grav` runs random query trees (and/or with SQL's
+precedence, nested and negated groups, `IN` with empty lists, `BETWEEN`,
+`LIKE` with `%` and `_`, NULLs, and values with quotes, backslashes, SQL
+comment marks and non-ASCII text) both as SQL and over an in-memory copy of the
+table, with random writes in between, checking each answer uncached and through
+`remember()`; random names, operators and directions must be refused before any
+SQL is sent; random values must round-trip through every field type.
+`ORBIT_FUZZ_SEED` and `ORBIT_FUZZ_ROUNDS` (300) pick a longer run:
+
+```bash
+grav test tests/fuzz.grav
+ORBIT_FUZZ_SEED=7 ORBIT_FUZZ_ROUNDS=5000 grav test tests/fuzz.grav
+```
+
+**Concurrent load and soak.** `tests/stress/load.grav` runs THREADS threads
+(8), each with its own write and read connection on one SQLite file in WAL
+mode, through OPS operations each (1500): transfers in retried transactions,
+in-place increments, remembered and plain reads, eager and lazy loads and
+inserts, with the log, cache and N+1 counting on; the totals must add up at the
+end. `tests/stress/soak.grav` does the same for SECONDS (600), pruning old rows
+as it goes, and fails if memory keeps growing (the end may exceed a quarter of
+the way in by 25%, or 8 MB). Build them with `--release`, or with `--race` for
+ThreadSanitizer:
+
+```bash
+grav tests/stress/load.grav --release -o /tmp/orbit_load --emit bin && /tmp/orbit_load 8 1500
+grav tests/stress/soak.grav --release -o /tmp/orbit_soak --emit bin && /tmp/orbit_soak 600 4
+grav tests/stress/load.grav --race -o /tmp/orbit_race --emit bin && /tmp/orbit_race 4 300
+```
 
 The tests drop and make their own tables (`users`, `posts`, `comments`,
 `roles`, `tags`, `migrations` and others) in the database the URL names: give
