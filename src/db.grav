@@ -56,10 +56,7 @@ namespace orbit {
         // one `select`, `selectOne`, `scalar` and a query's reading methods use
         // instead (a read replica): until a transaction opens, when they go back to
         // `write` (its replica may not have the transaction's own writes yet).
-        // (The two-connection forms are spelled out without the name as well: gravc
-        // does not yet fill in a trailing default when choosing between overloads.)
-        static fn connect(write: Connection, read: Connection) { DB.connect(write, read, "default"); }
-        static fn connect(write: Connection, read: Connection, name: string) {
+        static fn connect(write: Connection, read: Connection, name: string = "default") {
             let rs = new ReplicaSet();
             rs.conns.push(read);
             DB.named.put(name, write);
@@ -67,8 +64,7 @@ namespace orbit {
         }
         // The same with several read replicas: reads take them in turn (round
         // robin), passing over any that is closed; with none open, reads use `write`.
-        static fn connect(write: Connection, reads: Array<Connection>) { DB.connect(write, reads, "default"); }
-        static fn connect(write: Connection, reads: Array<Connection>, name: string) {
+        static fn connect(write: Connection, reads: Array<Connection>, name: string = "default") {
             let rs = new ReplicaSet();
             for (r in reads) { rs.conns.push(r); }
             DB.named.put(name, write);
@@ -156,8 +152,7 @@ namespace orbit {
         //       DB.leaveThread()
         //   })
         static fn useOnThisThread(db: Connection, name: string = "default") { DB.bindThread(db, null, name); }
-        static fn useOnThisThread(write: Connection, read: Connection) { DB.bindThread(write, read, "default"); }
-        static fn useOnThisThread(write: Connection, read: Connection, name: string) { DB.bindThread(write, read, name); }
+        static fn useOnThisThread(write: Connection, read: Connection, name: string = "default") { DB.bindThread(write, read, name); }
         // Forgets this thread's own connections for `name` (closing them is yours).
         static fn leaveThread(name: string = "default") {
             let key = "${Thread.currentId()}\t" + (name == "" ? "default" : name);

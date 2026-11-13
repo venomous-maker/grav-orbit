@@ -208,7 +208,7 @@ test "read replicas: in turn, passing over closed ones, sticky after writes" {
     let r1: Connection = Sqlite.openReadOnly(path)
     let r2: Connection = Sqlite.openReadOnly(path)
     let r3: Connection = Sqlite.openReadOnly(path)
-    DB.connect(writer, [r1, r2], "default")
+    DB.connect(writer, [r1, r2])
     DB.addReadReplica(r3)
     assertEq(DB.readReplicas().size(), 3)
     let picked = new HashMap<string, int>()
@@ -233,7 +233,7 @@ test "read replicas: in turn, passing over closed ones, sticky after writes" {
     assertEq(DB.readConnection() == writer, true)
     // Sticky reads: after a write, reads stay on the writer for a while.
     let r4: Connection = Sqlite.openReadOnly(path)
-    DB.connect(writer, [r4], "default")
+    DB.connect(writer, [r4])
     DB.stickyReads(0.2)
     assertEq(DB.readConnection() == r4, true)
     Author.create(fields("name", "A7"))
