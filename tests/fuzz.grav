@@ -1,0 +1,442 @@
+// Fuzzing Orbit against a reference: random query trees (and/or, nested and
+// negated groups, IN with empty lists, BETWEEN, LIKE with % and _, NULLs,
+// quotes, backslashes, SQL comment marks and non-ASCII text in the values)
+// are run both as SQL and over an in-memory copy of the table, with random
+// writes (create, save, delete, a query's update and delete) in between; each
+// answer is checked uncached and through remember(), which must never return
+// a stale result. Random names, operators and directions must be refused
+// before any SQL is sent. A random round trip of every field type closes it.
+//
+// ORBIT_FUZZ_SEED (default 20261113) and ORBIT_FUZZ_ROUNDS (default 300) pick
+// the run; a failure names the seed and round to replay it.
+import "std"
+import "../src/orbit.grav"
+use db.*
+use orbit.*
+
+class Item extends Model {
+    public id: long = 0
+    public label: string = ""
+    public qty: int = 0
+    public score: long = 0
+    public note: string? = null
+    public flag: bool = false
+}
+
+// The in-memory copy of a row.
+class Ref {
+    public id: long
+    public label: string
+    public qty: int
+    public score: long
+    public note: string?
+    public flag: bool
+    constructor(id: long, label: string, qty: int, score: long, note: string?, flag: bool) {
+        self.id = id; self.label = label; self.qty = qty; self.score = score; self.note = note; self.flag = flag;
+    }
+}
+
+const LABELS: Array<string> = ["alpha", "Alpha", "beta", "O'Brien", "say \"hi\"", "back\\slash", "100%", "under_score",
+                "semi;colon -- x", "café", "日本語", "emoji 🎉", "", " spaced ", "'; DROP TABLE items; --"]
+const NOTES: Array<string> = ["n1", "N1", "it's", "x%y", "ü"]
+const OPS: Array<string> = ["=", "!=", "<", "<=", ">", ">="]
+
+// One condition of a query, and the same condition over a Ref.
+class Leaf {
+    public kind: int = 0          // 0 compare, 1 in, 2 null, 3 between, 4 group, 5 like
+    public col: string = ""
+    public op: string = "="
+    public v: any = null
+    public v2: any = null
+    public list: Array<any> = new Array<any>()
+    public negate: bool = false
+    public children: Array<Leaf> = new Array<Leaf>()
+    public ors: Array<bool> = new Array<bool>()
+
+    fn apply(q: Builder, or: bool) {
+        let me = self;
+        if (self.kind == 0) {
+            if (or) { q.orWhere(self.col, self.op, self.v); } else { q.where(self.col, self.op, self.v); }
+        } else if (self.kind == 1) {
+            if (self.negate) { if (or) { q.orWhereNotIn(self.col, self.list); } else { q.whereNotIn(self.col, self.list); } }
+            else { if (or) { q.orWhereIn(self.col, self.list); } else { q.whereIn(self.col, self.list); } }
+        } else if (self.kind == 2) {
+            if (self.negate) { if (or) { q.orWhereNotNull(self.col); } else { q.whereNotNull(self.col); } }
+            else { if (or) { q.orWhereNull(self.col); } else { q.whereNull(self.col); } }
+        } else if (self.kind == 3) {
+            if (self.negate) { if (or) { q.orWhereNotBetween(self.col, self.v, self.v2); } else { q.whereNotBetween(self.col, self.v, self.v2); } }
+            else { if (or) { q.orWhereBetween(self.col, self.v, self.v2); } else { q.whereBetween(self.col, self.v, self.v2); } }
+        } else if (self.kind == 4) {
+            let f = fn(g: Builder) { me.applyChildren(g) };
+            if (self.negate) { if (or) { q.orWhereNot(f); } else { q.whereNot(f); } }
+            else { if (or) { q.orWhere(f); } else { q.where(f); } }
+        } else {
+            let op = self.negate ? "not like" : "like";
+            if (or) { q.orWhere("label", op, self.v); } else { q.where("label", op, self.v); }
+        }
+    }
+    fn applyChildren(q: Builder) { for (i, c in self.children) { c.apply(q, i > 0 && self.ors[i]); } }
+
+    // SQL's answer for `r`: true, false, or (null) unknown.
+    fn test(r: Ref) -> bool? {
+        if (self.kind == 0) { return Leaf.compare(r, self.col, self.op, self.v); }
+        if (self.kind == 1) {
+            if (self.list.size() == 0) { return self.negate; }          // (Orbit writes no SQL list for none)
+            if (self.col == "note" && r.note == null) { return null; }
+            let found = false;
+            for (x in self.list) { if (Leaf.compare(r, self.col, "=", x) == true) { found = true; } }
+            return self.negate ? !found : found;
+        }
+        if (self.kind == 2) { return self.negate ? r.note != null : r.note == null; }
+        if (self.kind == 3) {
+            let inside = Leaf.compare(r, self.col, ">=", self.v) == true && Leaf.compare(r, self.col, "<=", self.v2) == true;
+            return self.negate ? !inside : inside;
+        }
+        if (self.kind == 4) {
+            let g = Leaf.combine(self.children, self.ors, r);
+            if (g == null) { return null; }
+            return self.negate ? !g : g;
+        }
+        let m = Leaf.like(r.label, "${self.v}");
+        return self.negate ? !m : m;
+    }
+    // A run of conditions joined by and/or, with SQL's precedence (and first).
+    static fn combine(leaves: Array<Leaf>, ors: Array<bool>, r: Ref) -> bool? {
+        let any: bool? = false;
+        let run: bool? = true;
+        for (i, c in leaves) {
+            if (i > 0 && ors[i]) { any = Leaf.or3(any, run); run = true; }
+            run = Leaf.and3(run, c.test(r));
+        }
+        return Leaf.or3(any, run);
+    }
+    static fn and3(a: bool?, b: bool?) -> bool? {
+        if (a == false || b == false) { return false; }
+        if (a == null || b == null) { return null; }
+        return true;
+    }
+    static fn or3(a: bool?, b: bool?) -> bool? {
+        if (a == true || b == true) { return true; }
+        if (a == null || b == null) { return null; }
+        return false;
+    }
+    static fn compare(r: Ref, col: string, op: string, v: any) -> bool? {
+        let c = 0;
+        if (col == "qty") { let x = v as int; c = r.qty < x ? -1 : r.qty > x ? 1 : 0; }
+        else if (col == "score") { let x = v as long; c = r.score < x ? -1 : r.score > x ? 1 : 0; }
+        else if (col == "label") { c = Str.compare(r.label, v as string); }
+        else {
+            if (r.note == null) { return null; }
+            c = Str.compare(r.note!, v as string);
+        }
+        if (op == "=") { return c == 0; }
+        if (op == "!=") { return c != 0; }
+        if (op == "<") { return c < 0; }
+        if (op == "<=") { return c <= 0; }
+        if (op == ">") { return c > 0; }
+        return c >= 0;
+    }
+    // SQLite's LIKE: % any run, _ one character, ASCII letters in either case.
+    static fn like(s: string, p: string) -> bool { return Leaf.likeAt(Leaf.chars(s), 0, Leaf.chars(p), 0); }
+    private static fn likeAt(s: Array<int>, i: int, p: Array<int>, j: int) -> bool {
+        if (j == p.size()) { return i == s.size(); }
+        if (p[j] == 37) {                                                   // %
+            for (k in i..(s.size() + 1)) { if (Leaf.likeAt(s, k, p, j + 1)) { return true; } }
+            return false;
+        }
+        if (i == s.size()) { return false; }
+        if (p[j] == 95 || Leaf.fold(p[j]) == Leaf.fold(s[i])) { return Leaf.likeAt(s, i + 1, p, j + 1); }
+        return false;
+    }
+    private static fn fold(c: int) -> int { return c >= 65 && c <= 90 ? c + 32 : c; }
+    // The code points of UTF-8 text.
+    static fn chars(s: string) -> Array<int> {
+        let out = new Array<int>();
+        let i = 0;
+        while (i < s.length) {
+            let b = s[i] as int;
+            let n = b < 0x80 ? 1 : b < 0xE0 ? 2 : b < 0xF0 ? 3 : 4;
+            let cp = n == 1 ? b : n == 2 ? b & 0x1F : n == 3 ? b & 0x0F : b & 0x07;
+            for (k in 1..n) { cp = (cp << 6) | ((s[i + k] as int) & 0x3F); }
+            out.push(cp);
+            i += n;
+        }
+        return out;
+    }
+}
+
+class Fuzz {
+    public rng: Rng
+    public rows: Array<Ref> = new Array<Ref>()
+    public seed: long
+    public round: int = 0
+    constructor(seed: long) { self.seed = seed; self.rng = new Rng(seed); }
+
+    fn pick(xs: Array<string>) -> string { return xs[self.rng.nextInt(0, xs.size() - 1)]; }
+    fn chance(percent: int) -> bool { return self.rng.nextInt(1, 100) <= percent; }
+    fn qty() -> int { return self.rng.nextInt(-4, 4); }
+    fn score() -> long {
+        let k = self.rng.nextInt(0, 9);
+        if (k == 0) { return 9223372036854775807; }
+        if (k == 1) { return -9223372036854775807 - 1; }
+        return self.rng.nextLong(-1000, 1000);
+    }
+    fn note() -> string? { return self.chance(35) ? null : self.pick(NOTES); }
+    fn where() -> string { return "seed ${self.seed}, round ${self.round}"; }
+
+    // A random condition; `nullSafe`: none whose answer can be unknown (inside a NOT).
+    fn leaf(depth: int, nullSafe: bool) -> Leaf {
+        let l = new Leaf();
+        // (groups and LIKE only near the top, so trees stay small)
+        l.kind = self.rng.nextInt(0, depth < 2 ? 5 : 3);
+        let cols: Array<string> = nullSafe ? ["qty", "score", "label"] : ["qty", "score", "label", "note"];
+        l.col = self.pick(cols);
+        l.negate = self.chance(30);
+        if (l.kind == 0) {
+            l.op = self.pick(OPS);
+            l.v = self.value(l.col);
+        } else if (l.kind == 1) {
+            if (nullSafe && l.col == "note") { l.col = "qty"; }
+            let n = self.rng.nextInt(0, 3);
+            for (i in 0..n) { l.list.push(self.value(l.col)); }
+        } else if (l.kind == 2) {
+            l.col = "note";
+        } else if (l.kind == 3) {
+            if (l.col == "note" || l.col == "label") { l.col = "qty"; }
+            let a = self.value(l.col);
+            let b = self.value(l.col);
+            if (l.col == "qty" && (a as int) > (b as int)) { let t = a; a = b; b = t; }
+            if (l.col == "score" && (a as long) > (b as long)) { let t = a; a = b; b = t; }
+            l.v = a;
+            l.v2 = b;
+        } else if (l.kind == 4) {
+            let n = self.rng.nextInt(1, 3);
+            let inner = nullSafe || l.negate;
+            for (i in 0..n) { l.children.push(self.leaf(depth + 1, inner)); l.ors.push(i > 0 && self.chance(40)); }
+        } else {
+            l.v = self.pattern();
+        }
+        if (l.kind == 0 && nullSafe && l.col == "note") { l.col = "label"; l.v = self.pick(LABELS); }
+        return l;
+    }
+    fn value(col: string) -> any {
+        if (col == "qty") { return self.qty(); }
+        if (col == "score") { return self.chance(70) && self.rows.size() > 0 ? self.rows[self.rng.nextInt(0, self.rows.size() - 1)].score as any : self.score() as any; }
+        if (col == "label") { return self.pick(LABELS); }
+        return self.pick(NOTES);
+    }
+    // A LIKE pattern: a piece of a label, with % and _ around or inside it.
+    fn pattern() -> string {
+        let cs = Leaf.chars(self.pick(LABELS));
+        let sb = new StringBuilder();
+        if (self.chance(50)) { sb.append("%"); }
+        let from = cs.size() == 0 ? 0 : self.rng.nextInt(0, cs.size() - 1);
+        let to = cs.size() == 0 ? 0 : self.rng.nextInt(from, cs.size());
+        for (i in from..to) {
+            if (self.chance(15)) { sb.append("_"); }
+            else { sb.append(Fuzz.utf8(cs[i])); }
+        }
+        if (self.chance(50)) { sb.append("%"); }
+        return sb.toString();
+    }
+    static fn utf8(cp: int) -> string {
+        let b = new Bytes();
+        if (cp < 0x80) { b.appendByte(cp); }
+        else if (cp < 0x800) { b.appendByte(0xC0 | (cp >> 6)); b.appendByte(0x80 | (cp & 0x3F)); }
+        else if (cp < 0x10000) { b.appendByte(0xE0 | (cp >> 12)); b.appendByte(0x80 | ((cp >> 6) & 0x3F)); b.appendByte(0x80 | (cp & 0x3F)); }
+        else { b.appendByte(0xF0 | (cp >> 18)); b.appendByte(0x80 | ((cp >> 12) & 0x3F)); b.appendByte(0x80 | ((cp >> 6) & 0x3F)); b.appendByte(0x80 | (cp & 0x3F)); }
+        return b.toString();
+    }
+
+    // A random query: conditions, an order, perhaps a page of it.
+    fn query() -> Array<Leaf> {
+        let out = new Array<Leaf>();
+        let n = self.rng.nextInt(0, 4);
+        for (i in 0..n) { out.push(self.leaf(0, false)); }
+        return out;
+    }
+    fn ors(n: int) -> Array<bool> {
+        let out = new Array<bool>();
+        for (i in 0..n) { out.push(i > 0 && self.chance(35)); }
+        return out;
+    }
+    fn matches(leaves: Array<Leaf>, ors: Array<bool>) -> Array<Ref> {
+        let out = new Array<Ref>();
+        for (r in self.rows) { if (leaves.size() == 0 || Leaf.combine(leaves, ors, r) == true) { out.push(r); } }
+        return out;
+    }
+    fn build(leaves: Array<Leaf>, ors: Array<bool>) -> Query<Item> {
+        let q = Item.query();
+        for (i, l in leaves) { l.apply(q, ors[i]); }
+        return q;
+    }
+
+    // ── writes, mirrored in `rows` ───────────────────────────────────────────
+    fn write() {
+        let k = self.rng.nextInt(0, 9);
+        if (k <= 3 || self.rows.size() < 4) {
+            let it = Item.create(fields("label", self.pick(LABELS), "qty", self.qty(), "score", self.score(), "note", self.note(), "flag", self.chance(50)));
+            self.rows.push(new Ref(it.id, it.label, it.qty, it.score, it.note, it.flag));
+        } else if (k <= 5) {
+            let r = self.rows[self.rng.nextInt(0, self.rows.size() - 1)];
+            let it = Item.find(r.id);
+            r.label = self.pick(LABELS); r.qty = self.qty(); r.note = self.note();
+            it.label = r.label; it.qty = r.qty; it.note = r.note;
+            it.save();
+        } else if (k == 6) {
+            let i = self.rng.nextInt(0, self.rows.size() - 1);
+            Item.find(self.rows[i].id).delete();
+            self.rows.removeAt(i);
+        } else if (k <= 8) {
+            let leaves = new Array<Leaf>();
+            leaves.push(self.leaf(1, false));
+            let ors = self.ors(1);
+            let q = self.qty();
+            let changed = self.build(leaves, ors).update(fields("qty", q));
+            let hit = self.matches(leaves, ors);
+            assertEq("${changed} " + self.where(), "${hit.size()} " + self.where());
+            for (r in hit) { r.qty = q; }
+        } else {
+            let leaves = new Array<Leaf>();
+            leaves.push(self.leaf(1, false));
+            let ors = self.ors(1);
+            let gone = self.build(leaves, ors).delete();
+            let hit = self.matches(leaves, ors);
+            assertEq("${gone} " + self.where(), "${hit.size()} " + self.where());
+            let keep = new Array<Ref>();
+            for (r in self.rows) { if (!hit.contains(r)) { keep.push(r); } }
+            self.rows = keep;
+        }
+    }
+
+    // ── one query, checked three ways ────────────────────────────────────────
+    fn check() {
+        let leaves = self.query();
+        let ors = self.ors(leaves.size());
+        let sortCol = self.pick(["id", "qty", "score", "label", "note"]);
+        let desc = self.chance(50);
+        let lim = self.chance(40) ? self.rng.nextInt(0, 6) : -1;
+        let off = lim >= 0 && self.chance(50) ? self.rng.nextInt(0, 4) : 0;
+        let want = self.matches(leaves, ors);
+        want.sortBy(fn(a: Ref, b: Ref) -> int {
+            let c = Fuzz.order(a, b, sortCol);
+            if (c == 0) { return a.id < b.id ? -1 : a.id > b.id ? 1 : 0; }
+            return desc ? 0 - c : c;
+        });
+        let wantIds = new Array<string>();
+        for (i, r in want) { if (i >= off && (lim < 0 || i < off + lim)) { wantIds.push("${r.id}"); } }
+        let expect = Str.join(wantIds, ",") + " | " + self.where();
+        for (pass in 0..3) {
+            let q = self.build(leaves, ors).orderBy(sortCol, desc ? "desc" : "asc").orderBy("id");
+            if (lim >= 0) { q.limit(lim as long); if (off > 0) { q.offset(off as long); } }
+            if (pass > 0) { q.remember(60); }
+            let got = new Array<string>();
+            for (x in q.pluck("id")) { got.push("${x}"); }
+            if (Str.join(got, ",") + " | " + self.where() != expect) {
+                eprint("SQL: " + q.toSql());
+                eprint("bindings: " + str(q.getBindings()));
+                for (r in self.rows) {
+                    if (wantIds.contains("${r.id}") != got.contains("${r.id}")) {
+                        eprint("row ${r.id}: label=" + str(r.label) + " qty=${r.qty} score=${r.score} note=" + (r.note == null ? "NULL" : r.note!) + " wanted=${wantIds.contains("${r.id}")}");
+                    }
+                }
+            }
+            assertEq(Str.join(got, ",") + " | " + self.where(), expect);
+        }
+        let counted = self.build(leaves, ors).remember(60).count();
+        assertEq("${counted} | " + self.where(), "${want.size()} | " + self.where());
+    }
+    static fn order(a: Ref, b: Ref, col: string) -> int {
+        if (col == "id") { return a.id < b.id ? -1 : a.id > b.id ? 1 : 0; }
+        if (col == "qty") { return a.qty < b.qty ? -1 : a.qty > b.qty ? 1 : 0; }
+        if (col == "score") { return a.score < b.score ? -1 : a.score > b.score ? 1 : 0; }
+        if (col == "label") { return Str.compare(a.label, b.label); }
+        if (col == "note") {
+            if (a.note == null || b.note == null) { return a.note == null && b.note == null ? 0 : a.note == null ? -1 : 1; }
+            return Str.compare(a.note!, b.note!);
+        }
+        return 0;
+    }
+}
+
+fn fuzzSeed() -> long { let s = env("ORBIT_FUZZ_SEED"); return s == "" ? 20261113 : Integer.parseOr(s, 20261113); }
+fn fuzzRounds() -> int { let s = env("ORBIT_FUZZ_ROUNDS"); return s == "" ? 300 : Integer.parseOr(s, 300) as int; }
+
+fn setUpItems() {
+    DB.connect(Sqlite.open(":memory:"))
+    Schema.create("items", fn(t: Blueprint) {
+        t.id()
+        t.varchar("label")
+        t.integer("qty")
+        t.bigInteger("score")
+        t.varchar("note").nullable()
+        t.boolean("flag")
+    })
+}
+
+test "random queries and writes agree with a reference, cached or not" {
+    setUpItems()
+    Orbit.cacheQueries(64)
+    let f = new Fuzz(fuzzSeed())
+    for (i in 0..20) { f.write() }
+    for (round in 0..fuzzRounds()) {
+        f.round = round
+        if (f.chance(40)) { f.write() }
+        f.check()
+    }
+    Orbit.useQueryCache(null)
+    DB.disconnect()
+}
+
+test "random names, operators and directions never reach SQL" {
+    setUpItems()
+    let rng = new Rng(fuzzSeed())
+    let alphabet = "abcXYZ_09 .;'\"`-()*=<>!%\\é"
+    let refused = 0
+    let accepted = 0
+    for (i in 0..400) {
+        let sb = new StringBuilder()
+        for (k in 0..rng.nextInt(0, 8)) { let j = rng.nextInt(0, alphabet.length - 1); sb.append(alphabet[j..j + 1]) }
+        let s = sb.toString()
+        for (what in 0..4) {
+            try {
+                if (what == 0) { Item.where(s, 1).count() }
+                else if (what == 1) { Item.where("qty", s, 1).count() }
+                else if (what == 2) { Item.query().orderBy("id", s).count() }
+                else { DB.table(s).count() }
+                accepted += 1
+            } catch (e: ValueError) {
+                refused += 1
+            } catch (e: DbError) {
+                // A name Orbit let through must be a plain identifier (a table that does not exist), never broken SQL.
+                assertEq(Str.contains(e.message(), "no such table") || Str.contains(e.message(), "no such column"), true)
+                accepted += 1
+            }
+        }
+    }
+    assertEq(refused > 0 && accepted > 0, true)
+    DB.disconnect()
+}
+
+test "random values round-trip through every field type" {
+    setUpItems()
+    let rng = new Rng(fuzzSeed() + 1)
+    for (i in 0..300) {
+        let sb = new StringBuilder()
+        for (k in 0..rng.nextInt(0, 40)) {
+            let pick = rng.nextInt(0, 9)
+            if (pick < 6) { sb.appendChar(rng.nextInt(1, 126)) }               // ASCII, control characters too (no NUL)
+            else if (pick < 8) { sb.append(Fuzz.utf8(rng.nextInt(0x80, 0xD7FF))) }
+            else { sb.append(Fuzz.utf8(rng.nextInt(0x10000, 0x10FFFF))) }
+        }
+        let label = sb.toString()
+        let score = rng.nextInt(0, 3) == 0 ? (rng.nextBool() ? 9223372036854775807 : -9223372036854775807 - 1) : rng.nextLong(-1000000000000, 1000000000000)
+        let note: string? = rng.nextBool() ? null : label + "!"
+        let it = Item.create(fields("label", label, "qty", rng.nextInt(-2147483647, 2147483647), "score", score, "note", note, "flag", rng.nextBool()))
+        let back = Item.find(it.id)
+        assertEq("${back.label == it.label} ${back.qty == it.qty} ${back.score == it.score} ${back.note == it.note} ${back.flag == it.flag}",
+            "true true true true true")
+        assertEq(Item.where("label", label).where("id", it.id).count(), 1 as long)
+    }
+    DB.disconnect()
+}
