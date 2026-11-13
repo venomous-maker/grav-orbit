@@ -1,0 +1,214 @@
+// debugbar.grav — what Orbit did, and what looks wrong in it: every statement
+// (from the query log), the slowest, the same query shape run again and again
+// with only its arguments changing (the mark of an N+1), exact duplicates,
+// relations lazy-loaded one object at a time, and the query cache's answers.
+//
+//   Debugbar.enable()
+//   let users = User.all()
+//   for (u in users) { print(u.posts().count()) }     // one COUNT per user
+//   print(Debugbar.report())                          // ... "repeated 50×: SELECT COUNT(*) FROM posts ..."
+//   response.body = page + Debugbar.html()            // or as a panel on a web page
+import "std"
+import "querylog.grav"
+import "db.grav"
+import "relations.grav"
+
+namespace orbit {
+
+    // One SQL shape run more than once: its count and total time.
+    class RepeatedQuery {
+        public sql: string
+        public count: int
+        public ms: float
+        // Whether every run had the same arguments too (a plain duplicate, not an N+1).
+        public identical: bool
+        constructor(sql: string, count: int, ms: float, identical: bool) { self.sql = sql; self.count = count; self.ms = ms; self.identical = identical; }
+    }
+
+    // The debugbar's figures for the query log as it is now.
+    class DebugStats {
+        public queries: int = 0
+        public reads: int = 0
+        public writes: int = 0
+        public cached: int = 0
+        public fromReplicas: int = 0
+        public failed: int = 0
+        public ms: float = 0.0
+        // The slowest statements, slowest first.
+        public slowest: Array<QueryEvent> = new Array<QueryEvent>()
+        // Shapes run at least Debugbar.repeatThreshold times, most-run first.
+        public repeated: Array<RepeatedQuery> = new Array<RepeatedQuery>()
+        // "Class.relation" -> lazy loads on objects read together (N+1s).
+        public lazyLoads: HashMap<string, int> = new HashMap<string, int>()
+        // Whether anything here deserves a look (repeats, duplicates, lazy loads, failures).
+        fn hasWarnings() -> bool { return self.repeated.size() > 0 || self.lazyLoads.size() > 0 || self.failed > 0; }
+    }
+
+    // The query debugbar (see the top of this file).
+    class Debugbar {
+        // A shape run this many times or more is reported as repeated.
+        public static repeatThreshold: int = 3
+        // How many of the slowest statements a report lists.
+        public static slowestShown: int = 5
+        private static on: bool = false
+
+        // Starts recording: the query log, and N+1 lazy-load counting.
+        static fn enable() { DB.enableQueryLog(); Orbit.detectLazyLoading(true); Debugbar.on = true; }
+        static fn disable() { DB.disableQueryLog(); Orbit.detectLazyLoading(false); Debugbar.on = false; }
+        static fn enabled() -> bool { return Debugbar.on; }
+        // Forgets what was recorded so far (a new request, say).
+        static fn reset() { DB.flushQueryLog(); Orbit.resetLazyLoads(); }
+        // Runs `f` with the debugbar recording from a clean start; the report of what it did.
+        static fn measure(f: fn()) -> string {
+            let was = Debugbar.on;
+            if (!was) { Debugbar.enable(); }
+            Debugbar.reset();
+            f();
+            let r = Debugbar.report();
+            if (!was) { Debugbar.disable(); }
+            return r;
+        }
+
+        // The figures (see DebugStats).
+        static fn stats() -> DebugStats {
+            let st = new DebugStats();
+            let log = DB.getQueryLog();
+            let shapes = new HashMap<string, RepeatedQuery>();
+            let firstArgs = new HashMap<string, string>();
+            let order = new Array<string>();
+            for (e in log) {
+                st.queries += 1;
+                if (e.read) { st.reads += 1; } else { st.writes += 1; }
+                if (e.cached) { st.cached += 1; }
+                if (e.replica) { st.fromReplicas += 1; }
+                if (e.error != "") { st.failed += 1; }
+                st.ms += e.ms;
+                if (e.cached) { continue; }                           // (an answer from memory is no N+1)
+                let args = Sql.cacheKey("", "", e.bindings);
+                let r = shapes.getOr(e.sql, null);
+                if (r == null) {
+                    shapes.put(e.sql, new RepeatedQuery(e.sql, 1, e.ms, true));
+                    firstArgs.put(e.sql, args);
+                    order.push(e.sql);
+                } else {
+                    r.count += 1;
+                    r.ms += e.ms;
+                    if (firstArgs[e.sql] != args) { r.identical = false; }
+                }
+            }
+            for (k in order) { let r = shapes[k]; if (r.count >= Debugbar.repeatThreshold) { st.repeated.push(r); } }
+            st.repeated.sortBy(fn(a: RepeatedQuery, b: RepeatedQuery) -> int { return b.count - a.count; });
+            let bySpeed = log.copy();
+            bySpeed.sortBy(fn(a: QueryEvent, b: QueryEvent) -> int { return a.ms < b.ms ? 1 : a.ms > b.ms ? -1 : 0; });
+            for (i in 0..(bySpeed.size() < Debugbar.slowestShown ? bySpeed.size() : Debugbar.slowestShown)) {
+                if (!bySpeed[i].cached) { st.slowest.push(bySpeed[i]); }
+            }
+            st.lazyLoads = Orbit.lazyLoads();
+            return st;
+        }
+
+        // A plain-text report: the totals, then each warning, then the slowest statements.
+        static fn report() -> string {
+            let st = Debugbar.stats();
+            let sb = new StringBuilder();
+            sb.append("orbit: ").appendInt(st.queries).append(st.queries == 1 ? " statement" : " statements")
+              .append(" in ").append(Format.fixed(st.ms, 2)).append(" ms (")
+              .appendInt(st.reads).append(" reads, ").appendInt(st.writes).append(" writes");
+            if (st.cached > 0) { sb.append(", ").appendInt(st.cached).append(" from the cache"); }
+            if (st.fromReplicas > 0) { sb.append(", ").appendInt(st.fromReplicas).append(" on replicas"); }
+            if (st.failed > 0) { sb.append(", ").appendInt(st.failed).append(" failed"); }
+            sb.append(")\n");
+            for (k in Debugbar.sortedKeys(st.lazyLoads)) {
+                let dot = Str.indexOf(k, ".");
+                sb.append("  N+1: ").append(k).append("() lazy-loaded ").appendInt(st.lazyLoads[k])
+                  .append("× on objects read together — with(\"").append(k[dot + 1..]).append("\")\n");
+            }
+            for (r in st.repeated) {
+                sb.append(r.identical ? "  duplicate " : "  repeated ").appendInt(r.count).append("× (")
+                  .append(Format.fixed(r.ms, 2)).append(" ms): ").append(r.sql).append("\n");
+            }
+            if (st.slowest.size() > 0) {
+                sb.append("  slowest:\n");
+                for (e in st.slowest) { sb.append("    ").append(e.toString()).append("\n"); }
+            }
+            return sb.toString();
+        }
+
+        // The same as JSON, with every statement: for a debugbar of your own.
+        static fn toJson() -> string {
+            let st = Debugbar.stats();
+            let sb = new StringBuilder();
+            sb.append("{\"queries\":").appendInt(st.queries).append(",\"reads\":").appendInt(st.reads)
+              .append(",\"writes\":").appendInt(st.writes).append(",\"cached\":").appendInt(st.cached)
+              .append(",\"replicas\":").appendInt(st.fromReplicas).append(",\"failed\":").appendInt(st.failed)
+              .append(",\"ms\":").append(Format.fixed(st.ms, 3));
+            sb.append(",\"lazyLoads\":{");
+            for (i, k in Debugbar.sortedKeys(st.lazyLoads)) {
+                if (i > 0) { sb.append(","); }
+                sb.append(Json.quote(k)).append(":").appendInt(st.lazyLoads[k]);
+            }
+            sb.append("},\"repeated\":[");
+            for (i, r in st.repeated) {
+                if (i > 0) { sb.append(","); }
+                sb.append("{\"sql\":").append(Json.quote(r.sql)).append(",\"count\":").appendInt(r.count)
+                  .append(",\"ms\":").append(Format.fixed(r.ms, 3)).append(",\"identical\":").appendBool(r.identical).append("}");
+            }
+            sb.append("],\"statements\":[");
+            for (i, e in DB.getQueryLog()) {
+                if (i > 0) { sb.append(","); }
+                sb.append("{\"sql\":").append(Json.quote(e.sql)).append(",\"bindings\":[");
+                for (j, b in e.bindings) { if (j > 0) { sb.append(","); } sb.append(Json.quote(Sql.show(b))); }
+                sb.append("],\"connection\":").append(Json.quote(e.connection))
+                  .append(",\"ms\":").append(Format.fixed(e.ms, 3)).append(",\"rows\":").appendInt(e.rows)
+                  .append(",\"read\":").appendBool(e.read).append(",\"cached\":").appendBool(e.cached)
+                  .append(",\"replica\":").appendBool(e.replica).append(",\"error\":").append(Json.quote(e.error)).append("}");
+            }
+            sb.append("]}");
+            return sb.toString();
+        }
+
+        // A self-contained HTML panel (a <details> fixed to the bottom of the page)
+        // to append to a page while developing. Never on a production page: it shows the SQL.
+        static fn html() -> string {
+            let st = Debugbar.stats();
+            let warn = st.hasWarnings();
+            let sb = new StringBuilder();
+            sb.append("<details id=\"orbit-debugbar\" style=\"position:fixed;left:0;right:0;bottom:0;max-height:45vh;overflow:auto;")
+              .append("font:12px/1.45 ui-monospace,monospace;background:#1d1f21;color:#e0e0e0;border-top:3px solid ")
+              .append(warn ? "#e5a50a" : "#3a7bd5").append(";z-index:2147483647\">")
+              .append("<summary style=\"cursor:pointer;padding:6px 10px\">Orbit · ").appendInt(st.queries)
+              .append(st.queries == 1 ? " statement · " : " statements · ").append(Format.fixed(st.ms, 2)).append(" ms");
+            if (st.cached > 0) { sb.append(" · ").appendInt(st.cached).append(" cached"); }
+            if (st.lazyLoads.size() > 0) { sb.append(" · <b style=\"color:#e5a50a\">N+1</b>"); }
+            if (st.failed > 0) { sb.append(" · <b style=\"color:#f66\">").appendInt(st.failed).append(" failed</b>"); }
+            sb.append("</summary><div style=\"padding:0 10px 10px\">");
+            for (k in Debugbar.sortedKeys(st.lazyLoads)) {
+                sb.append("<div style=\"color:#e5a50a\">N+1: ").append(Debugbar.esc(k)).append("() lazy-loaded ")
+                  .appendInt(st.lazyLoads[k]).append("×</div>");
+            }
+            for (r in st.repeated) {
+                sb.append("<div style=\"color:#e5a50a\">").append(r.identical ? "duplicate " : "repeated ").appendInt(r.count)
+                  .append("×: ").append(Debugbar.esc(r.sql)).append("</div>");
+            }
+            sb.append("<table style=\"border-collapse:collapse;width:100%;margin-top:6px\">");
+            for (e in DB.getQueryLog()) {
+                sb.append("<tr style=\"border-top:1px solid #333").append(e.error != "" ? ";color:#f66" : "").append("\">")
+                  .append("<td style=\"padding:2px 8px 2px 0;white-space:nowrap;text-align:right\">")
+                  .append(e.cached ? "cache" : Format.fixed(e.ms, 2) + " ms").append("</td>")
+                  .append("<td style=\"padding:2px 8px 2px 0;white-space:nowrap\">").append(Debugbar.esc(e.connection))
+                  .append(e.replica ? " (replica)" : "").append("</td><td>").append(Debugbar.esc(e.toString())).append("</td></tr>");
+            }
+            sb.append("</table></div></details>");
+            return sb.toString();
+        }
+
+        private static fn sortedKeys(m: HashMap<string, int>) -> Array<string> {
+            let keys = m.keys();
+            keys.sortBy(fn(a: string, b: string) -> int { return m[b] != m[a] ? m[b] - m[a] : Str.compare(a, b); });
+            return keys;
+        }
+        private static fn esc(s: string) -> string {
+            return Str.replace(Str.replace(Str.replace(Str.replace(s, "&", "&amp;"), "<", "&lt;"), ">", "&gt;"), "\"", "&quot;");
+        }
+    }
+}

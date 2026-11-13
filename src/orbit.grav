@@ -1,6 +1,7 @@
 // Orbit: an ORM for Grav, on grav-db, in the manner of Laravel's Eloquent.
 // `import "grav-orbit"` brings in Model, the relations, Query and Builder, DB,
-// Schema and Blueprint, migrations, factories and seeders (and grav-db).
+// Schema and Blueprint, migrations, factories and seeders, the query log,
+// cache and debugbar (and grav-db).
 import "mapping.grav"
 import "casts.grav"
 import "db.grav"
@@ -13,3 +14,4 @@ import "factory.grav"
 import "traits.grav"
 import "querycache.grav"
 import "querylog.grav"
+import "debugbar.grav"
