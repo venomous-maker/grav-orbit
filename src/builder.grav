@@ -345,7 +345,7 @@ namespace orbit {
         fn exists() -> bool {
             let keep = self.lim;
             self.lim = 1;
-            let found = self.conn().queryOne(self.__sql("1"), self.__bindings()) != null;
+            let found = self.readConn().queryOne(self.__sql("1"), self.__bindings()) != null;
             self.lim = keep;
             return found;
         }
@@ -370,7 +370,7 @@ namespace orbit {
             let keep = self.selects;
             self.selects = new Array<string>();
             self.selects.push(self.col(name));
-            let rows = self.conn().query(self.__sql(""), self.__bindings());
+            let rows = self.readConn().query(self.__sql(""), self.__bindings());
             self.selects = keep;
             for (row in rows) { out.push(row.at(0)); }
             return out;
@@ -384,7 +384,7 @@ namespace orbit {
             return all.size() == 0 ? null : all[0];
         }
         // The rows as they come (columns by name), for any query.
-        fn rows() -> ResultSet { return self.conn().query(self.__sql(""), self.__bindings()); }
+        fn rows() -> ResultSet { return self.readConn().query(self.__sql(""), self.__bindings()); }
         // Deletes the matches (for a @SoftDeletes model: marks them deleted); how many.
         fn delete() -> long {
             if (self.__map != null && self.__map.softDelete != null) {
@@ -494,6 +494,13 @@ namespace orbit {
         fn conn() -> Connection {
             if (self.__db != null) { return self.__db; }
             return DB.connection(self.__map == null ? "default" : self.__map.connection);
+        }
+        // The connection a read goes to: a given `on(db)` connection as it is;
+        // otherwise the read replica of the model's (or the default's), while
+        // nothing has it in a transaction.
+        fn readConn() -> Connection {
+            if (self.__db != null) { return self.__db; }
+            return DB.readConnection(self.__map == null ? "default" : self.__map.connection);
         }
         fn __bindings() -> Array<any> {
             let all = new Array<any>();
@@ -769,11 +776,11 @@ namespace orbit {
         private fn aggregate(expr: string) -> any {
             if (self.groups.size() > 0 || self.distinctRows || self.unionParts.size() > 0) {
                 let inner = self.__sql("");
-                return self.conn().queryValue("SELECT " + Str.replace(expr, self.q(self.__alias) + ".", "") + " FROM (" + inner + ") AS " + self.q("__orbit_agg"), self.__bindings());
+                return self.readConn().queryValue("SELECT " + Str.replace(expr, self.q(self.__alias) + ".", "") + " FROM (" + inner + ") AS " + self.q("__orbit_agg"), self.__bindings());
             }
             let keep = self.orders;
             self.orders = new Array<string>();
-            let v = self.conn().queryValue(self.__sql(expr), self.__bindings());
+            let v = self.readConn().queryValue(self.__sql(expr), self.__bindings());
             self.orders = keep;
             return v;
         }
@@ -863,7 +870,7 @@ namespace orbit {
         // Every match.
         fn all() -> Array<T> { return self.get(); }
         fn get() -> Array<T> {
-            let rows = self.conn().query(self.__sql(""), self.__bindings());
+            let rows = self.readConn().query(self.__sql(""), self.__bindings());
             let out = new Array<T>();
             out.reserve(rows.size());
             let extras = self.extraColumns(rows.columns);
@@ -952,7 +959,7 @@ namespace orbit {
             let at = new Array<int>();                                 // (filled from the first row: captures are copies)
             let extras = new Array<string>();
             let ready = new Array<bool>();
-            self.conn().each(self.__sql(""), self.__bindings(), fn(row: Row) {
+            self.readConn().each(self.__sql(""), self.__bindings(), fn(row: Row) {
                 if (ready.size() == 0) {
                     ready.push(true);
                     for (p in Persister.positions(self.__map, row.columns())) { at.push(p); }

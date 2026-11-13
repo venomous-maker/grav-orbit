@@ -3,7 +3,9 @@
 //
 //   DB.connect(Sqlite.open("app.db"))                // the default connection
 //   DB.connect(MySql.open(url), "reports")           // a named one (@Connection("reports") on a model)
+//   DB.connect(MySql.open(writeUrl), MySql.open(readUrl))   // reads go to the replica
 //   DB.transaction(fn() { ... })                     // committed, or rolled back when it throws
+//   DB.transaction(fn() { ... }, 3)                  // retried on a deadlock, up to 3 times
 //   DB.beginTransaction(); ...; DB.commit()          // or DB.rollBack()
 //   let rows = DB.select("SELECT * FROM users WHERE age > ?", [18])
 //   let names = DB.table("users").where("age", ">", 18).orderBy("name").pluck("name")
@@ -18,28 +20,68 @@ namespace orbit {
     class DB {
         private static named: HashMap<string, Connection> = new HashMap<string, Connection>()
 
+        private static reads: HashMap<string, Connection> = new HashMap<string, Connection>()
+
         // Makes `db` the connection called `name` ("default": what models use).
         static fn connect(db: Connection, name: string = "default") { DB.named.put(name, db); }
+        // Makes `write` the connection reads go to too, but `read` the one `select`,
+        // `selectOne`, `scalar` and a query's reading methods use instead (a read
+        // replica): until a transaction opens, when they go back to `write` (its
+        // replica may not have the transaction's own writes yet).
+        static fn connect(write: Connection, read: Connection, name: string = "default") {
+            DB.named.put(name, write);
+            DB.reads.put(name, read);
+        }
+        // The connection reads use: `read` while none is in a transaction, else `write`.
+        static fn readConnection(name: string = "default") -> Connection {
+            let key = name == "" ? "default" : name;
+            let w = DB.connection(key);
+            let r = DB.reads.getOr(key, null);
+            return r == null || w.inTransaction() || r.inTransaction() ? w : r;
+        }
         // The connection called `name`; StateError when there is none.
         static fn connection(name: string = "default") -> Connection {
             let key = name == "" ? "default" : name;
             let db = DB.named.getOr(key, null);
             if (db == null) {
                 throw new StateError(key == "default" ? "no database for Orbit: call DB.connect(db) first"
-                                                      : "no database connection called '" + key + "': DB.connect(db, \"" + key + "\")");
+                    : "no database connection called '" + key + "': DB.connect(db, \"" + key + "\")");
             }
             return db;
         }
         // Whether a connection called `name` is set.
         static fn hasConnection(name: string = "default") -> bool { return DB.named.containsKey(name == "" ? "default" : name); }
-        // Forgets the connection called `name` (closing it is yours).
-        static fn disconnect(name: string = "default") { DB.named.remove(name); }
+        // Forgets the connection called `name` (closing it is yours; its read
+        // replica too, if `connect` gave one).
+        static fn disconnect(name: string = "default") {
+            DB.named.remove(name);
+            DB.reads.remove(name);
+        }
 
         // ── transactions ─────────────────────────────────────────────────────────
         // Runs `body` in a transaction: committed when it returns, rolled back when
         // it throws (and the exception goes on). Nested, it is a savepoint.
         static fn transaction(body: fn()) { DB.connection().transaction(body); }
         static fn transaction(name: string, body: fn()) { DB.connection(name).transaction(body); }
+        // Retries `body` up to `attempts` times, rolling back and running it again
+        // when it fails on a deadlock or a serialization failure (SQLSTATE 40001 /
+        // 40P01, or MySQL error 1213 / 1205); any other error, or the last attempt's,
+        // goes on. Each retry waits a little longer than the last.
+        static fn transaction(body: fn(), attempts: int) -> void { DB.transaction("default", body, attempts); }
+        static fn transaction(name: string, body: fn(), attempts: int) {
+            for (i in 0..attempts) {
+                try { DB.connection(name).transaction(body); return; }
+                catch (e: DbError) {
+                    if (i + 1 >= attempts || !DB.isDeadlock(e)) { throw e; }
+                    Time.sleepMs(20 * (i + 1));
+                }
+            }
+        }
+        // Whether `e` is the database reporting a deadlock or a transaction
+        // conflict (worth retrying), rather than a real error in the statement.
+        static fn isDeadlock(e: DbError) -> bool {
+            return e.state == "40001" || e.state == "40P01" || e.code == 1213 || e.code == 1205;
+        }
         // Starts a transaction (a savepoint inside one), to end with commit or rollBack.
         static fn beginTransaction(name: string = "default") { DB.connection(name).begin(); }
         static fn commit(name: string = "default") { DB.connection(name).commit(); }
@@ -48,10 +90,11 @@ namespace orbit {
         static fn inTransaction(name: string = "default") -> bool { return DB.connection(name).inTransaction(); }
 
         // ── raw SQL (with `?` arguments) ─────────────────────────────────────────
-        static fn select(sql: string, args: Array<any> = new Array<any>()) -> ResultSet { return DB.connection().query(sql, args); }
-        static fn selectOne(sql: string, args: Array<any> = new Array<any>()) -> Row { return DB.connection().queryOne(sql, args); }
+        // Reads go to the read connection (readConnection), writes to the write one.
+        static fn select(sql: string, args: Array<any> = new Array<any>()) -> ResultSet { return DB.readConnection().query(sql, args); }
+        static fn selectOne(sql: string, args: Array<any> = new Array<any>()) -> Row { return DB.readConnection().queryOne(sql, args); }
         // The first column of the first row, or null.
-        static fn scalar(sql: string, args: Array<any> = new Array<any>()) -> any { return DB.connection().queryValue(sql, args); }
+        static fn scalar(sql: string, args: Array<any> = new Array<any>()) -> any { return DB.readConnection().queryValue(sql, args); }
         // Runs an INSERT; the new row's id.
         static fn insert(sql: string, args: Array<any> = new Array<any>()) -> long { return DB.connection().insert(sql, args); }
         // Runs an UPDATE or DELETE; the rows it changed.
@@ -64,5 +107,8 @@ namespace orbit {
 
         // A query on table `name`, without a model: its rows come back as Rows.
         static fn table(name: string) -> TableQuery { return new TableQuery(name, DB.connection()); }
+        // Adds every retryable DbError's class to the recognized set is unnecessary:
+        // isDeadlock covers the common drivers. Advanced users can retry by hand:
+        // `try { DB.transaction(body) } catch (e: DbError) { if (DB.isDeadlock(e)) { ... } }`.
     }
 }
