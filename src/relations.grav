@@ -114,6 +114,10 @@ namespace orbit {
             }
             return out;
         }
+        // The one related object, for a relation that has at most one (hasOne,
+        // belongsTo, morphOne, morphTo): null for hasMany and the many-to-many kinds,
+        // and for one with none loaded ($touches: touching the owner after a save).
+        fn relatedOne() -> Model { return null; }
         // A field of `map` by field or column name; ValueError naming the relation otherwise.
         static fn field(map: TableMap, name: string, what: string) -> FieldMap {
             let m = map.find(name);
@@ -217,6 +221,7 @@ namespace orbit {
         // One of many: the related row with the largest `name` (latestOfMany: the id by default;
         // say "createdAt" for the newest), or the smallest (oldestOfMany); ofMany takes "max" or "min".
         //   fn latestOrder() -> HasOne<Order> { return self.hasOne::<Order>().latestOfMany() }
+        fn relatedOne() -> Model { return self.get() as Model; }
         fn latestOfMany(name: string = "") -> HasOne<T> { return self.ofMany(name, "max"); }
         fn oldestOfMany(name: string = "") -> HasOne<T> { return self.ofMany(name, "min"); }
         fn ofMany(name: string, agg: string) -> HasOne<T> {
@@ -290,6 +295,7 @@ namespace orbit {
             self.ownerKey = ownerKey != "" ? Relation.field(self.relatedMap, ownerKey, "an owner key") : self.relatedMap.requireId();
         }
         fn key() -> string { return "belongsTo:" + self.parentMap.table + "." + self.foreignKey.column; }
+        fn relatedOne() -> Model { return self.get() as Model; }
         fn __ownerKeys() -> Array<FieldMap> { let k = new Array<FieldMap>(); k.push(self.foreignKey); k.push(self.ownerKey); return k; }
         // get() gives a new (unsaved) T, with these fields, instead of null.
         fn withDefault(values: HashMap<string, any> = new HashMap<string, any>()) -> BelongsTo<T> { self.defaults = values; return self; }
@@ -664,6 +670,7 @@ namespace orbit {
             self.many = new HasManyThrough<T, U>(parent, firstKey, secondKey, localKey, secondLocalKey);
         }
         fn key() -> string { return "oneThrough:" + self.many.key(); }
+        fn relatedOne() -> Model { return self.get() as Model; }
         fn query() -> Query<T> { return self.many.query(); }
         fn get() -> T {
             if (self.loaded()) { return self.parent.__loaded()[self.key()] as T; }
@@ -748,6 +755,7 @@ namespace orbit {
             self.many = new MorphMany<T>(parent, name);
         }
         fn key() -> string { return "morphOne:" + self.many.key(); }
+        fn relatedOne() -> Model { return self.get() as Model; }
         fn query() -> Query<T> { return self.many.query(); }
         fn get() -> T {
             if (self.loaded()) { return self.parent.__loaded()[self.key()] as T; }
@@ -781,6 +789,7 @@ namespace orbit {
             self.typeField = Relation.field(self.parentMap, name + "_type", "morphTo " + name);
         }
         fn key() -> string { return "morphTo:" + self.name; }
+        fn relatedOne() -> Model { return self.get(); }
         // The object it points to, or null.
         fn get() -> Model {
             if (self.loaded()) { return self.parent.__loaded()[self.key()] as Model; }
