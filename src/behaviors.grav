@@ -52,6 +52,15 @@ namespace orbit {
         fn updated(m: Model, d: Decorator) {}
         fn deleting(m: Model, d: Decorator) {}
         fn deleted(m: Model, d: Decorator) {}
+        // After a soft delete actually marks the row (not for forceDelete).
+        fn trashed(m: Model, d: Decorator) {}
+        // Around forceDelete (a @SoftDeletes row removed for good); deleting/deleted
+        // fire too, since a forceDelete is still a delete.
+        fn forceDeleting(m: Model, d: Decorator) {}
+        fn forceDeleted(m: Model, d: Decorator) {}
+        // Around undoing a soft delete.
+        fn restoring(m: Model, d: Decorator) {}
+        fn restored(m: Model, d: Decorator) {}
         // After a row is read into a model.
         fn retrieved(m: Model, d: Decorator) {}
     }

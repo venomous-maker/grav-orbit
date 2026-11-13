@@ -214,6 +214,11 @@ namespace orbit {
                 case "updated": b.updated(m, d)
                 case "deleting": b.deleting(m, d)
                 case "deleted": b.deleted(m, d)
+                case "trashed": b.trashed(m, d)
+                case "forceDeleting": b.forceDeleting(m, d)
+                case "forceDeleted": b.forceDeleted(m, d)
+                case "restoring": b.restoring(m, d)
+                case "restored": b.restored(m, d)
                 case "retrieved": b.retrieved(m, d)
                 default: throw new ValueError("no behavior hook '" + hook + "'")
             }
