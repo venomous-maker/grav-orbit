@@ -947,9 +947,8 @@ lifecycle hooks (so `@Uuids` fills nothing in); timestamps are still set.
 
 ### $touches: touching a related row's timestamp
 
-`@Touches("relation", ...)` on a model touches the named relation's single
-related object (`belongsTo`, `hasOne`, `morphOne` or `morphTo`) every time it
-saves — so saving a comment can bump its post's `updatedAt`:
+`@Touches("relation", ...)` on a model touches the named relation's
+`updatedAt` every time it saves — so saving a comment can bump its post's:
 
 ```grav
 @Touches("post")
@@ -964,7 +963,23 @@ comment.body = "edited"
 comment.save()              // post.updatedAt is now, too
 ```
 
-Nothing happens when the relation has no related object yet (a null foreign key).
+It is a raw `UPDATE` through the relation's own query — not a load and a
+`save()` — so it works for `hasMany`, `belongsToMany` and `morphMany` too
+(every matching row, none of them loaded, and no hooks run on them), as well
+as `belongsTo`, `hasOne`, `morphOne` and `morphTo`:
+
+```grav
+@Touches("spokes")
+class Hub extends Model {
+    public id: long = 0
+    fn spokes() -> HasMany<Spoke> { return self.hasMany() }
+}
+
+hub.save()                  // every spoke's updatedAt is now, in one UPDATE
+```
+
+Nothing happens when the relation has no matching row, or its related class
+has no `updatedAt`.
 
 ### Prunable: deleting old rows in batches
 
@@ -1211,6 +1226,12 @@ User.observe(new SendsWelcomeMail())        // runs for User, and any subclass
 of its own to read arguments from. Register observers once, at start-up;
 `User.observe(...)` works even after `User`'s mapping has already been built.
 
+Beyond the hooks [Behaviors](#behaviors-model-traits) already lists
+(`saving`, `creating`, ...), a soft-deleting model's full lifecycle is there
+too: `trashed` (after a soft delete marks the row), `forceDeleting` and
+`forceDeleted` (around a `forceDelete`, alongside the usual `deleting` and
+`deleted`), and `restoring` and `restored` (around undoing a soft delete).
+
 ## Repository: classes that do not extend Model
 
 `Repository<T>` gives the same saving and querying to a class with no base,
@@ -1270,9 +1291,9 @@ A transaction inside another is a savepoint: only its own changes are undone.
 name too.
 
 **Retries.** `DB.transaction(body, attempts)` runs it again, rolling back
-first, when it fails on a deadlock or a serialization conflict (SQLSTATE
-`40001` / `40P01`, or MySQL error 1213 / 1205) — any other error, or the last
-attempt's, goes on unchanged. Each retry waits a little longer than the last.
+first, when it fails on a deadlock or a serialization conflict — any other
+error, or the last attempt's, goes on unchanged. Each retry waits a little
+longer than the last.
 
 ```grav
 DB.transaction(fn() {
@@ -1280,9 +1301,16 @@ DB.transaction(fn() {
     acct.balance -= amount
     acct.save()
 }, 3)                                  // up to 3 attempts total
+DB.transaction("reports", body, 3)     // on a named connection
 ```
 
-`DB.isDeadlock(e)` is the check itself, for code that wants to retry by hand.
+`DB.isDeadlock(e, name)` is the check itself, for code that wants to retry by
+hand: PostgreSQL's or the standard's SQLSTATE (`40001` serialization failure,
+`40P01` deadlock_detected), MySQL's own codes (1213 deadlock, 1205 lock wait
+timeout), and, for SQLite — which has no SQLSTATE — `SQLITE_BUSY` or
+`SQLITE_LOCKED` (5, 6) on the connection named `name`. The name tells it which
+driver's codes apply; without one (or with a name nothing is connected under)
+it falls back to the MySQL codes.
 
 **Read and write connections.** `DB.connect(write, read, name)` sends writes
 and transactions to `write`, but a model's reads (and `DB.select`,
