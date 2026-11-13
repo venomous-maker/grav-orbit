@@ -1,0 +1,270 @@
+// The query log and DB.listen, the debugbar, N+1 detection (preventLazyLoading,
+// warnings, counting), remembered results (remember) and their invalidation,
+// several read replicas, sticky reads, and one connection per thread. On
+// SQLite: files in the temporary directory, so replicas see the writer's rows.
+import "std"
+import "../src/orbit.grav"
+use db.*
+use orbit.*
+
+class Author extends Model {
+    public id: long = 0
+    public name: string = ""
+    fn books() -> HasMany<Book> { return self.hasMany() }
+}
+
+class Book extends Model {
+    public id: long = 0
+    public authorId: long = 0
+    public title: string = ""
+    fn author() -> BelongsTo<Author> { return self.belongsTo("author_id") }
+}
+
+fn dbFile(name: string) -> string { return Dir.temp() + "/orbit_diag_${Process.pid()}_" + name + ".db" }
+
+fn fresh(name: string) -> string {
+    let path = dbFile(name)
+    for (suffix in ["", "-wal", "-shm"]) { new File(path + suffix).delete() }
+    let db = Sqlite.open(path)
+    db.exec("PRAGMA journal_mode = WAL")
+    DB.connect(db)
+    Schema.create("authors", fn(t: Blueprint) { t.id(); t.varchar("name") })
+    Schema.create("books", fn(t: Blueprint) { t.id(); t.foreignId("author_id"); t.varchar("title") })
+    for (i in 1..6) {
+        let a = Author.create(fields("name", "A${i}"))
+        for (j in 0..3) { a.books().create(fields("title", "B${i}.${j}")) }
+    }
+    return path
+}
+
+fn cleanUp(path: string) {
+    DB.disconnect()
+    for (suffix in ["", "-wal", "-shm"]) { new File(path + suffix).delete() }
+}
+
+fn resetDiagnostics() {
+    Debugbar.disable()
+    DB.flushQueryLog()
+    DB.forgetListeners()
+    Orbit.preventLazyLoading(false)
+    Orbit.resetLazyLoads()
+    Orbit.useQueryCache(null)
+}
+
+test "the query log and DB.listen" {
+    let path = fresh("log")
+    DB.enableQueryLog()
+    let seen = new Array<string>()
+    DB.listen(fn(q: QueryEvent) { seen.push(q.read ? "read" : "write") })
+    let a = Author.where("name", "A1").first()
+    a.name = "A1!"
+    a.save()
+    let log = DB.getQueryLog()
+    assertEq(log.size(), 2)
+    assertEq(log[0].read && !log[1].read, true)
+    assertEq(log[0].connection, "default")
+    assertEq(log[0].bindings.size() >= 1 && "${log[0].bindings[0]}" == "A1", true)
+    assertEq(log[0].rows, 1 as long)
+    assertEq(log[1].rows, 1 as long)
+    assertEq(Str.contains(log[0].toString(), "[\"A1\"]"), true)
+    assertEq(Str.join(seen, " "), "read write")
+    // A failed statement is logged with its error, and still throws.
+    let threw = false
+    try { DB.select("SELECT * FROM no_such_table") } catch (e: DbError) { threw = true }
+    let last = DB.getQueryLog()[DB.getQueryLog().size() - 1]
+    assertEq(threw && last.error != "", true)
+    // Off: nothing more is kept, but listeners still hear.
+    DB.disableQueryLog()
+    DB.flushQueryLog()
+    Author.count()
+    assertEq(DB.getQueryLog().size(), 0)
+    assertEq(seen.size(), 4)
+    resetDiagnostics()
+    cleanUp(path)
+}
+
+test "the debugbar: repeated shapes, duplicates and N+1 lazy loads" {
+    let path = fresh("bar")
+    Debugbar.enable()
+    let titles = 0
+    for (a in Author.all()) { titles += a.books().get().size() }   // one query per author: N+1
+    assertEq(titles, 15)
+    let st = Debugbar.stats()
+    assertEq(st.queries, 6)
+    assertEq(st.lazyLoads.getOr("Author.books", 0), 5)
+    assertEq(st.repeated.size(), 1)
+    assertEq(st.repeated[0].count, 5)
+    assertEq(st.repeated[0].identical, false)
+    let report = Debugbar.report()
+    assertEq(Str.contains(report, "N+1: Author.books() lazy-loaded 5×"), true)
+    assertEq(Str.contains(report, "repeated 5×"), true)
+    // The fix: with("books") reads them in one more query, and no warning.
+    Debugbar.reset()
+    let again = 0
+    for (a in Author.with("books").get()) { again += a.books().get().size() }
+    assertEq(again, 15)
+    let fixed = Debugbar.stats()
+    assertEq("${fixed.queries} ${fixed.lazyLoads.size()} ${fixed.repeated.size()} ${fixed.hasWarnings()}", "2 0 0 false")
+    // Exact duplicates are told apart from N+1 shapes.
+    Debugbar.reset()
+    for (i in 0..3) { Author.find(1) }
+    assertEq(Debugbar.stats().repeated[0].identical, true)
+    // An object read alone may lazy-load: no N+1.
+    Debugbar.reset()
+    Author.find(2).books().get()
+    assertEq(Debugbar.stats().lazyLoads.size(), 0)
+    // JSON and HTML forms.
+    let json = Json.parse(Debugbar.toJson())
+    assertEq(json.get("queries").asInt(), 2 as long)
+    let html = Debugbar.html()
+    assertEq(Str.startsWith(html, "<details id=\"orbit-debugbar\"") && Str.contains(html, "&quot;authors&quot;"), true)
+    assertEq(Str.contains(Debugbar.measure(fn() { Author.count() }), "1 statement"), true)
+    resetDiagnostics()
+    cleanUp(path)
+}
+
+test "preventLazyLoading: throws, or calls a handler" {
+    let path = fresh("lazy")
+    Orbit.preventLazyLoading()
+    let threw = ""
+    try { for (a in Author.all()) { a.books().get() } }
+    catch (e: LazyLoadingViolation) { threw = e.model + "." + e.relation }
+    assertEq(threw, "Author.books")
+    // belongsTo and count() are caught too.
+    let kinds = new Array<string>()
+    Orbit.handleLazyLoadingViolationsUsing(fn(m: Model, relation: string) { kinds.push(relation) })
+    for (b in Book.limit(2).get()) { b.author().get() }
+    for (a in Author.limit(2).get()) { a.books().count() }
+    assertEq(Str.join(kinds, " "), "author author books books")
+    // Loaded with the query, or read alone: allowed.
+    for (a in Author.with("books").get()) { a.books().get() }
+    Author.find(1).books().get()
+    assertEq(kinds.size(), 4)
+    resetDiagnostics()
+    cleanUp(path)
+}
+
+test "remember(): cached results, and writes that invalidate them" {
+    let path = fresh("cache")
+    let cache = Orbit.cacheQueries(100)
+    DB.enableQueryLog()
+    let first = Author.where("name", "like", "A%").remember(60).get()
+    let second = Author.where("name", "like", "A%").remember(60).get()
+    assertEq("${first.size()} ${second.size()}", "5 5")
+    let log = DB.getQueryLog()
+    assertEq("${log.size()} ${log[0].cached} ${log[1].cached}", "2 false true")
+    assertEq("${cache.hits} ${cache.misses}", "1 1")
+    // Other arguments are another result; without remember() nothing is cached.
+    Author.where("name", "like", "B%").remember(60).get()
+    Author.where("name", "like", "A%").get()
+    assertEq(cache.size(), 2)
+    // A write to authors drops both; one to books leaves them.
+    Book.create(fields("authorId", 1, "title", "New"))
+    assertEq(cache.size(), 2)
+    Author.create(fields("name", "A6"))
+    assertEq(cache.size(), 0)
+    assertEq(Author.where("name", "like", "A%").remember(60).get().size(), 6)
+    // Joins and whereHas subqueries depend on their other tables too.
+    let withBooks = Author.whereHas("books", fn(q: Builder) { q.where("title", "like", "B1%") }).remember(60).count()
+    assertEq(withBooks, 1 as long)
+    Book.create(fields("authorId", 2, "title", "B1 again"))
+    assertEq(Author.whereHas("books", fn(q: Builder) { q.where("title", "like", "B1%") }).remember(60).count(), 2 as long)
+    // Aggregates, pluck and exists are remembered; with() loads are remembered as long.
+    DB.flushQueryLog()
+    for (i in 0..2) {
+        Book.where("authorId", 3).remember(60).count()
+        Book.where("authorId", 3).remember(60).pluck("title")
+        Author.with("books").remember(60).limit(2).get()
+    }
+    let cachedNow = 0
+    for (e in DB.getQueryLog()) { if (e.cached) { cachedNow += 1 } }
+    assertEq("${DB.getQueryLog().size()} ${cachedNow}", "8 4")
+    // Time running out, and raw writes (unknown tables: everything goes).
+    Author.where("id", 1).remember(0.05).get()
+    Time.sleepMs(80)
+    let misses = cache.misses
+    Author.where("id", 1).remember(0.05).get()
+    assertEq(cache.misses, misses + 1)
+    DB.statement("UPDATE books SET title = title")
+    assertEq(cache.size(), 0)
+    // Inside a transaction nothing is read from or put in the cache.
+    Author.where("id", 2).remember(60).get()
+    let before = cache.size()
+    DB.transaction(fn() { Author.where("id", 3).remember(60).get() })
+    assertEq(cache.size(), before)
+    // Capacity: the oldest go first.
+    let small = Orbit.cacheQueries(3)
+    for (i in 1..6) { Author.where("id", i).remember(60).get() }
+    assertEq(small.size(), 3)
+    Orbit.flushQueryCache()
+    assertEq(small.size(), 0)
+    resetDiagnostics()
+    cleanUp(path)
+}
+
+test "read replicas: in turn, passing over closed ones, sticky after writes" {
+    let path = fresh("replicas")
+    let writer = DB.connection()
+    let r1: Connection = Sqlite.openReadOnly(path)
+    let r2: Connection = Sqlite.openReadOnly(path)
+    let r3: Connection = Sqlite.openReadOnly(path)
+    DB.connect(writer, [r1, r2], "default")
+    DB.addReadReplica(r3)
+    assertEq(DB.readReplicas().size(), 3)
+    let picked = new HashMap<string, int>()
+    for (i in 0..9) {
+        let c = DB.readConnection()
+        let k = c == r1 ? "r1" : c == r2 ? "r2" : c == r3 ? "r3" : "w"
+        picked.put(k, picked.getOr(k, 0) + 1)
+    }
+    assertEq("${picked.getOr("r1", 0)} ${picked.getOr("r2", 0)} ${picked.getOr("r3", 0)}", "3 3 3")
+    // Model reads go to replicas and say so in the log; writes go to the writer.
+    DB.enableQueryLog()
+    assertEq(Author.count(), 5 as long)
+    Author.create(fields("name", "A6"))
+    let log = DB.getQueryLog()
+    assertEq("${log[0].replica} ${log[1].replica}", "true false")
+    assertEq(Author.count(), 6 as long)                       // (the replicas read the same file)
+    // A closed replica is passed over; with all closed, reads use the writer.
+    r2.close()
+    for (i in 0..6) { assertEq(DB.readConnection() != r2, true) }
+    r1.close()
+    r3.close()
+    assertEq(DB.readConnection() == writer, true)
+    // Sticky reads: after a write, reads stay on the writer for a while.
+    let r4: Connection = Sqlite.openReadOnly(path)
+    DB.connect(writer, [r4], "default")
+    DB.stickyReads(0.2)
+    assertEq(DB.readConnection() == r4, true)
+    Author.create(fields("name", "A7"))
+    assertEq(DB.readConnection() == writer, true)
+    Time.sleepMs(250)
+    assertEq(DB.readConnection() == r4, true)
+    DB.stickyReads(0.0)
+    r4.close()
+    resetDiagnostics()
+    cleanUp(path)
+}
+
+test "one connection per thread" {
+    let path = fresh("threads")
+    let shared = DB.connection()
+    let ok = new AtomicInt(0)
+    let threads = new Array<Thread>()
+    for (t in 0..4) {
+        threads.push(Thread.spawn(fn() {
+            let mine: Connection = Sqlite.open(path)
+            DB.useOnThisThread(mine)
+            if (DB.connection() == mine && DB.connection() != shared) { ok.increment() }
+            for (i in 0..20) { Book.create(fields("authorId", 1, "title", "T${t}.${i}")) }
+            if (Book.where("title", "like", "T${t}.%").count() == 20) { ok.increment() }
+            DB.leaveThread()
+            mine.close()
+        }))
+    }
+    for (th in threads) { th.join() }
+    assertEq(ok.get(), 8 as long)
+    assertEq(DB.connection() == shared, true)
+    assertEq(Book.count(), 95 as long)
+    cleanUp(path)
+}
