@@ -186,6 +186,8 @@ namespace orbit {
         fn index(columns: Array<string>) { self.addIndex("index", columns); }
         fn unique(columns: Array<string>) { self.addIndex("unique", columns); }
         fn primary(columns: Array<string>) { self.addIndex("primary", columns); }
+        // A full-text index for whereFullText (MySQL FULLTEXT, PostgreSQL GIN over the same tsvector; none on SQLite).
+        fn fullText(columns: Array<string>) { self.addIndex("fulltext", columns); }
         // ── changes (Schema.table) ───────────────────────────────────────────────
         fn dropColumn(name: string) { self.commands.push("dropColumn|" + Builder.ident(name)); }
         fn renameColumn(from: string, to: string) { self.commands.push("renameColumn|" + Builder.ident(from) + "|" + Builder.ident(to)); }
@@ -289,6 +291,16 @@ namespace orbit {
             for (i, cols in self.indexCols) {
                 let kind = self.indexKind(i);
                 if (kind == "primary") { continue; }
+                if (kind == "fulltext") {
+                    let ft = db.quote(self.table + "_" + Str.join(cols, "_") + "_fulltext");
+                    if (db.driver() == "mysql") { out.push("CREATE FULLTEXT INDEX " + ft + " ON " + db.quote(self.table) + " (" + Schema.quoted(cols, db) + ")"); }
+                    else if (db.driver() == "postgres") {
+                        let doc = new Array<string>();
+                        for (c in cols) { doc.push("COALESCE(" + db.quote(c) + ", '')"); }
+                        out.push("CREATE INDEX " + ft + " ON " + db.quote(self.table) + " USING GIN (to_tsvector('english', " + Str.join(doc, " || ' ' || ") + "))");
+                    }
+                    continue;
+                }
                 let name = self.table + "_" + Str.join(cols, "_") + (kind == "unique" ? "_unique" : "_index");
                 out.push((kind == "unique" ? "CREATE UNIQUE INDEX " : "CREATE INDEX ") + db.quote(name) + " ON " + db.quote(self.table) + " (" + Schema.quoted(cols, db) + ")");
             }
@@ -326,8 +338,8 @@ namespace orbit {
             a.push(table);
             let d = db.driver();
             let sql = d == "sqlite" ? "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?"
-                    : d == "mysql" ? "SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?"
-                    : "SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = ?";
+            : d == "mysql" ? "SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?"
+            : "SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = ?";
             return db.queryOne(sql, a) != null;
         }
         static fn hasColumn(table: string, column: string) -> bool {
@@ -346,8 +358,8 @@ namespace orbit {
             let db = DB.connection();
             let d = db.driver();
             let sql = d == "sqlite" ? "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
-                    : d == "mysql" ? "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE' ORDER BY table_name"
-                    : "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' ORDER BY table_name";
+            : d == "mysql" ? "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE' ORDER BY table_name"
+            : "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' ORDER BY table_name";
             let out = new Array<string>();
             for (row in db.query(sql)) { out.push(row.getString(row.columns()[0])); }
             return out;
@@ -385,8 +397,8 @@ namespace orbit {
             a.push(Builder.ident(table));
             let d = db.driver();
             let sql = d == "sqlite" ? "SELECT name FROM pragma_table_info(?) ORDER BY cid"
-                    : d == "mysql" ? "SELECT column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? ORDER BY ordinal_position"
-                    : "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ? ORDER BY ordinal_position";
+            : d == "mysql" ? "SELECT column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? ORDER BY ordinal_position"
+            : "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ? ORDER BY ordinal_position";
             let out = new Array<string>();
             for (row in db.query(sql, a)) { out.push(row.getString(row.columns()[0])); }
             return out;
@@ -456,7 +468,7 @@ namespace orbit {
         }
         static fn foreignSql(c: ColumnDef, db: Connection, table: string) -> string {
             let s = "CONSTRAINT " + db.quote(table + "_" + c.name + "_foreign") + " FOREIGN KEY (" + db.quote(c.name) + ") REFERENCES " +
-                    db.quote(c.refTable) + " (" + db.quote(c.refColumn) + ")";
+                db.quote(c.refTable) + " (" + db.quote(c.refColumn) + ")";
             if (c.onDeleteAction != "") { s = s + " ON DELETE " + c.onDeleteAction; }
             if (c.onUpdateAction != "") { s = s + " ON UPDATE " + c.onUpdateAction; }
             return s;
