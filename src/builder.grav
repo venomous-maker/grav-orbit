@@ -915,6 +915,7 @@ namespace orbit {
             let extras = self.extraColumns(rows.columns);
             let at = Persister.positions(self.__map, rows.columns);       // (once, not per row)
             for (row in rows) { out.push(self.hydrate(row, extras, at) as T); }
+            if (out.size() > 1 && LazyLoads.watching()) { for (o in out) { if (o is Model) { (o as Model).__batch = out.size(); } } }
             if (self.__withs.size() > 0 && out.size() > 0) {
                 let models = new Array<Model>();
                 for (o in out) { models.push(o as Model); }

@@ -73,6 +73,8 @@ namespace orbit {
 
         fn db() -> Connection { return DB.connection(self.relatedMap == null ? self.parentMap.connection : self.relatedMap.connection); }
         fn loaded() -> bool { return self.parent.__ld != null && self.parent.__ld.containsKey(self.key()); }
+        // A get() that was not loaded: about to query for this one parent (N+1 detection).
+        fn lazy() { if (LazyLoads.watching()) { LazyLoads.saw(self); } }
 
         // The relation `name` of `map`'s class (its method of that name, called on a blank object).
         // The objects of a typed list, as models.
@@ -182,9 +184,10 @@ namespace orbit {
         // The related objects (loaded ones when with() loaded them).
         fn get() -> Array<T> {
             if (self.loaded()) { return self.parent.__loaded()[self.key()] as Array<T>; }
+            self.lazy();
             return self.query().get();
         }
-        fn count() -> long { return self.loaded() ? (self.get().size() as long) : self.query().count(); }
+        fn count() -> long { if (self.loaded()) { return self.get().size() as long; } self.lazy(); return self.query().count(); }
         // One field of each related object.
         fn pluck(name: string) -> Array<any> { return self.query().pluck(name); }
         fn exists() -> bool { return self.count() > 0; }
@@ -242,6 +245,7 @@ namespace orbit {
         // The related object, or null (withDefault: a new T).
         fn get() -> T {
             if (self.loaded()) { return self.orDefault(self.parent.__loaded()[self.key()] as T); }
+            self.lazy();
             return self.orDefault(self.query().first());
         }
         // One of many: the related row with the largest `name` (latestOfMany: the id by default;
@@ -343,6 +347,7 @@ namespace orbit {
         fn get() -> T {
             if (self.loaded()) { return self.orDefault(self.parent.__loaded()[self.key()] as T); }
             if (self.foreignKey.field.get(self.parent) == null) { return self.orDefault(null); }
+            self.lazy();
             return self.orDefault(self.query().first());
         }
         // Sets the foreign key to `owner`'s key (save the object to keep it).
@@ -490,9 +495,10 @@ namespace orbit {
         // The linked objects (loaded ones when with() loaded them).
         fn get() -> Array<T> {
             if (self.loaded()) { return self.parent.__loaded()[self.key()] as Array<T>; }
+            self.lazy();
             return self.query().get();
         }
-        fn count() -> long { return self.loaded() ? (self.get().size() as long) : self.query().count(); }
+        fn count() -> long { if (self.loaded()) { return self.get().size() as long; } self.lazy(); return self.query().count(); }
         // One field of each related object.
         fn pluck(name: string) -> Array<any> { return self.query().pluck(name); }
         // Links `id` (an object of T, or its key), or each of `ids`, with the
@@ -656,10 +662,11 @@ namespace orbit {
         fn with(relation: string) -> Query<T> { return self.query().with(relation); }
         fn get() -> Array<T> {
             if (self.loaded()) { return self.parent.__loaded()[self.key()] as Array<T>; }
+            self.lazy();
             return self.query().get();
         }
         fn first() -> T { return self.query().first(); }
-        fn count() -> long { return self.loaded() ? (self.get().size() as long) : self.query().count(); }
+        fn count() -> long { if (self.loaded()) { return self.get().size() as long; } self.lazy(); return self.query().count(); }
         fn pluck(name: string) -> Array<any> { return self.query().pluck(name); }
         fn existence(outer: Builder) -> Builder {
             let alias = "__orbit_${outer.__depth + 1}";
@@ -705,6 +712,7 @@ namespace orbit {
         fn query() -> Query<T> { return self.many.query(); }
         fn get() -> T {
             if (self.loaded()) { return self.parent.__loaded()[self.key()] as T; }
+            self.lazy();
             return self.many.query().first();
         }
         fn existence(outer: Builder) -> Builder { return self.many.existence(outer); }
@@ -741,9 +749,10 @@ namespace orbit {
         fn relatedQuery() -> Builder { return self.query(); }
         fn get() -> Array<T> {
             if (self.loaded()) { return self.parent.__loaded()[self.key()] as Array<T>; }
+            self.lazy();
             return self.query().get();
         }
-        fn count() -> long { return self.loaded() ? (self.get().size() as long) : self.query().count(); }
+        fn count() -> long { if (self.loaded()) { return self.get().size() as long; } self.lazy(); return self.query().count(); }
         // One field of each related object.
         fn pluck(name: string) -> Array<any> { return self.query().pluck(name); }
         fn save(child: T) -> T {
@@ -792,6 +801,7 @@ namespace orbit {
         fn query() -> Query<T> { return self.many.query(); }
         fn get() -> T {
             if (self.loaded()) { return self.parent.__loaded()[self.key()] as T; }
+            self.lazy();
             return self.many.query().first();
         }
         fn save(child: T) -> T { return self.many.save(child); }
@@ -829,6 +839,7 @@ namespace orbit {
             let kind = self.typeField.field.get(self.parent);
             let id = self.idField.field.get(self.parent);
             if (kind == null || id == null) { return null; }
+            self.lazy();
             let map = MorphTo.mapOf("${kind}");
             return new Query<Model>(map).find(id);
         }
@@ -885,12 +896,126 @@ namespace orbit {
         }
     }
 
+    // A relation lazy-loaded on an object its query read with others, while
+    // Orbit.preventLazyLoading() is on (an N+1: one query per object).
+    class LazyLoadingViolation extends Exception {
+        public model: string
+        public relation: string
+        constructor(model: string, relation: string, others: int) {
+            super("lazy loading " + model + "." + relation + "() on a " + model + " read with ${others - 1} others " +
+                "(one query each: an N+1) — load it with the query: with(\"" + relation + "\")");
+            self.model = model;
+            self.relation = relation;
+        }
+        public fn kind() -> string { return "LazyLoadingViolation"; }
+    }
+
+    // N+1 detection: relations lazy-loaded on objects read together (see Orbit).
+    class LazyLoads {
+        // Is anything watching (prevention, or counting)? Atomic, read without the lock.
+        private static on: AtomicInt = new AtomicInt(0)
+        private static preventing: bool = false
+        private static counting: bool = false
+        private static handler: fn(Model, string) = null
+        private static counts: HashMap<string, int> = new HashMap<string, int>()
+        private static names: HashMap<string, string> = new HashMap<string, string>()
+        private static lock: Mutex = new Mutex()
+
+        static fn prevent(on: bool) { LazyLoads.lock.lock(); LazyLoads.preventing = on; LazyLoads.rewatch(); LazyLoads.lock.unlock(); }
+        static fn count(on: bool) { LazyLoads.lock.lock(); LazyLoads.counting = on; LazyLoads.rewatch(); LazyLoads.lock.unlock(); }
+        static fn handle(f: fn(Model, string)) { LazyLoads.lock.lock(); LazyLoads.handler = f; LazyLoads.lock.unlock(); }
+        static fn preventingNow() -> bool { return LazyLoads.preventing; }
+        private static fn rewatch() { LazyLoads.on.set(LazyLoads.preventing || LazyLoads.counting ? 1 : 0); }
+        static fn watching() -> bool { return LazyLoads.on.get() != 0; }
+        // "Class.relation" -> how many lazy loads of it ran on objects read with others.
+        static fn seen() -> HashMap<string, int> {
+            LazyLoads.lock.lock();
+            let out = new HashMap<string, int>();
+            for (k in LazyLoads.counts.keys()) { out.put(k, LazyLoads.counts[k]); }
+            LazyLoads.lock.unlock();
+            return out;
+        }
+        static fn reset() { LazyLoads.lock.lock(); LazyLoads.counts.clear(); LazyLoads.lock.unlock(); }
+
+        // `r` is being lazy-loaded: an N+1 when its parent was read with others.
+        static fn saw(r: Relation) {
+            let p = r.parent;
+            if (p.__batch <= 1) { return; }
+            let model = r.parentMap.info.simpleName();
+            let rel = LazyLoads.nameOf(r);
+            LazyLoads.lock.lock();
+            let k = model + "." + rel;
+            LazyLoads.counts.put(k, LazyLoads.counts.getOr(k, 0) + 1);
+            let f = LazyLoads.handler;
+            let stop = LazyLoads.preventing;
+            LazyLoads.lock.unlock();
+            if (!stop) { return; }
+            if (f != null) { f(p, rel); return; }
+            throw new LazyLoadingViolation(model, rel, p.__batch);
+        }
+        // The name of the method that made `r` (found once per class and relation).
+        private static fn nameOf(r: Relation) -> string {
+            let info = r.parentMap.info;
+            let key = info.name + "\t" + r.key();
+            LazyLoads.lock.lock();
+            let known = LazyLoads.names.getOr(key, "");
+            LazyLoads.lock.unlock();
+            if (known != "") { return known; }
+            let found = r.key();
+            for (m in info.methods()) {
+                if (m.paramCount() != 0 || m.isStatic() || !LazyLoads.isRelationType(m.result)) { continue; }
+                let x = m.invoke(r.parent, new Array<any>());
+                if (x is Relation && (x as Relation).key() == r.key()) { found = m.name; break; }
+            }
+            LazyLoads.lock.lock();
+            LazyLoads.names.put(key, found);
+            LazyLoads.lock.unlock();
+            return found;
+        }
+        private static fn isRelationType(t: string) -> bool {
+            for (n in ["HasMany", "HasOne", "BelongsTo", "MorphMany", "MorphOne", "MorphTo"]) { if (Str.contains(t, n)) { return true; } }
+            return false;
+        }
+    }
+
     // Settings that are not about one connection.
     class Orbit {
         // Makes `name` stand for `info`'s class in polymorphic relations' type columns.
         static fn morphMap(name: string, info: ClassInfo) { TableMap.registerMorph(name, info); }
         // Registers each class's morph name (so morphTo can find them before they are used).
         static fn register(infos: Array<ClassInfo>) { for (i in infos) { TableMap.of(i); } }
+
+        // ── N+1 detection ───────────────────────────────────────────────────────
+        // A relation lazy-loaded on an object its query read with others (one query
+        // per object: an N+1) throws LazyLoadingViolation from now on — or, after
+        // handleLazyLoadingViolationsUsing, calls that instead. Objects read alone
+        // (find, first) lazy-load as before.
+        static fn preventLazyLoading(on: bool = true) { LazyLoads.prevent(on); }
+        // What a violation does instead of throwing: `f(model, relation name)`.
+        static fn handleLazyLoadingViolationsUsing(f: fn(Model, string)) { LazyLoads.handle(f); }
+        // Prevention that only warns: one line on stderr the first time each
+        // Class.relation is lazy-loaded that way.
+        static fn warnOnLazyLoading() {
+            let warned = new HashSet<string>();
+            let lock = new Mutex();
+            LazyLoads.handle(fn(m: Model, relation: string) {
+                let k = ClassInfo.of(m).simpleName() + "." + relation;
+                lock.lock();
+                let first = !warned.contains(k);
+                if (first) { warned.add(k); }
+                lock.unlock();
+                if (first) {
+                    eprint("orbit: N+1 — " + k + "() is lazy-loaded on each " + ClassInfo.of(m).simpleName() +
+                        " of a query that read ${m.__batch} together; load it with the query: with(\"" + relation + "\")");
+                }
+            });
+            LazyLoads.prevent(true);
+        }
+        // Counts N+1 lazy loads without stopping them (the debugbar turns this on).
+        static fn detectLazyLoading(on: bool = true) { LazyLoads.count(on); }
+        // "Class.relation" -> the N+1 lazy loads of it seen so far.
+        static fn lazyLoads() -> HashMap<string, int> { return LazyLoads.seen(); }
+        static fn resetLazyLoads() { LazyLoads.reset(); }
 
         // ── the query cache (remember) ──────────────────────────────────────────
         // Keeps remember()ed results in this process's memory, up to `capacity` of them.
