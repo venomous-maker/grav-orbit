@@ -116,8 +116,27 @@ namespace orbit {
         }
         // The one related object, for a relation that has at most one (hasOne,
         // belongsTo, morphOne, morphTo): null for hasMany and the many-to-many kinds,
-        // and for one with none loaded ($touches: touching the owner after a save).
+        // and for one with none loaded.
         fn relatedOne() -> Model { return null; }
+        // A query over every row this relation matches (for touchAll, and other
+        // bulk operations): null for a relation with no such query (morphTo, whose
+        // match depends on the dynamic type).
+        fn relatedQuery() -> Builder { return null; }
+        // $touches: bumps every matching related row's updatedAt directly — a raw
+        // UPDATE through relatedQuery(), with no load, save cycle or hooks on the
+        // related rows (so it touches a whole hasMany/belongsToMany too, not just
+        // a loaded one); relatedOne().touch() when there is no bulk query (morphTo).
+        fn touchAll() {
+            let q = self.relatedQuery();
+            if (q != null && self.relatedMap != null && self.relatedMap.updatedAt != null) {
+                let v = new HashMap<string, any>();
+                v.put(self.relatedMap.updatedAt.field.name, DateTime.now());
+                q.update(v);
+                return;
+            }
+            let one = self.relatedOne();
+            if (one != null) { one.touch(); }
+        }
         // A field of `map` by field or column name; ValueError naming the relation otherwise.
         static fn field(map: TableMap, name: string, what: string) -> FieldMap {
             let m = map.find(name);
@@ -146,6 +165,7 @@ namespace orbit {
             q.where(self.foreignKey.field.name, self.localKey.field.get(self.parent));
             return q;
         }
+        fn relatedQuery() -> Builder { return self.query(); }
         fn where(name: string, op: string, value: any) -> Query<T> { return self.query().where(name, op, value); }
         fn where(name: string, value: any) -> Query<T> { return self.query().where(name, value); }
         fn whereIn(name: string, values: Array<any>) -> Query<T> { return self.query().whereIn(name, values); }
@@ -222,6 +242,7 @@ namespace orbit {
         // say "createdAt" for the newest), or the smallest (oldestOfMany); ofMany takes "max" or "min".
         //   fn latestOrder() -> HasOne<Order> { return self.hasOne::<Order>().latestOfMany() }
         fn relatedOne() -> Model { return self.get() as Model; }
+        fn relatedQuery() -> Builder { return self.query(); }
         fn latestOfMany(name: string = "") -> HasOne<T> { return self.ofMany(name, "max"); }
         fn oldestOfMany(name: string = "") -> HasOne<T> { return self.ofMany(name, "min"); }
         fn ofMany(name: string, agg: string) -> HasOne<T> {
@@ -296,6 +317,7 @@ namespace orbit {
         }
         fn key() -> string { return "belongsTo:" + self.parentMap.table + "." + self.foreignKey.column; }
         fn relatedOne() -> Model { return self.get() as Model; }
+        fn relatedQuery() -> Builder { return self.query(); }
         fn __ownerKeys() -> Array<FieldMap> { let k = new Array<FieldMap>(); k.push(self.foreignKey); k.push(self.ownerKey); return k; }
         // get() gives a new (unsaved) T, with these fields, instead of null.
         fn withDefault(values: HashMap<string, any> = new HashMap<string, any>()) -> BelongsTo<T> { self.defaults = values; return self; }
@@ -390,6 +412,7 @@ namespace orbit {
             for (w in self.pivotWheres) { where.append("${w[0]}${w[1]}${w[2]};"); }
             return "belongsToMany:" + self.table + "." + self.foreignPivotKey + "." + self.typeValue + "|" + Str.join(self.pivotCols, ",") + "|" + where.toString();
         }
+        fn relatedQuery() -> Builder { return self.query(); }
         // Also reads these pivot columns (each object's pivot("level")).
         fn withPivot(columns: Array<string>) -> BelongsToMany<T> { for (c in columns) { self.pivotCols.push(Builder.ident(c)); } return self; }
         // Only links whose pivot column matches (`wherePivot("level", ">", 2)`).
@@ -617,6 +640,7 @@ namespace orbit {
             q.where(self.throughMap.table + "." + self.firstKey.column, self.localKey.field.get(self.parent));
             return q;
         }
+        fn relatedQuery() -> Builder { return self.query(); }
         fn where(name: string, op: string, value: any) -> Query<T> { return self.query().where(name, op, value); }
         fn where(name: string, value: any) -> Query<T> { return self.query().where(name, value); }
         fn whereIn(name: string, values: Array<any>) -> Query<T> { return self.query().whereIn(name, values); }
@@ -671,6 +695,7 @@ namespace orbit {
         }
         fn key() -> string { return "oneThrough:" + self.many.key(); }
         fn relatedOne() -> Model { return self.get() as Model; }
+        fn relatedQuery() -> Builder { return self.query(); }
         fn query() -> Query<T> { return self.many.query(); }
         fn get() -> T {
             if (self.loaded()) { return self.parent.__loaded()[self.key()] as T; }
@@ -707,6 +732,7 @@ namespace orbit {
             q.where(self.typeField.field.name, self.parentMap.morphName);
             return q;
         }
+        fn relatedQuery() -> Builder { return self.query(); }
         fn get() -> Array<T> {
             if (self.loaded()) { return self.parent.__loaded()[self.key()] as Array<T>; }
             return self.query().get();
@@ -756,6 +782,7 @@ namespace orbit {
         }
         fn key() -> string { return "morphOne:" + self.many.key(); }
         fn relatedOne() -> Model { return self.get() as Model; }
+        fn relatedQuery() -> Builder { return self.query(); }
         fn query() -> Query<T> { return self.many.query(); }
         fn get() -> T {
             if (self.loaded()) { return self.parent.__loaded()[self.key()] as T; }

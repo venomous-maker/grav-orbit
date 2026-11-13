@@ -175,7 +175,8 @@ namespace orbit {
             Persister.snapshot(obj, map);
             if (!quiet) { if (model != null) { model.afterSave(); } map.fire("saved", obj); Persister.touch(obj, map); }
         }
-        // Touches ($touches): the single related object of each of map.touches, if any.
+        // Touches ($touches): every row map.touches' relations match, by a raw
+        // UPDATE of their updatedAt (Relation.touchAll — no load, no hooks on them).
         static fn touch(obj: any, map: TableMap) {
             if (map.touches.size() == 0 || !(obj is Model)) { return; }
             for (name in map.touches) {
@@ -183,8 +184,7 @@ namespace orbit {
                 if (mi == null) { throw new StateError(map.info.simpleName() + " is @Touches(\"" + name + "\"), and it has no method '" + name + "'"); }
                 let r = mi.invoke(obj, new Array<any>());
                 if (!(r is Relation)) { throw new ValueError(map.info.simpleName() + "." + name + "() is not a relation"); }
-                let one = (r as Relation).relatedOne();
-                if (one != null) { one.touch(); }
+                (r as Relation).touchAll();
             }
         }
         static fn insert(obj: any, map: TableMap, db: Connection) {
@@ -226,11 +226,14 @@ namespace orbit {
         static fn delete(obj: any, map: TableMap, db: Connection, force: bool) -> bool {
             let id = map.requireId();
             map.fire("deleting", obj);
+            let goingThrough = force && map.softDelete != null;   // a forceDelete of an otherwise-soft-deletable row
+            if (goingThrough) { map.fire("forceDeleting", obj); }
             if (map.softDelete != null && !force) {
                 map.softDelete.field.set(obj, DateTime.now());
                 let marked = Persister.update(obj, map, db) > 0;
                 Persister.snapshot(obj, map);
                 map.fire("deleted", obj);
+                map.fire("trashed", obj);
                 return marked;
             }
             let args = new Array<any>();
@@ -238,6 +241,7 @@ namespace orbit {
             let gone = db.execute("DELETE FROM " + db.quote(map.table) + " WHERE " + db.quote(id.column) + " = ?", args) > 0;
             if (obj is Model) { (obj as Model).__exists = false; }
             map.fire("deleted", obj);
+            if (goingThrough) { map.fire("forceDeleted", obj); }
             return gone;
         }
         // The field values of `obj` as a map (column values; @Hidden left out;
@@ -544,10 +548,12 @@ namespace orbit {
         fn restore() -> Self {
             let map = self.__map();
             if (map.softDelete == null) { throw new StateError(map.info.simpleName() + " is not @SoftDeletes"); }
+            map.fire("restoring", self);
             map.softDelete.field.set(self, null);
             if (map.updatedAt != null) { map.updatedAt.field.set(self, DateTime.now()); }
             Persister.update(self, map, self.__db());
             Persister.snapshot(self, map);
+            map.fire("restored", self);
             return self;
         }
         // Whether a soft delete marked it.
