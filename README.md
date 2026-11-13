@@ -176,6 +176,7 @@ above is `true` and `balance` is `0` until something sets them.
 | `@SoftDeletes`, `@SoftDeletes("removedAt")` | soft deletes (see [Soft deletes](#soft-deletes)) |
 | `@Timestamps("created", "updated")` | other names for the timestamp fields |
 | `@Uuids`, `@Uuids("field")` | a new row gets a random UUID (see [Behaviors](#behaviors-model-traits)) |
+| `@Appends("initials", ...)` | these properties' getters go into `toMap` and `toJson` (see [Accessors](#accessors-mutators-and-casts)) |
 
 On a field:
 
@@ -192,6 +193,7 @@ On a field:
 | `@Ignore` | not a column |
 | `@Hidden` | left out of `toMap()` and `toJson()` |
 | `@Guarded` | not set by mass assignment (`create`, `make`, `fill`, `update`) |
+| `@Cast("money")` | a field of any type, stored through a registered `Cast` (built in: `json`, `csv`) |
 | `@NotNull` | `NOT NULL`, though the field is `T?` |
 | `@Unique` | a `UNIQUE` column |
 
@@ -839,6 +841,74 @@ user.makeVisible(["secret"]).toMap() // show @Hidden ones on this object
 Loaded relations are in the map too (a model as a map, a list as a list of
 maps), and so are the extra columns a query selected (`posts_count`).
 
+### Accessors, mutators and casts
+
+Grav properties are Orbit's accessors and mutators. A getter marked
+`@Appended` (or named by `@Appends(...)` on the class) is put into `toMap` and
+`toJson`, and a setter is what `fill`, `create` and `update` call for its name:
+
+```grav
+@Appends("initials")
+class Person extends Model {
+    public id: long = 0
+    public first: string = ""
+    public last: string = ""
+
+    @Appended get fullName() -> string { return self.first + " " + self.last }
+    set fullName(v: string) {
+        let i = Str.indexOf(v, " ")
+        self.first = v[..i]
+        self.last = v[i + 1..]
+    }
+    get initials() -> string { return self.first[..1] + self.last[..1] }
+    get shout() -> string { return Str.upper(self.fullName) }       // not in toMap
+}
+
+let p = Person.create(fields("fullName", "Ada Lovelace"))   // the setter fills first and last
+p.toMap()                          // {id: 1, first: "Ada", last: "Lovelace", fullName: "Ada Lovelace", initials: "AL"}
+p.append(["shout"]).toJson()       // any other getter, for this object
+p.makeHidden(["initials"])         // hides an appended one, as it hides a field
+```
+
+A setter marked `@Guarded` is left alone by mass assignment, as a field is.
+Properties are not columns: keep the value in fields, and compute or convert
+it in the accessors.
+
+**Casts.** A field's type is its cast for the types Orbit maps (numbers, bools,
+strings, enums, `DateTime`, `Decimal`, `Bytes`, `JsonValue`, `T?`). For any
+other type, `@Cast("name")` names a `Cast` that turns the column's value into
+the field's and back. `json` and `csv` are built in:
+
+```grav
+class Money {
+    public cents: long
+    constructor(cents: long) { self.cents = cents }
+}
+class MoneyCast extends Cast {
+    fn get(value: any) -> any { return new Money(value as long) }    // column -> field
+    fn set(value: any) -> any { return (value as Money).cents }      // field -> column
+    fn column() -> string { return "long" }                          // the column's kind (createTable, Schema)
+}
+Casts.register("money", new MoneyCast())                             // at start-up, before the class is used
+
+class Order extends Model {
+    public id: long = 0
+    @Cast("money") public total: Money = null
+    @Cast("json") public options: HashMap<string, any> = null       // JSON text: objects as maps, arrays as Array<any>
+    @Cast("csv") public tags: Array<string> = null                  // "a,b,c"
+}
+
+let o = Order.find(1)
+o.options.put("gift", true)       // a change inside a cast value counts:
+o.isDirty("options")              // true, so save() writes it
+```
+
+A null stays null both ways. The model keeps a cast field's snapshot as its
+column has it, so changing the map or list in place shows in `isDirty` and is
+saved; `getOriginal` gives the field's form back. A `@Cast` name no cast is
+registered under is a `StateError` naming the field, the first time the class
+is used.
+
 ## Behaviors (model traits)
 
 A behavior is code a class gets by wearing a decorator, as `@SoftDeletes` gives
@@ -1329,7 +1399,8 @@ Most of Eloquent's names are here and mean the same. What differs:
 - **Maps are `fields(...)`**: `User.create(fields("name", "Ada", "age", 36))`.
 - **No `$fillable`, `$hidden`, `$casts`**: every field is fillable but
   `@Guarded` ones (and a numbered id); `@Hidden` hides; a field's type is its
-  cast. There are no accessors or mutators: write methods.
+  cast, and `@Cast("name")` covers other types. Accessors and mutators are
+  [properties](#accessors-mutators-and-casts): `get` and `set`.
 - **No local scope methods**: keep a scope in a function and `tap` it. Global
   scopes and traits are [behaviors](#behaviors-model-traits), put on by
   decorators; hooks are methods on the model or a behavior (there is no event
