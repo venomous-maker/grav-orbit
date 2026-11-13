@@ -13,6 +13,7 @@ import "std"
 import "grav-db"
 import "mapping.grav"
 import "builder.grav"
+import "querylog.grav"
 
 namespace orbit {
 
@@ -39,6 +40,10 @@ namespace orbit {
             let r = DB.reads.getOr(key, null);
             return r == null || w.inTransaction() || r.inTransaction() ? w : r;
         }
+        // Whether `db` is `name`'s read replica (for the query log).
+        static fn isReplica(db: Connection, name: string = "default") -> bool {
+            return db != DB.connection(name);
+        }
         // The connection called `name`; StateError when there is none.
         static fn connection(name: string = "default") -> Connection {
             let key = name == "" ? "default" : name;
@@ -58,11 +63,27 @@ namespace orbit {
             DB.reads.remove(name);
         }
 
+        // ── the query log ────────────────────────────────────────────────────────
+        // Keeps every statement Orbit runs from now on (the newest Sql.logLimit, 10000).
+        static fn enableQueryLog() { Sql.enableLog(); }
+        static fn disableQueryLog() { Sql.disableLog(); }
+        static fn logging() -> bool { return Sql.logEnabled(); }
+        // What the log kept, oldest first.
+        static fn getQueryLog() -> Array<QueryEvent> { return Sql.entries(); }
+        static fn flushQueryLog() { Sql.clearLog(); }
+        // Calls `f` after every statement Orbit runs (also while the log is off).
+        static fn listen(f: fn(QueryEvent)) { Sql.listen(f); }
+        static fn forgetListeners() { Sql.forgetListeners(); }
+
         // ── transactions ─────────────────────────────────────────────────────────
         // Runs `body` in a transaction: committed when it returns, rolled back when
         // it throws (and the exception goes on). Nested, it is a savepoint.
-        static fn transaction(body: fn()) { DB.connection().transaction(body); }
-        static fn transaction(name: string, body: fn()) { DB.connection(name).transaction(body); }
+        static fn transaction(body: fn()) { DB.transaction("default", body); }
+        static fn transaction(name: string, body: fn()) {
+            let db = DB.connection(name);
+            try { db.transaction(body); } catch (e: Exception) { if (!db.inTransaction()) { Sql.ended(DB.key(name)); } throw e; }
+            if (!db.inTransaction()) { Sql.ended(DB.key(name)); }
+        }
         // Retries `body` up to `attempts` times, rolling back and running it again
         // when it fails on a deadlock or a serialization failure (see isDeadlock);
         // any other error, or the last attempt's, goes on. Each retry waits a
@@ -70,7 +91,7 @@ namespace orbit {
         static fn transaction(body: fn(), attempts: int) -> void { DB.transaction("default", body, attempts); }
         static fn transaction(name: string, body: fn(), attempts: int) {
             for (i in 0..attempts) {
-                try { DB.connection(name).transaction(body); return; }
+                try { DB.transaction(name, body); return; }
                 catch (e: DbError) {
                     if (i + 1 >= attempts || !DB.isDeadlock(e, name)) { throw e; }
                     Time.sleepMs(20 * (i + 1));
@@ -95,26 +116,47 @@ namespace orbit {
         }
         // Starts a transaction (a savepoint inside one), to end with commit or rollBack.
         static fn beginTransaction(name: string = "default") { DB.connection(name).begin(); }
-        static fn commit(name: string = "default") { DB.connection(name).commit(); }
-        static fn rollBack(name: string = "default") { DB.connection(name).rollback(); }
+        static fn commit(name: string = "default") { let db = DB.connection(name); db.commit(); if (!db.inTransaction()) { Sql.ended(DB.key(name)); } }
+        static fn rollBack(name: string = "default") { let db = DB.connection(name); db.rollback(); if (!db.inTransaction()) { Sql.ended(DB.key(name)); } }
         // Whether a transaction is open.
         static fn inTransaction(name: string = "default") -> bool { return DB.connection(name).inTransaction(); }
 
         // ── raw SQL (with `?` arguments) ─────────────────────────────────────────
         // Reads go to the read connection (readConnection), writes to the write one.
-        static fn select(sql: string, args: Array<any> = new Array<any>()) -> ResultSet { return DB.readConnection().query(sql, args); }
-        static fn selectOne(sql: string, args: Array<any> = new Array<any>()) -> Row { return DB.readConnection().queryOne(sql, args); }
+        static fn select(sql: string, args: Array<any> = new Array<any>()) -> ResultSet {
+            let db = DB.readConnection();
+            return Sql.query(db, "default", sql, args, DB.isReplica(db));
+        }
+        static fn selectOne(sql: string, args: Array<any> = new Array<any>()) -> Row {
+            let db = DB.readConnection();
+            return Sql.queryOne(db, "default", sql, args, DB.isReplica(db));
+        }
         // The first column of the first row, or null.
-        static fn scalar(sql: string, args: Array<any> = new Array<any>()) -> any { return DB.readConnection().queryValue(sql, args); }
-        // Runs an INSERT; the new row's id.
-        static fn insert(sql: string, args: Array<any> = new Array<any>()) -> long { return DB.connection().insert(sql, args); }
+        static fn scalar(sql: string, args: Array<any> = new Array<any>()) -> any {
+            let db = DB.readConnection();
+            return Sql.queryValue(db, "default", sql, args, DB.isReplica(db));
+        }
+        // Runs an INSERT; the new row's id. (Raw writes drop every cached result of
+        // the connection: Orbit cannot tell which tables they change.)
+        static fn insert(sql: string, args: Array<any> = new Array<any>()) -> long { return Sql.insert(DB.connection(), "default", sql, args, ""); }
         // Runs an UPDATE or DELETE; the rows it changed.
-        static fn update(sql: string, args: Array<any> = new Array<any>()) -> long { return DB.connection().execute(sql, args); }
-        static fn delete(sql: string, args: Array<any> = new Array<any>()) -> long { return DB.connection().execute(sql, args); }
+        static fn update(sql: string, args: Array<any> = new Array<any>()) -> long { return Sql.execute(DB.connection(), "default", sql, args, ""); }
+        static fn delete(sql: string, args: Array<any> = new Array<any>()) -> long { return Sql.execute(DB.connection(), "default", sql, args, ""); }
         // Runs any statement; the rows it changed.
-        static fn statement(sql: string, args: Array<any> = new Array<any>()) -> long { return DB.connection().execute(sql, args); }
+        static fn statement(sql: string, args: Array<any> = new Array<any>()) -> long { return Sql.execute(DB.connection(), "default", sql, args, ""); }
         // Runs statements without arguments (a script).
-        static fn unprepared(sql: string) { DB.connection().exec(sql); }
+        static fn unprepared(sql: string) { Sql.exec(DB.connection(), "default", sql); }
+        // The DB name `db` is connected under (a replica: its write connection's
+        // name; an unnamed one: "@" and a number), for the query log and cache.
+        static fn nameOf(db: Connection) -> string {
+            for (k in DB.named.keys()) { if (DB.named[k] == db) { return k; } }
+            for (k in DB.reads.keys()) { if (DB.reads[k] == db) { return k; } }
+            return Sql.anonymous(db);
+        }
+        // nameOf, only while something needs it (the log, the cache, sticky reads); "" otherwise.
+        static fn nameFor(db: Connection) -> string { return Sql.busy() ? DB.nameOf(db) : ""; }
+        // The DB name a query names ("" is "default").
+        static fn key(name: string) -> string { return name == "" ? "default" : name; }
 
         // A query on table `name`, without a model: its rows come back as Rows.
         static fn table(name: string) -> TableQuery { return new TableQuery(name, DB.connection()); }

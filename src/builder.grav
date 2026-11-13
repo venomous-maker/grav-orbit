@@ -14,6 +14,7 @@ import "std"
 import "grav-db"
 import "mapping.grav"
 import "db.grav"
+import "querylog.grav"
 import "model.grav"
 import "relations.grav"
 
@@ -61,6 +62,8 @@ namespace orbit {
         private aliases: HashMap<string, string> = new HashMap<string, string>()
         // 0: rows a soft delete removed are left out; 1: with them; 2: only them.
         public __trashed: int = 0
+        // remember(): how long its reads' results are kept in the query cache (-1: not at all).
+        public __cacheMs: long = -1
 
         constructor(map: TableMap, table: string, db: Connection) {
             self.__map = map;
@@ -71,6 +74,15 @@ namespace orbit {
 
         // Runs on `db` instead of the default connection.
         fn on(db: Connection) -> Self { self.__db = db; return self; }
+        // Answers this query's reads from the query cache (Orbit.cacheQueries) for
+        // `seconds`: the first run reads the database, later identical ones (same
+        // SQL, same arguments) the cache, until the time is up or Orbit writes to a
+        // table it reads. Relations its with() loads are remembered as long.
+        fn remember(seconds: float) -> Self { self.__cacheMs = (seconds * 1000.0) as long; return self; }
+        // Kept until a write to one of its tables (or Orbit.flushQueryCache()).
+        fn rememberForever() -> Self { self.__cacheMs = 3153600000000; return self; }
+        // Not from the cache, after all.
+        fn dontRemember() -> Self { self.__cacheMs = -1; return self; }
 
         // ── where ───────────────────────────────────────────────────────────────
         // `name op value`: op is =, !=, <>, <, <=, >, >=, like, not like, ilike.
@@ -345,7 +357,7 @@ namespace orbit {
         fn exists() -> bool {
             let keep = self.lim;
             self.lim = 1;
-            let found = self.readConn().queryOne(self.__sql("1"), self.__bindings()) != null;
+            let found = self.__readOne(self.__sql("1"), self.__bindings()) != null;
             self.lim = keep;
             return found;
         }
@@ -370,7 +382,7 @@ namespace orbit {
             let keep = self.selects;
             self.selects = new Array<string>();
             self.selects.push(self.col(name));
-            let rows = self.readConn().query(self.__sql(""), self.__bindings());
+            let rows = self.__read(self.__sql(""), self.__bindings());
             self.selects = keep;
             for (row in rows) { out.push(row.at(0)); }
             return out;
@@ -384,7 +396,7 @@ namespace orbit {
             return all.size() == 0 ? null : all[0];
         }
         // The rows as they come (columns by name), for any query.
-        fn rows() -> ResultSet { return self.readConn().query(self.__sql(""), self.__bindings()); }
+        fn rows() -> ResultSet { return self.__read(self.__sql(""), self.__bindings()); }
         // Deletes the matches (for a @SoftDeletes model: marks them deleted); how many.
         fn delete() -> long {
             if (self.__map != null && self.__map.softDelete != null) {
@@ -397,7 +409,7 @@ namespace orbit {
         // Deletes the matches, even of a @SoftDeletes model.
         fn forceDelete() -> long {
             let db = self.conn();
-            return db.execute("DELETE FROM " + db.quote(self.__table) + self.whereSql(false), self.whereArgs());
+            return self.__write(db, "DELETE FROM " + db.quote(self.__table) + self.whereSql(false), self.whereArgs());
         }
         // Undoes a soft delete of the matches.
         fn restore() -> long {
@@ -420,7 +432,7 @@ namespace orbit {
             }
             if (sets.size() == 0) { return 0; }
             for (x in self.whereArgs()) { a.push(x); }
-            return db.execute("UPDATE " + db.quote(self.__table) + " SET " + Str.join(sets, ", ") + self.whereSql(true), a);
+            return self.__write(db, "UPDATE " + db.quote(self.__table) + " SET " + Str.join(sets, ", ") + self.whereSql(true), a);
         }
         // Inserts rows (field or column names), or, where one with the same `uniqueBy`
         // columns exists, updates its `update` columns; the rows written. One
@@ -446,7 +458,7 @@ namespace orbit {
             let sql = "INSERT INTO " + db.quote(self.__table) + " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")";
             if (d == "mysql") { sql = sql + (sets.size() > 0 ? " ON DUPLICATE KEY UPDATE " + Str.join(sets, ", ") : ""); }
             else { sql = sql + " ON CONFLICT (" + Str.join(target, ", ") + ")" + (sets.size() > 0 ? " DO UPDATE SET " + Str.join(sets, ", ") : " DO NOTHING"); }
-            return db.executeMany(sql, self.rowArgs(rows, keys));
+            return Sql.executeMany(db, self.__name(), sql, self.rowArgs(rows, keys), self.__table);
         }
         // Inserts rows, skipping those a unique key already has; the rows inserted.
         fn insertOrIgnore(rows: Array<HashMap<string, any>>) -> long {
@@ -460,7 +472,7 @@ namespace orbit {
             let head = d == "sqlite" ? "INSERT OR IGNORE INTO " : d == "mysql" ? "INSERT IGNORE INTO " : "INSERT INTO ";
             let sql = head + db.quote(self.__table) + " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")" +
                 (d == "postgres" ? " ON CONFLICT DO NOTHING" : "");
-            return db.executeMany(sql, self.rowArgs(rows, keys));
+            return Sql.executeMany(db, self.__name(), sql, self.rowArgs(rows, keys), self.__table);
         }
         // The rows' names (the first row's), with a model's createdAt and updatedAt added when missing.
         private fn withStamps(rows: Array<HashMap<string, any>>) -> Array<string> {
@@ -502,6 +514,33 @@ namespace orbit {
             if (self.__db != null) { return self.__db; }
             return DB.readConnection(self.__map == null ? "default" : self.__map.connection);
         }
+        // The DB name its statements are logged and cached under ("" while nothing needs one).
+        fn __name() -> string {
+            if (!Sql.busy()) { return ""; }
+            if (self.__db != null) { return DB.nameOf(self.__db); }
+            return DB.key(self.__map == null ? "default" : self.__map.connection);
+        }
+        // Its reads and writes, through Sql (the query log, remember(), invalidation).
+        fn __read(sql: string, args: Array<any>) -> ResultSet {
+            let db = self.readConn();
+            if (!Sql.busy()) { return db.query(sql, args); }
+            return Sql.query(db, self.__name(), sql, args, self.__db == null && db != self.conn(), self.__cacheMs);
+        }
+        fn __readOne(sql: string, args: Array<any>) -> Row {
+            let db = self.readConn();
+            if (!Sql.busy()) { return db.queryOne(sql, args); }
+            return Sql.queryOne(db, self.__name(), sql, args, self.__db == null && db != self.conn(), self.__cacheMs);
+        }
+        fn __readValue(sql: string, args: Array<any>) -> any {
+            let r = self.__readOne(sql, args);
+            return r == null || r.size() == 0 ? null : r.at(0);
+        }
+        fn __readEach(sql: string, args: Array<any>, f: fn(Row)) {
+            let db = self.readConn();
+            if (!Sql.busy()) { db.each(sql, args, f); return; }
+            Sql.each(db, self.__name(), sql, args, f, self.__db == null && db != self.conn());
+        }
+        fn __write(db: Connection, sql: string, args: Array<any>) -> long { return Sql.execute(db, self.__name(), sql, args, self.__table); }
         fn __bindings() -> Array<any> {
             let all = new Array<any>();
             for (a in self.selectArgs) { all.push(a); }
@@ -771,16 +810,16 @@ namespace orbit {
                 a.push(DateTime.now());
             }
             for (x in self.whereArgs()) { a.push(x); }
-            return db.execute("UPDATE " + db.quote(self.__table) + " SET " + sets + self.whereSql(true), a);
+            return self.__write(db, "UPDATE " + db.quote(self.__table) + " SET " + sets + self.whereSql(true), a);
         }
         private fn aggregate(expr: string) -> any {
             if (self.groups.size() > 0 || self.distinctRows || self.unionParts.size() > 0) {
                 let inner = self.__sql("");
-                return self.readConn().queryValue("SELECT " + Str.replace(expr, self.q(self.__alias) + ".", "") + " FROM (" + inner + ") AS " + self.q("__orbit_agg"), self.__bindings());
+                return self.__readValue("SELECT " + Str.replace(expr, self.q(self.__alias) + ".", "") + " FROM (" + inner + ") AS " + self.q("__orbit_agg"), self.__bindings());
             }
             let keep = self.orders;
             self.orders = new Array<string>();
-            let v = self.readConn().queryValue(self.__sql(expr), self.__bindings());
+            let v = self.__readValue(self.__sql(expr), self.__bindings());
             self.orders = keep;
             return v;
         }
@@ -870,7 +909,7 @@ namespace orbit {
         // Every match.
         fn all() -> Array<T> { return self.get(); }
         fn get() -> Array<T> {
-            let rows = self.readConn().query(self.__sql(""), self.__bindings());
+            let rows = self.__read(self.__sql(""), self.__bindings());
             let out = new Array<T>();
             out.reserve(rows.size());
             let extras = self.extraColumns(rows.columns);
@@ -879,7 +918,7 @@ namespace orbit {
             if (self.__withs.size() > 0 && out.size() > 0) {
                 let models = new Array<Model>();
                 for (o in out) { models.push(o as Model); }
-                for (i, w in self.__withs) { Relation.eagerLoad(models, w, self.__withFns[i]); }
+                for (i, w in self.__withs) { Relation.eagerLoad(models, w, self.__withFns[i], self.__cacheMs); }
             }
             return out;
         }
@@ -959,7 +998,7 @@ namespace orbit {
             let at = new Array<int>();                                 // (filled from the first row: captures are copies)
             let extras = new Array<string>();
             let ready = new Array<bool>();
-            self.readConn().each(self.__sql(""), self.__bindings(), fn(row: Row) {
+            self.__readEach(self.__sql(""), self.__bindings(), fn(row: Row) {
                 if (ready.size() == 0) {
                     ready.push(true);
                     for (p in Persister.positions(self.__map, row.columns())) { at.push(p); }
@@ -1064,7 +1103,7 @@ namespace orbit {
             let marks = new Array<string>();
             let args = new Array<any>();
             for (k in values.keys()) { cols.push(db.quote(Builder.ident(k))); marks.push("?"); args.push(values[k]); }
-            return db.insert("INSERT INTO " + db.quote(self.__table) + " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")", args);
+            return Sql.insert(db, self.__name(), "INSERT INTO " + db.quote(self.__table) + " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")", args, self.__table);
         }
         // Inserts the rows (all with the same columns as the first), batched; how many.
         fn insertMany(rows: Array<HashMap<string, any>>) -> long {
@@ -1080,7 +1119,7 @@ namespace orbit {
                 for (k in keys) { a.push(r.getOr(k, null)); }
                 all.push(a);
             }
-            return db.executeMany("INSERT INTO " + db.quote(self.__table) + " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")", all);
+            return Sql.executeMany(db, self.__name(), "INSERT INTO " + db.quote(self.__table) + " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")", all, self.__table);
         }
     }
 }

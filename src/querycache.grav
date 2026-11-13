@@ -1,0 +1,144 @@
+// querycache.grav — remembered query results: a query that says
+// `remember(seconds)` is answered from here, without SQL, until its time is up
+// or Orbit writes to one of the tables it read.
+//
+//   Orbit.cacheQueries()                                  // an in-memory cache (1000 results)
+//   User.where("active", true).remember(60).get()         // from the database, then from memory
+//   User.create(fields("name", "Ada"))                    // a write to users: its cached results go
+//   Orbit.flushQueryCache()                               // or forget them all by hand
+//
+// Results are kept per process. A write Orbit makes (a model's save or delete,
+// a query's update/delete/insert, DB.statement) drops the cached results of
+// the tables it writes; one made elsewhere (another process, a trigger) is seen
+// once their time is up. Nothing is cached, or read from the cache, inside a
+// transaction.
+import "std"
+import "grav-db"
+
+namespace orbit {
+
+    // Where remembered results are kept: MemoryQueryCache, or a store of your own.
+    interface QueryCache {
+        // The rows kept under `key`, or null (none, or their time is up).
+        fn get(key: string) -> ResultSet
+        // Keeps `rows` under `key` for `ttlMs` milliseconds, dropped early when any
+        // of `tags` ("connection\ttable") is invalidated.
+        fn put(key: string, tags: Array<string>, rows: ResultSet, ttlMs: long)
+        // Drops every result tagged `tag`.
+        fn invalidate(tag: string)
+        // Drops everything.
+        fn flush()
+        // Results kept now.
+        fn size() -> int
+    }
+
+    // One remembered result.
+    class CachedResult {
+        public rows: ResultSet
+        public expiresAt: long                // Time.monotonicMs()
+        public tags: Array<string>
+        public seq: long
+        constructor(rows: ResultSet, expiresAt: long, tags: Array<string>, seq: long) {
+            self.rows = rows; self.expiresAt = expiresAt; self.tags = tags; self.seq = seq;
+        }
+    }
+
+    // A QueryCache in this process's memory, for up to `capacity` results (the
+    // oldest go first when it is full). Safe to share between threads.
+    class MemoryQueryCache implements QueryCache {
+        private entries: HashMap<string, CachedResult> = new HashMap<string, CachedResult>()
+        private byTag: HashMap<string, HashSet<string>> = new HashMap<string, HashSet<string>>()
+        // Keys in the order they were put, with the seq they were put with (a key
+        // put again is a newer entry: its older place in the queue is skipped).
+        private order: Deque<string> = new Deque<string>()
+        private orderSeq: Deque<long> = new Deque<long>()
+        private lock: Mutex = new Mutex()
+        private seq: long = 0
+        public capacity: int
+        // Results answered, and asked for but not there.
+        public hits: long = 0
+        public misses: long = 0
+
+        constructor(capacity: int = 1000) {
+            if (capacity < 1) { throw new ValueError("a query cache needs room for at least one result"); }
+            self.capacity = capacity;
+        }
+
+        fn get(key: string) -> ResultSet {
+            self.lock.lock();
+            let e = self.entries.getOr(key, null);
+            if (e != null && e.expiresAt <= Time.monotonicMs()) { self.drop(key); e = null; }
+            if (e == null) { self.misses += 1; } else { self.hits += 1; }
+            self.lock.unlock();
+            return e == null ? null : e.rows;
+        }
+        fn put(key: string, tags: Array<string>, rows: ResultSet, ttlMs: long) {
+            if (ttlMs <= 0) { return; }
+            self.lock.lock();
+            if (self.entries.containsKey(key)) { self.drop(key); }
+            self.seq += 1;
+            self.entries.put(key, new CachedResult(rows, Time.monotonicMs() + ttlMs, tags, self.seq));
+            for (t in tags) {
+                if (!self.byTag.containsKey(t)) { self.byTag.put(t, new HashSet<string>()); }
+                self.byTag[t].add(key);
+            }
+            self.order.pushBack(key);
+            self.orderSeq.pushBack(self.seq);
+            while (self.entries.size() > self.capacity && self.order.size() > 0) {
+                let k = self.order.popFront();
+                let s = self.orderSeq.popFront();
+                let e = self.entries.getOr(k, null);
+                if (e != null && e.seq == s) { self.drop(k); }
+            }
+            // (keys dropped early leave their places in the queue: trim those once it is twice the size)
+            if (self.order.size() > 2 * self.capacity) { self.compact(); }
+            self.lock.unlock();
+        }
+        fn invalidate(tag: string) {
+            self.lock.lock();
+            let keys = self.byTag.getOr(tag, null);
+            if (keys != null) {
+                for (k in keys.toArray()) { self.drop(k); }
+                self.byTag.remove(tag);
+            }
+            self.lock.unlock();
+        }
+        fn flush() {
+            self.lock.lock();
+            self.entries.clear();
+            self.byTag.clear();
+            self.order.clear();
+            self.orderSeq.clear();
+            self.lock.unlock();
+        }
+        fn size() -> int {
+            self.lock.lock();
+            let n = self.entries.size();
+            self.lock.unlock();
+            return n;
+        }
+        // (lock held)
+        private fn drop(key: string) {
+            let e = self.entries.getOr(key, null);
+            if (e == null) { return; }
+            self.entries.remove(key);
+            for (t in e.tags) {
+                let keys = self.byTag.getOr(t, null);
+                if (keys != null) { keys.remove(key); if (keys.isEmpty()) { self.byTag.remove(t); } }
+            }
+        }
+        // (lock held) Rebuilds the queue with only the places still current.
+        private fn compact() {
+            let keys = new Deque<string>();
+            let seqs = new Deque<long>();
+            while (self.order.size() > 0) {
+                let k = self.order.popFront();
+                let s = self.orderSeq.popFront();
+                let e = self.entries.getOr(k, null);
+                if (e != null && e.seq == s) { keys.pushBack(k); seqs.pushBack(s); }
+            }
+            self.order = keys;
+            self.orderSeq = seqs;
+        }
+    }
+}

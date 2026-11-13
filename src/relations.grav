@@ -32,6 +32,8 @@ import "mapping.grav"
 import "db.grav"
 import "builder.grav"
 import "model.grav"
+import "querylog.grav"
+import "querycache.grav"
 
 namespace orbit {
 
@@ -44,6 +46,8 @@ namespace orbit {
         // with(name, f): narrows the eager query (`constraint`), or the next level's (`nestedConstraint`).
         public constraint: fn(Builder) = null
         public nestedConstraint: fn(Builder) = null
+        // The remember() of the query whose with() loads it (-1: none).
+        public cacheMs: long = -1
 
         constructor(parent: Model, related: ClassInfo) {
             self.parent = parent;
@@ -60,6 +64,7 @@ namespace orbit {
 
         // An eager query, before it runs: the nested relations to load with it, and with's constraint.
         fn prepare(q: Builder, nested: string) {
+            if (self.cacheMs > 0) { q.__cacheMs = self.cacheMs; }
             if (nested != "") { q.with(nested, self.nestedConstraint); }
             if (self.constraint != null) { self.constraint(q); }
         }
@@ -85,7 +90,7 @@ namespace orbit {
             return r as Relation;
         }
         // Loads `path` ("posts", "posts.comments") for all of `models` (one query a level).
-        static fn eagerLoad(models: Array<Model>, path: string, f: fn(Builder) = null) {
+        static fn eagerLoad(models: Array<Model>, path: string, f: fn(Builder) = null, cacheMs: long = -1) {
             if (models.size() == 0) { return; }
             let dot = Str.indexOf(path, ".");
             let first = dot > 0 ? path[..dot] : path;
@@ -97,6 +102,7 @@ namespace orbit {
             if (!(r is Relation)) { throw new ValueError(map.info.simpleName() + "." + first + "() is not a relation"); }
             let rel = r as Relation;
             if (rest == "") { rel.constraint = f; } else { rel.nestedConstraint = f; }
+            rel.cacheMs = cacheMs;
             rel.eager(models, rest);
             for (x in models) { x.__names().put(first, rel.key()); }
         }
@@ -446,7 +452,7 @@ namespace orbit {
             let sql = "UPDATE " + db.quote(self.table) + " SET " + Str.join(sets, ", ") + " WHERE " + db.quote(self.foreignPivotKey) + " = ? AND " + db.quote(self.relatedPivotKey) + " = ?";
             if (self.typeColumn != "") { sql = sql + " AND " + db.quote(self.typeColumn) + " = ?"; args.push(self.typeValue); }
             self.parent.__forget(self.key());
-            return db.execute(sql, args);
+            return Sql.execute(db, DB.nameFor(db), sql, args, self.table);
         }
         // Attaches those of `ids` not linked yet, and detaches nothing.
         fn syncWithoutDetaching(ids: Array<any>) {
@@ -464,7 +470,7 @@ namespace orbit {
             let sql = "SELECT " + db.quote(self.relatedPivotKey) + " FROM " + db.quote(self.table) + " WHERE " + db.quote(self.foreignPivotKey) + " = ?";
             if (self.typeColumn != "") { sql = sql + " AND " + db.quote(self.typeColumn) + " = ?"; args.push(self.typeValue); }
             let out = new Array<any>();
-            for (row in db.query(sql, args)) { out.push(row.at(0)); }
+            for (row in Sql.query(db, DB.nameFor(db), sql, args)) { out.push(row.at(0)); }
             return out;
         }
         // A query for the linked objects; each has the pivot's columns in extra("pivot_<column>").
@@ -520,7 +526,7 @@ namespace orbit {
                 if (self.pivotTimes) { r.push(now); r.push(now); }
                 rows.push(r);
             }
-            db.executeMany("INSERT INTO " + db.quote(self.table) + " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")", rows);
+            Sql.executeMany(db, DB.nameFor(db), "INSERT INTO " + db.quote(self.table) + " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")", rows, self.table);
             self.parent.__forget(self.key());
         }
         // Unlinks `id` (an object or key), or every linked object; how many links went.
@@ -543,7 +549,7 @@ namespace orbit {
                 sql = sql + " AND " + db.quote(self.relatedPivotKey) + " IN (" + Str.join(marks, ", ") + ")";
             }
             self.parent.__forget(self.key());
-            return db.execute(sql, args);
+            return Sql.execute(db, DB.nameFor(db), sql, args, self.table);
         }
         // Links exactly `ids`: those missing are attached, others detached.
         fn sync(ids: Array<any>) {
@@ -556,7 +562,7 @@ namespace orbit {
             if (self.typeColumn != "") { sql = sql + " AND " + db.quote(self.typeColumn) + " = ?"; args.push(self.typeValue); }
             let have = new HashSet<string>();
             let gone = new Array<any>();
-            for (row in db.query(sql, args)) {
+            for (row in Sql.query(db, DB.nameFor(db), sql, args)) {
                 let v = row.at(0);
                 have.add("${v}");
                 if (!want.contains("${v}")) { gone.push(v); }
@@ -885,5 +891,19 @@ namespace orbit {
         static fn morphMap(name: string, info: ClassInfo) { TableMap.registerMorph(name, info); }
         // Registers each class's morph name (so morphTo can find them before they are used).
         static fn register(infos: Array<ClassInfo>) { for (i in infos) { TableMap.of(i); } }
+
+        // ── the query cache (remember) ──────────────────────────────────────────
+        // Keeps remember()ed results in this process's memory, up to `capacity` of them.
+        static fn cacheQueries(capacity: int = 1000) -> MemoryQueryCache {
+            let c = new MemoryQueryCache(capacity);
+            Sql.cache = c;
+            return c;
+        }
+        // Keeps them in `store` instead (null: remember() reads the database again).
+        static fn useQueryCache(store: QueryCache) { Sql.cache = store; }
+        static fn queryCache() -> QueryCache { return Sql.cache; }
+        // Forgets every remembered result, or those that read `table` (on connection `name`).
+        static fn flushQueryCache() { if (Sql.cache != null) { Sql.cache.flush(); } }
+        static fn forgetCachedTable(table: string, name: string = "default") { Sql.invalidate(DB.key(name), Str.lower(table)); }
     }
 }

@@ -1,0 +1,366 @@
+// querylog.grav — every statement Orbit sends goes through Sql: the one place
+// that times it, logs it (DB.enableQueryLog, DB.listen), answers it from the
+// query cache (remember), and drops cached results its writes make stale. With
+// nothing logging, listening or cached, each call is a straight call to the
+// connection.
+//
+//   DB.enableQueryLog()
+//   User.with("posts").get()
+//   for (q in DB.getQueryLog()) { print("${q.ms} ms  ${q.sql}") }
+//   DB.listen(fn(q: QueryEvent) { if (q.ms > 100.0) { Log.warn("slow: " + q.toString()) } })
+import "std"
+import "grav-db"
+import "querycache.grav"
+
+namespace orbit {
+
+    // One statement Orbit ran (or answered from the query cache).
+    class QueryEvent {
+        public sql: string
+        public bindings: Array<any>
+        // The DB name it ran on ("default", "reports"; "@..." for an on(db) connection).
+        public connection: string
+        // How long it took, in milliseconds (0 when answered from the cache).
+        public ms: float
+        // Rows read, for a read; rows changed, for a write.
+        public rows: long
+        // Whether it was a read (SELECT), and whether the read went to a read replica.
+        public read: bool
+        public replica: bool = false
+        // Answered from the query cache, without SQL.
+        public cached: bool = false
+        // For executeMany: how many rows of arguments it ran with (bindings are the first row's).
+        public batch: int = 0
+        // The error's message, when it failed ("" when it did not).
+        public error: string = ""
+        // When it started (Time.nowMs()).
+        public at: long
+
+        constructor(sql: string, bindings: Array<any>, connection: string, read: bool) {
+            self.sql = sql; self.bindings = bindings; self.connection = connection; self.read = read;
+            self.ms = 0.0; self.rows = 0; self.at = Time.nowMs();
+        }
+        // The SQL with its bindings after it, and its time: `SELECT ... [1, "Ada"] (0.21 ms)`.
+        fn toString() -> string {
+            let sb = new StringBuilder();
+            sb.append(self.sql);
+            if (self.bindings.size() > 0) {
+                sb.append(" [");
+                for (i, b in self.bindings) { if (i > 0) { sb.append(", "); } sb.append(Sql.show(b)); }
+                sb.append("]");
+            }
+            if (self.batch > 1) { sb.append(" ×").appendInt(self.batch); }
+            sb.append(self.cached ? " (cached)" : " (" + Format.fixed(self.ms, 2) + " ms)");
+            if (self.replica) { sb.append(" (replica)"); }
+            if (self.error != "") { sb.append(" FAILED: ").append(self.error); }
+            return sb.toString();
+        }
+    }
+
+    // The funnel every Orbit statement goes through (see the top of this file).
+    class Sql {
+        // Is anything watching (a log, a listener)? Atomic, read without the lock: a
+        // stale answer only means one event more or less while logging is switched.
+        private static watchOn: AtomicInt = new AtomicInt(0)
+        private static logging: bool = false
+        private static log: Deque<QueryEvent> = new Deque<QueryEvent>()
+        private static listeners: Array<fn(QueryEvent)> = new Array<fn(QueryEvent)>()
+        private static lock: Mutex = new Mutex()
+        // The log keeps the newest this many events (older ones are dropped).
+        public static logLimit: int = 10000
+        // The query cache remember() uses; null: remember() does nothing.
+        public static cache: QueryCache = null
+        // Tags a transaction wrote, per connection: invalidated again when it ends,
+        // so a result cached by another thread meanwhile does not outlive it.
+        private static pending: HashMap<string, HashSet<string>> = new HashMap<string, HashSet<string>>()
+        private static pendingOn: AtomicInt = new AtomicInt(0)
+
+        // ── the query log ────────────────────────────────────────────────────────
+        static fn enableLog() { Sql.lock.lock(); Sql.logging = true; Sql.rewatch(); Sql.lock.unlock(); }
+        static fn disableLog() { Sql.lock.lock(); Sql.logging = false; Sql.rewatch(); Sql.lock.unlock(); }
+        static fn logEnabled() -> bool { return Sql.logging; }
+        static fn entries() -> Array<QueryEvent> {
+            Sql.lock.lock();
+            let out = Sql.log.toArray();
+            Sql.lock.unlock();
+            return out;
+        }
+        static fn clearLog() { Sql.lock.lock(); Sql.log.clear(); Sql.lock.unlock(); }
+        static fn listen(f: fn(QueryEvent)) { Sql.lock.lock(); Sql.listeners.push(f); Sql.rewatch(); Sql.lock.unlock(); }
+        static fn forgetListeners() { Sql.lock.lock(); Sql.listeners.clear(); Sql.rewatch(); Sql.lock.unlock(); }
+        private static fn rewatch() { Sql.watchOn.set(Sql.logging || Sql.listeners.size() > 0 ? 1 : 0); }
+        static fn isWatching() -> bool { return Sql.watchOn.get() != 0; }
+
+        // ── reads ────────────────────────────────────────────────────────────────
+        // `cacheMs` >= 0 (remember) answers from the cache when it can; `tags` are
+        // what a write invalidates it by ("connection\ttable").
+        static fn query(db: Connection, name: string, sql: string, args: Array<any>, replica: bool = false,
+                        cacheMs: long = -1, tags: Array<string> = null) -> ResultSet {
+            let useCache = cacheMs > 0 && Sql.cache != null && !db.inTransaction();
+            let key = "";
+            if (useCache) {
+                key = Sql.cacheKey(name, sql, args);
+                let hit = Sql.cache.get(key);
+                if (hit != null) {
+                    if (Sql.isWatching()) {
+                        let e = new QueryEvent(sql, args, name, true);
+                        e.cached = true;
+                        e.rows = hit.size() as long;
+                        Sql.emit(e);
+                    }
+                    return hit;
+                }
+            }
+            let rows: ResultSet = null;
+            if (!Sql.isWatching()) {
+                rows = db.query(sql, args);
+            } else {
+                let e = new QueryEvent(sql, args, name, true);
+                e.replica = replica;
+                let t0 = Time.monotonicNs();
+                try { rows = db.query(sql, args); }
+                catch (x: Exception) { Sql.failed(e, t0, x); throw x; }
+                e.ms = Sql.since(t0);
+                e.rows = rows.size() as long;
+                Sql.emit(e);
+            }
+            if (useCache) { Sql.cache.put(key, tags == null ? Sql.tagsOf(name, Sql.tablesOf(sql)) : tags, rows, cacheMs); }
+            return rows;
+        }
+        // The first row, or null (no further rows are read).
+        static fn queryOne(db: Connection, name: string, sql: string, args: Array<any>, replica: bool = false,
+                           cacheMs: long = -1, tags: Array<string> = null) -> Row {
+            if (cacheMs > 0 && Sql.cache != null) {
+                let rows = Sql.query(db, name, sql, args, replica, cacheMs, tags);
+                return rows.size() == 0 ? null : rows.get(0);
+            }
+            if (!Sql.isWatching()) { return db.queryOne(sql, args); }
+            let e = new QueryEvent(sql, args, name, true);
+            e.replica = replica;
+            let t0 = Time.monotonicNs();
+            let r: Row = null;
+            try { r = db.queryOne(sql, args); }
+            catch (x: Exception) { Sql.failed(e, t0, x); throw x; }
+            e.ms = Sql.since(t0);
+            e.rows = r == null ? 0 : 1;
+            Sql.emit(e);
+            return r;
+        }
+        // The first column of the first row, or null.
+        static fn queryValue(db: Connection, name: string, sql: string, args: Array<any>, replica: bool = false,
+                             cacheMs: long = -1, tags: Array<string> = null) -> any {
+            let r = Sql.queryOne(db, name, sql, args, replica, cacheMs, tags);
+            return r == null || r.size() == 0 ? null : r.at(0);
+        }
+        // Each row as it is read (never cached: the rows are not kept).
+        static fn each(db: Connection, name: string, sql: string, args: Array<any>, f: fn(Row), replica: bool = false) {
+            if (!Sql.isWatching()) { db.each(sql, args, f); return; }
+            let e = new QueryEvent(sql, args, name, true);
+            e.replica = replica;
+            let n = new Array<long>();
+            n.push(0);
+            let t0 = Time.monotonicNs();
+            try { db.each(sql, args, fn(row: Row) { n[0] = n[0] + 1; f(row); }); }
+            catch (x: Exception) { Sql.failed(e, t0, x); throw x; }
+            e.ms = Sql.since(t0);
+            e.rows = n[0];
+            Sql.emit(e);
+        }
+
+        // ── writes ───────────────────────────────────────────────────────────────
+        // Each drops the cached results of `table` on `name` ("" for a table it
+        // cannot tell: every cached result of `name`).
+        static fn execute(db: Connection, name: string, sql: string, args: Array<any>, table: string) -> long {
+            let n = 0 as long;
+            if (!Sql.isWatching()) {
+                n = db.execute(sql, args);
+            } else {
+                let e = new QueryEvent(sql, args, name, false);
+                let t0 = Time.monotonicNs();
+                try { n = db.execute(sql, args); }
+                catch (x: Exception) { Sql.failed(e, t0, x); throw x; }
+                e.ms = Sql.since(t0);
+                e.rows = n;
+                Sql.emit(e);
+            }
+            Sql.wrote(db, name, table);
+            return n;
+        }
+        // An INSERT; the new row's id.
+        static fn insert(db: Connection, name: string, sql: string, args: Array<any>, table: string) -> long {
+            let id = 0 as long;
+            if (!Sql.isWatching()) {
+                id = db.insert(sql, args);
+            } else {
+                let e = new QueryEvent(sql, args, name, false);
+                let t0 = Time.monotonicNs();
+                try { id = db.insert(sql, args); }
+                catch (x: Exception) { Sql.failed(e, t0, x); throw x; }
+                e.ms = Sql.since(t0);
+                e.rows = 1;
+                Sql.emit(e);
+            }
+            Sql.wrote(db, name, table);
+            return id;
+        }
+        static fn executeMany(db: Connection, name: string, sql: string, rows: Array<Array<any>>, table: string) -> long {
+            let n = 0 as long;
+            if (!Sql.isWatching()) {
+                n = db.executeMany(sql, rows);
+            } else {
+                let e = new QueryEvent(sql, rows.size() > 0 ? rows[0] : new Array<any>(), name, false);
+                e.batch = rows.size();
+                let t0 = Time.monotonicNs();
+                try { n = db.executeMany(sql, rows); }
+                catch (x: Exception) { Sql.failed(e, t0, x); throw x; }
+                e.ms = Sql.since(t0);
+                e.rows = n;
+                Sql.emit(e);
+            }
+            Sql.wrote(db, name, table);
+            return n;
+        }
+        // Statements without arguments (schema changes, scripts): every cached
+        // result of `name` goes.
+        static fn exec(db: Connection, name: string, sql: string) {
+            if (!Sql.isWatching()) {
+                db.exec(sql);
+            } else {
+                let e = new QueryEvent(sql, new Array<any>(), name, false);
+                let t0 = Time.monotonicNs();
+                try { db.exec(sql); }
+                catch (x: Exception) { Sql.failed(e, t0, x); throw x; }
+                e.ms = Sql.since(t0);
+                Sql.emit(e);
+            }
+            Sql.wrote(db, name, "");
+        }
+
+        // ── the cache's bookkeeping ──────────────────────────────────────────────
+        // The tag a write to `table` on `name` invalidates ("" table: the connection's own tag).
+        static fn tag(name: string, table: string) -> string { return name + "\t" + table; }
+        // Drops the cached results a write to `table` made stale; inside a
+        // transaction, again when it ends (Sql.ended).
+        static fn wrote(db: Connection, name: string, table: string) {
+            if (Sql.cache == null) { return; }
+            Sql.invalidate(name, table);
+            if (db.inTransaction()) {
+                Sql.lock.lock();
+                if (!Sql.pending.containsKey(name)) { Sql.pending.put(name, new HashSet<string>()); }
+                Sql.pending[name].add(table);
+                Sql.pendingOn.set(1);
+                Sql.lock.unlock();
+            }
+        }
+        // (Every cached result carries its connection's own tag too, so "" drops them all.)
+        static fn invalidate(name: string, table: string) {
+            if (Sql.cache != null) { Sql.cache.invalidate(Sql.tag(name, table)); }
+        }
+        // The tags of a read of `tables` on `name`.
+        static fn tagsOf(name: string, tables: Array<string>) -> Array<string> {
+            let out = new Array<string>();
+            out.push(Sql.tag(name, ""));
+            for (t in tables) { let g = Sql.tag(name, t); if (!out.contains(g)) { out.push(g); } }
+            return out;
+        }
+        // A transaction on `name` committed or rolled back: what it wrote is invalidated again.
+        static fn ended(name: string) {
+            if (Sql.pendingOn.get() == 0 || Sql.cache == null) { return; }
+            Sql.lock.lock();
+            let tables = Sql.pending.getOr(name, null);
+            if (tables != null) { Sql.pending.remove(name); }
+            Sql.pendingOn.set(Sql.pending.size() > 0 ? 1 : 0);
+            Sql.lock.unlock();
+            if (tables != null) { for (t in tables.toArray()) { Sql.invalidate(name, t); } }
+        }
+        // The tables `sql` reads: each name after a FROM or JOIN (quoted or not;
+        // a subquery's own FROM counts too), lowercased, without a schema prefix.
+        static fn tablesOf(sql: string) -> Array<string> {
+            let out = new Array<string>();
+            let up = Str.upper(sql);
+            for (word in ["FROM", "JOIN"]) {
+                let at = 0;
+                while (true) {
+                    let i = Str.indexFrom(up, word, at);
+                    if (i < 0) { break; }
+                    at = i + word.length;
+                    let before = i == 0 ? (' ' as byte) : sql[i - 1];
+                    if (before.isLetterOrDigit() || before == ('_' as byte)) { continue; }
+                    let j = at;
+                    if (j < sql.length && (sql[j].isLetterOrDigit() || sql[j] == ('_' as byte))) { continue; }
+                    while (j < sql.length && (sql[j] == (' ' as byte) || sql[j] == ('\n' as byte) || sql[j] == ('\t' as byte))) { j += 1; }
+                    let name = Sql.identAt(sql, j);
+                    if (name != "" && !out.contains(name)) { out.push(name); }
+                }
+            }
+            return out;
+        }
+        // The (possibly quoted, possibly schema.qualified) identifier at `j`, its last part lowercased; "" for none.
+        private static fn identAt(sql: string, j: int) -> string {
+            let last = "";
+            let k = j;
+            while (k < sql.length) {
+                let c = sql[k];
+                let part = "";
+                if (c == ('"' as byte) || c == ('`' as byte) || c == ('[' as byte)) {
+                    let close = c == ('[' as byte) ? (']' as byte) : c;
+                    let e = k + 1;
+                    while (e < sql.length && sql[e] != close) { e += 1; }
+                    part = sql[k + 1..e];
+                    k = e + 1;
+                } else {
+                    let e = k;
+                    while (e < sql.length && (sql[e].isLetterOrDigit() || sql[e] == ('_' as byte))) { e += 1; }
+                    part = sql[k..e];
+                    k = e;
+                }
+                if (part == "") { break; }
+                last = Str.lower(part);
+                if (k < sql.length && sql[k] == ('.' as byte)) { k += 1; continue; }
+                break;
+            }
+            return last;
+        }
+        // Whether a statement needs its connection's name (for the log, or the cache).
+        static fn busy() -> bool { return Sql.isWatching() || Sql.cache != null; }
+        // The cache key of a read: the connection, the SQL, and each argument with its kind.
+        static fn cacheKey(name: string, sql: string, args: Array<any>) -> string {
+            let sb = new StringBuilder();
+            sb.append(name).append("\n").append(sql);
+            for (a in args) {
+                sb.append("\n");
+                if (a == null) { sb.append("n"); }
+                else if (a is string) { sb.append("s").append(a as string); }
+                else if (a is bool) { sb.append((a as bool) ? "t" : "f"); }
+                else { sb.append("v").append("${a}"); }
+            }
+            return sb.toString();
+        }
+        // A name for a connection no DB name stands for (a query's on(db)).
+        static fn anonymous(db: Connection) -> string { let p = %{ (long long)(uintptr_t)db %} as long; return "@${p}"; }
+
+        // ── internals ────────────────────────────────────────────────────────────
+        private static fn since(t0: long) -> float { return ((Time.monotonicNs() - t0) as float) / 1000000.0; }
+        private static fn failed(e: QueryEvent, t0: long, x: Exception) {
+            e.ms = Sql.since(t0);
+            e.error = x.message();
+            Sql.emit(e);
+        }
+        private static fn emit(e: QueryEvent) {
+            Sql.lock.lock();
+            if (Sql.logging) {
+                Sql.log.pushBack(e);
+                while (Sql.log.size() > Sql.logLimit && Sql.log.size() > 0) { Sql.log.popFront(); }
+            }
+            let fs = Sql.listeners.size() == 0 ? null : Sql.listeners.toArray();
+            Sql.lock.unlock();
+            if (fs != null) { for (f in fs) { f(e); } }
+        }
+        // A binding as it reads in a log line: strings quoted, the rest as they print.
+        static fn show(v: any) -> string {
+            if (v == null) { return "null"; }
+            if (v is string) { return "\"" + Str.replace(v as string, "\"", "\\\"") + "\""; }
+            return "${v}";
+        }
+    }
+}

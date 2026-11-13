@@ -20,6 +20,7 @@ import "std"
 import "grav-db"
 import "mapping.grav"
 import "db.grav"
+import "querylog.grav"
 import "builder.grav"
 import "relations.grav"
 import "schema.grav"
@@ -202,9 +203,9 @@ namespace orbit {
                 (cols.size() == 0 ? (db.driver() == "mysql" ? " () VALUES ()" : " DEFAULT VALUES") : " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")");
             if (numbered) {
                 if (db.driver() == "postgres") { sql = sql + " RETURNING " + db.quote(map.id.column); }
-                map.id.field.set(obj, db.insert(sql, args));
+                map.id.field.set(obj, Sql.insert(db, DB.nameFor(db), sql, args, map.table));
             } else {
-                db.execute(sql, args);
+                Sql.execute(db, DB.nameFor(db), sql, args, map.table);
             }
             if (obj is Model) { (obj as Model).__exists = true; }
         }
@@ -220,7 +221,7 @@ namespace orbit {
             }
             if (sets.size() == 0) { return 0; }
             args.push(id.field.get(obj));
-            return db.execute("UPDATE " + db.quote(map.table) + " SET " + Str.join(sets, ", ") + " WHERE " + db.quote(id.column) + " = ?", args);
+            return Sql.execute(db, DB.nameFor(db), "UPDATE " + db.quote(map.table) + " SET " + Str.join(sets, ", ") + " WHERE " + db.quote(id.column) + " = ?", args, map.table);
         }
         // Deletes `obj`'s row (with `force` even for a @SoftDeletes class); whether there was one.
         static fn delete(obj: any, map: TableMap, db: Connection, force: bool) -> bool {
@@ -238,7 +239,7 @@ namespace orbit {
             }
             let args = new Array<any>();
             args.push(id.field.get(obj));
-            let gone = db.execute("DELETE FROM " + db.quote(map.table) + " WHERE " + db.quote(id.column) + " = ?", args) > 0;
+            let gone = Sql.execute(db, DB.nameFor(db), "DELETE FROM " + db.quote(map.table) + " WHERE " + db.quote(id.column) + " = ?", args, map.table) > 0;
             if (obj is Model) { (obj as Model).__exists = false; }
             map.fire("deleted", obj);
             if (goingThrough) { map.fire("forceDeleted", obj); }
@@ -488,7 +489,7 @@ namespace orbit {
         static fn createTable() { let map = TableMap.of(reflect(Self)); Schema.createFor(map, DB.connection(map.connection)); }
         static fn dropTable() { let map = TableMap.of(reflect(Self)); DB.connection(map.connection).exec("DROP TABLE IF EXISTS " + DB.connection(map.connection).quote(map.table)); }
         // Deletes every row.
-        static fn truncate() { let map = TableMap.of(reflect(Self)); let db = DB.connection(map.connection); db.exec("DELETE FROM " + db.quote(map.table)); }
+        static fn truncate() { let map = TableMap.of(reflect(Self)); let db = DB.connection(map.connection); Sql.execute(db, DB.nameFor(db), "DELETE FROM " + db.quote(map.table), new Array<any>(), map.table); }
         static fn tableName() -> string { return TableMap.of(reflect(Self)).table; }
 
         // ── this object ──────────────────────────────────────────────────────────
