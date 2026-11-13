@@ -465,3 +465,72 @@ test "more of Eloquent: changes, upserts, pivots, through, schema" {
     assertEq(Schema.hasColumn("shirts", "remember_token"), false)
     for (t in ["shirts", "notes", "citizens", "countries"]) { Schema.dropIfExists(t) }
 }
+
+// Accessors, mutators and casts (Eloquent's get/set attributes and $casts).
+class Money {
+    public cents: long
+    constructor(cents: long) { self.cents = cents }
+    fn toString() -> string { return "$" + "${self.cents / 100}." + Str.padLeft("${self.cents % 100}", 2, "0") }
+}
+class MoneyCast extends Cast {
+    fn get(value: any) -> any { return new Money(value is long ? value as long : Integer.parseOr("${value}", 0)) }
+    fn set(value: any) -> any { return (value as Money).cents }
+    fn column() -> string { return "long" }
+}
+@Appends("label")
+class Order extends Model {
+    public id: long = 0
+    public first: string = ""
+    public last: string = ""
+    @Hidden public code: string = ""
+    @Cast("money") public total: Money = null
+    @Cast("json") public options: HashMap<string, any> = null
+    @Cast("csv") public tags: Array<string> = null
+    // An accessor in toMap (@Appended), and its mutator (fill, create and update use it).
+    @Appended get customer() -> string { return self.first + " " + self.last }
+    set customer(v: string) { let i = Str.indexOf(v, " "); self.first = v[..i]; self.last = v[i + 1..] }
+    get label() -> string { return Str.upper(self.code) + " " + "${self.total}" }
+    // Not in toMap unless appended.
+    get shout() -> string { return Str.upper(self.customer) }
+    // A mutator mass assignment leaves alone.
+    @Guarded set secretCode(v: string) { self.code = v }
+}
+
+class Unregistered extends Model {
+    public id: long = 0
+    @Cast("cents") public amount: Money = null
+}
+
+test "accessors, mutators and casts" {
+    setUp()
+    Casts.register("money", new MoneyCast())
+    Schema.dropIfExists("orders")
+    Order.createTable()
+    let opts = new HashMap<string, any>()
+    opts.put("gift", true)
+    opts.put("note", "ring twice")
+    let tags = new Array<string>()
+    tags.push("new")
+    tags.push("vip")
+    let o = Order.create(fields("customer", "Ada Lovelace", "code", "a1", "total", new Money(1999), "options", opts, "tags", tags, "secretCode", "nope"))
+    assertEq("${o.first}|${o.last}|${o.code}", "Ada|Lovelace|a1")
+    let back = Order.find(o.id)
+    assertEq("${back.total} ${back.options["gift"]} ${back.options["note"]} ${back.tags}", "$19.99 true ring twice [\"new\", \"vip\"]")
+    let m = back.toMap()
+    assertEq("${m["customer"]}|${m["label"]}|${m.containsKey("shout")}|${m.containsKey("code")}", "Ada Lovelace|A1 $19.99|false|false")
+    assertEq("${back.append(["shout"]).toMap()["shout"]} ${back.makeHidden(["label"]).toMap().containsKey("label")}", "ADA LOVELACE false")
+    assertEq(Str.contains(back.toJson(), "\"customer\": \"Ada Lovelace\"") || Str.contains(back.toJson(), "\"customer\":\"Ada Lovelace\""), true)
+    // A change inside a cast value is a change; the snapshot keeps the column's form.
+    assertEq(back.isDirty(), false)
+    back.options.put("gift", false)
+    back.tags.push("late")
+    assertEq("${back.isDirty("options")} ${back.isDirty("tags")} ${back.isDirty("total")} ${back.getOriginal("tags")}", "true true false [\"new\", \"vip\"]")
+    back.update(fields("customer", "Grace Hopper", "total", new Money(500)))
+    let again = Order.find(o.id)
+    assertEq("${again.customer} ${again.total} ${again.options["gift"]} ${again.tags.size()}", "Grace Hopper $5.00 false 3")
+    // A cast name nobody registered is an error naming the field.
+    let msg = ""
+    try { Unregistered.count() } catch (e: StateError) { msg = e.message() }
+    assertEq(msg, "Unregistered.amount is @Cast(\"cents\"), and no cast has that name: Casts.register it first")
+    Schema.dropIfExists("orders")
+}
