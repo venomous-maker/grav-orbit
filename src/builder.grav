@@ -46,8 +46,12 @@ namespace orbit {
         private cursorCol: string = ""
         private cursorVal: any = null
         private off: long = -1
-        private lockRows: bool = false
+        private lockMode: string = ""                              // "update" or "share"
         public __withs: Array<string> = new Array<string>()
+        public __withFns: Array<fn(Builder)> = new Array<fn(Builder)>()   // (with's constraints, parallel; null for none)
+        // union / unionAll: queries whose rows are added to this one's.
+        private unionParts: Array<Builder> = new Array<Builder>()
+        private unionAlls: Array<bool> = new Array<bool>()
         // Global scopes (behaviors' apply), by name: their conditions and arguments.
         private scopeNames: Array<string> = new Array<string>()
         private scopeSqls: Array<string> = new Array<string>()
@@ -118,6 +122,45 @@ namespace orbit {
         // A condition in SQL, with `?` for its arguments.
         fn whereRaw(sql: string, args: Array<any> = new Array<any>()) -> Self { return self.condArgs(" AND ", "(" + sql + ")", args); }
         fn orWhereRaw(sql: string, args: Array<any> = new Array<any>()) -> Self { return self.condArgs(" OR ", "(" + sql + ")", args); }
+        // `name` is (not) among the values a subquery selects: whereIn("id", Post.query().select(["userId"])).
+        fn whereIn(name: string, sub: Builder) -> Self { return self.inSub(" AND ", name, sub, false); }
+        fn whereNotIn(name: string, sub: Builder) -> Self { return self.inSub(" AND ", name, sub, true); }
+        fn orWhereIn(name: string, sub: Builder) -> Self { return self.inSub(" OR ", name, sub, false); }
+        // Rows for which a subquery finds something (correlate it with whereColumn("posts.user_id", "=", "users.id")).
+        fn whereExists(sub: Builder) -> Self { return self.condArgs(" AND ", "EXISTS (" + sub.__subSql("1") + ")", sub.__condArgs()); }
+        fn whereNotExists(sub: Builder) -> Self { return self.condArgs(" AND ", "NOT EXISTS (" + sub.__subSql("1") + ")", sub.__condArgs()); }
+        fn orWhereExists(sub: Builder) -> Self { return self.condArgs(" OR ", "EXISTS (" + sub.__subSql("1") + ")", sub.__condArgs()); }
+        // Words in text columns: MySQL's MATCH ... AGAINST (the columns need a fullText index),
+        // PostgreSQL's full-text search, and on SQLite each word in one of the columns (LIKE).
+        fn whereFullText(names: Array<string>, text: string) -> Self { return self.fullText(" AND ", names, text); }
+        fn orWhereFullText(names: Array<string>, text: string) -> Self { return self.fullText(" OR ", names, text); }
+        // Rows belonging to `owner`: its BelongsTo relation (by default the one named after its class, camelCase).
+        fn whereBelongsTo(owner: Model, relation: string = "") -> Self {
+            let keys = self.ownerKeys(ClassInfo.of(owner), relation);
+            return self.where(keys[0].field.name, keys[1].field.get(owner));
+        }
+        // Rows belonging to any of `owners` (all of one class).
+        fn whereBelongsTo(owners: Array<Model>, relation: string = "") -> Self {
+            if (owners.size() == 0) { return self.cond(" AND ", "1 = 0"); }
+            let keys = self.ownerKeys(ClassInfo.of(owners[0]), relation);
+            let ids = new Array<any>();
+            for (o in owners) { ids.push(keys[1].field.get(o)); }
+            return self.whereIn(keys[0].field.name, ids);
+        }
+        // Applies the model's local scope `name`: its method marked @Scope, given this query (and `args`).
+        //   @Scope fn popular(q: Builder, min: int) { q.where("votes", ">", min) }     User.scope("popular", [100])
+        fn scope(name: string, args: Array<any> = new Array<any>()) -> Self {
+            if (self.__map == null) { throw new StateError("scopes belong to models: DB.table queries have none"); }
+            let m = self.__map.info.method(name);
+            if (m == null || !m.has("Scope")) {
+                throw new ValueError(self.__map.info.simpleName() + " has no scope '" + name + "' (a method marked @Scope taking the query first)");
+            }
+            let a = new Array<any>();
+            a.push(self);
+            for (x in args) { a.push(x); }
+            m.invoke(self.__map.info.create(), a);
+            return self;
+        }
         // Applies `f` when `condition` holds (a filter that is optional).
         fn when(condition: bool, f: fn(Builder)) -> Self { if (condition) { f(self); } return self; }
         // Applies `f` unless `condition` holds.
@@ -159,13 +202,22 @@ namespace orbit {
         private fn withAggregate(relation: string, agg: string, name: string, word: string) -> Self {
             let inner = self.relationExistence(relation);
             self.extraSelects.push("(" + inner.__subSql(agg + "(" + inner.col(name) + ")") + ") AS " +
-                                   self.q(Naming.snake(relation) + "_" + word + "_" + Naming.snake(name)));
+                self.q(Naming.snake(relation) + "_" + word + "_" + Naming.snake(name)));
             for (a in inner.__bindings()) { self.selectArgs.push(a); }
             return self;
         }
         // Loads `relation` (one query for all the rows; "posts.comments" loads both) with the results.
-        fn with(relation: string) -> Self { self.__withs.push(relation); return self; }
-        fn with(relations: Array<string>) -> Self { for (r in relations) { self.__withs.push(r); } return self; }
+        fn with(relation: string) -> Self { self.__withs.push(relation); self.__withFns.push(null); return self; }
+        fn with(relations: Array<string>) -> Self { for (r in relations) { self.__withs.push(r); self.__withFns.push(null); } return self; }
+        // Loads `relation` narrowed by `f` (its last part: with("posts.comments", f) narrows the comments).
+        fn with(relation: string, f: fn(Builder)) -> Self { self.__withs.push(relation); self.__withFns.push(f); return self; }
+        // whereHas and with, with the same condition: the rows that have matches, and just those matches loaded.
+        fn withWhereHas(relation: string, f: fn(Builder)) -> Self { self.whereHas(relation, f); return self.with(relation, f); }
+        // Rows whose polymorphic `relation` (a morphTo) points at one of `types` (morph names) matching `f`.
+        fn whereHasMorph(relation: string, types: Array<string>, f: fn(Builder)) -> Self { return self.morphCond(" AND ", relation, types, f, false); }
+        fn orWhereHasMorph(relation: string, types: Array<string>, f: fn(Builder)) -> Self { return self.morphCond(" OR ", relation, types, f, false); }
+        fn whereDoesntHaveMorph(relation: string, types: Array<string>, f: fn(Builder)) -> Self { return self.morphCond(" AND ", relation, types, f, true); }
+        fn hasMorph(relation: string, types: Array<string>) -> Self { return self.morphCond(" AND ", relation, types, null, false); }
         // Adds `<relation>_count` (snake_case) to each row: how many it has; read with model.countOf("posts").
         fn withCount(relation: string) -> Self { return self.withCount(relation, null); }
         fn withCount(relation: string, f: fn(Builder)) -> Self {
@@ -228,6 +280,17 @@ namespace orbit {
             return self;
         }
         fn distinct() -> Self { self.distinctRows = true; return self; }
+        // A subquery's value as one more column, `alias` (read with extra(alias)):
+        //   User.query().selectSub(Post.query().select(["title"]).whereColumn("posts.user_id", "=", "users.id").latest().limit(1), "last_post")
+        fn selectSub(sub: Builder, alias: string) -> Self {
+            self.extraSelects.push("(" + sub.__sql("") + ") AS " + self.q(Builder.ident(alias)));
+            for (a in sub.__bindings()) { self.selectArgs.push(a); }
+            return self;
+        }
+        // Adds the rows of `other` (the same columns), without duplicates (unionAll: with them).
+        // This query's order, limit and offset apply to all of them; other's own are left out.
+        fn union(other: Builder) -> Self { self.unionParts.push(other); self.unionAlls.push(false); return self; }
+        fn unionAll(other: Builder) -> Self { self.unionParts.push(other); self.unionAlls.push(true); return self; }
         // INNER JOIN `table` ON first op second (`join("posts", "users.id", "=", "posts.user_id")`).
         fn join(table: string, first: string, op: string, second: string) -> Self { return self.joinWith("INNER", table, first, op, second); }
         fn leftJoin(table: string, first: string, op: string, second: string) -> Self { return self.joinWith("LEFT", table, first, op, second); }
@@ -236,7 +299,7 @@ namespace orbit {
         // `having("total", ">", 10)` (a selected alias or a field), or havingRaw for an expression.
         fn having(name: string, op: string, value: any) -> Self {
             let lhs = self.__map != null && self.__map.find(name) != null ? self.col(name)
-                    : self.aliases.containsKey(name) ? self.aliases[name] : self.q(Builder.ident(name));
+            : self.aliases.containsKey(name) ? self.aliases[name] : self.q(Builder.ident(name));
             self.havingOps.push(" AND ");
             self.havings.push(lhs + " " + Builder.operator(op) + " ?");
             self.havingArgs.push(value);
@@ -273,7 +336,9 @@ namespace orbit {
         // Page `page` (from 1) of `perPage` rows.
         fn forPage(page: long, perPage: long) -> Self { self.lim = perPage; self.off = (page - 1) * perPage; return self; }
         // Locks the rows it reads until the transaction ends (MySQL, PostgreSQL).
-        fn lockForUpdate() -> Self { self.lockRows = true; return self; }
+        fn lockForUpdate() -> Self { self.lockMode = "update"; return self; }
+        // Locks them against changes (others may read and share-lock them) until the transaction ends.
+        fn sharedLock() -> Self { self.lockMode = "share"; return self; }
 
         // ── answers ──────────────────────────────────────────────────────────────
         fn count() -> long { return Builder.toLong(self.aggregate("COUNT(*)")); }
@@ -289,7 +354,7 @@ namespace orbit {
         fn sum(name: string) -> Decimal {
             let v = self.aggregate("SUM(" + self.col(name) + ")");
             return v == null ? Decimal.of(0) : v is Decimal ? v as Decimal : v is long ? Decimal.of(v as long) :
-                   v is float ? Decimal.fromFloat(v as float) : Decimal.parse("${v}");
+                v is float ? Decimal.fromFloat(v as float) : Decimal.parse("${v}");
         }
         // The mean of a column (0 for no rows).
         fn avg(name: string) -> float {
@@ -394,7 +459,7 @@ namespace orbit {
             for (k in keys) { cols.push(db.quote(self.column(k))); marks.push("?"); }
             let head = d == "sqlite" ? "INSERT OR IGNORE INTO " : d == "mysql" ? "INSERT IGNORE INTO " : "INSERT INTO ";
             let sql = head + db.quote(self.__table) + " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")" +
-                      (d == "postgres" ? " ON CONFLICT DO NOTHING" : "");
+                (d == "postgres" ? " ON CONFLICT DO NOTHING" : "");
             return db.executeMany(sql, self.rowArgs(rows, keys));
         }
         // The rows' names (the first row's), with a model's createdAt and updatedAt added when missing.
@@ -435,10 +500,47 @@ namespace orbit {
             for (a in self.selectArgs) { all.push(a); }
             for (a in self.whereArgs()) { all.push(a); }
             for (a in self.havingArgs) { all.push(a); }
+            for (u in self.unionParts) { for (a in u.__coreBindings()) { all.push(a); } }
+            return all;
+        }
+        // (A union part's: the columns', conditions' and havings' arguments.)
+        fn __coreBindings() -> Array<any> {
+            let all = new Array<any>();
+            for (a in self.selectArgs) { all.push(a); }
+            for (a in self.whereArgs()) { all.push(a); }
+            for (a in self.havingArgs) { all.push(a); }
             return all;
         }
         // SELECT `what` (its columns when "") FROM ... with every clause.
         fn __sql(what: string) -> string {
+            let db = self.conn();
+            let sb = new StringBuilder();
+            if (self.unionParts.size() > 0 && what == "") {
+                // (base) UNION (others): as a derived table, so the order and limit cover them all
+                sb.append("SELECT * FROM (");
+                sb.append(self.__coreSql(""));
+                for (i, u in self.unionParts) { sb.append(self.unionAlls[i] ? " UNION ALL " : " UNION "); sb.append(u.__coreSql("")); }
+                sb.append(") AS ");
+                sb.append(db.quote(self.__alias));
+            } else {
+                sb.append(self.__coreSql(what));
+            }
+            if (self.orders.size() > 0 && !Str.startsWith(what, "COUNT(") ) { sb.append(" ORDER BY "); sb.append(Str.join(self.orders, ", ")); }
+            if (self.lim >= 0) { sb.append(" LIMIT ${self.lim}"); }
+            if (self.off > 0) {
+                if (self.lim < 0) {
+                    let d = db.driver();
+                    sb.append(d == "mysql" ? " LIMIT 18446744073709551615" : d == "sqlite" ? " LIMIT -1" : "");
+                }
+                sb.append(" OFFSET ${self.off}");
+            }
+            if (self.lockMode != "" && db.driver() != "sqlite") {
+                sb.append(self.lockMode == "update" ? " FOR UPDATE" : db.driver() == "mysql" ? " LOCK IN SHARE MODE" : " FOR SHARE");
+            }
+            return sb.toString();
+        }
+        // SELECT ... FROM ... WHERE ... GROUP BY ... HAVING ... (no order, paging or unions).
+        fn __coreSql(what: string) -> string {
             let db = self.conn();
             let sb = new StringBuilder();
             sb.append(self.distinctRows ? "SELECT DISTINCT " : "SELECT ");
@@ -454,16 +556,6 @@ namespace orbit {
                 sb.append(" HAVING ");
                 for (i, h in self.havings) { if (i > 0) { sb.append(self.havingOps[i]); } sb.append(h); }
             }
-            if (self.orders.size() > 0 && !Str.startsWith(what, "COUNT(") ) { sb.append(" ORDER BY "); sb.append(Str.join(self.orders, ", ")); }
-            if (self.lim >= 0) { sb.append(" LIMIT ${self.lim}"); }
-            if (self.off > 0) {
-                if (self.lim < 0) {
-                    let d = db.driver();
-                    sb.append(d == "mysql" ? " LIMIT 18446744073709551615" : d == "sqlite" ? " LIMIT -1" : "");
-                }
-                sb.append(" OFFSET ${self.off}");
-            }
-            if (self.lockRows && db.driver() != "sqlite") { sb.append(" FOR UPDATE"); }
             return sb.toString();
         }
         // A subquery: SELECT `what` FROM ... WHERE ... (no order or paging).
@@ -497,6 +589,8 @@ namespace orbit {
         }
         // `table.column` (quoted) for a field name, column name or `table.column`.
         fn col(name: string) -> string {
+            let arrow = Str.indexOf(name, "->");
+            if (arrow > 0) { return self.jsonPath(self.col(name[..arrow]), name[arrow + 2..]); }
             let dot = Str.indexOf(name, ".");
             if (dot > 0) {
                 let t = Builder.ident(name[..dot]);
@@ -556,6 +650,17 @@ namespace orbit {
                 if (o == "=") { return self.cond(join, c + " IS NULL"); }
                 if (o == "!=" || o == "<>") { return self.cond(join, c + " IS NOT NULL"); }
             }
+            if (Str.indexOf(name, "->") > 0 && value != null) {    // a JSON path reads as text (SQLite: as the JSON value)
+                let d = self.conn().driver();
+                if (value is bool && d != "sqlite") { return self.condArgs(join, c + " " + o + " ?", Builder.one((value as bool) ? "true" : "false")); }
+                if ((value is long || value is int || value is float || value is Decimal) && d == "postgres") {
+                    return self.condArgs(join, "CAST(" + c + " AS NUMERIC) " + o + " ?", Builder.one(value));
+                }
+            }
+            if (value is Builder) {                                   // where("votes", ">", sub): a subquery's value
+                let sub = value as Builder;
+                return self.condArgs(join, c + " " + o + " (" + sub.__sql("") + ")", sub.__bindings());
+            }
             if (o == "ILIKE" && self.conn().driver() != "postgres") { return self.condArgs(join, "LOWER(" + c + ") LIKE LOWER(?)", Builder.one(value)); }
             return self.condArgs(join, c + " " + o + " ?", Builder.one(value));
         }
@@ -573,6 +678,65 @@ namespace orbit {
             let marks = new StringBuilder();
             for (i in 0..values.size()) { marks.append(i == 0 ? "?" : ", ?"); }
             return self.condArgs(join, self.col(name) + (negate ? " NOT IN (" : " IN (") + marks.toString() + ")", values);
+        }
+        private fn inSub(join: string, name: string, sub: Builder, negate: bool) -> Self {
+            return self.condArgs(join, self.col(name) + (negate ? " NOT IN (" : " IN (") + sub.__sql("") + ")", sub.__bindings());
+        }
+        // `column->a->b` read as text: json_extract, JSON_EXTRACT, or PostgreSQL's #>> (on json, jsonb or text).
+        private fn jsonPath(c: string, path: string) -> string {
+            let parts = Str.split(path, "->");
+            for (p in parts) { Builder.ident(p); }
+            let d = self.conn().driver();
+            if (d == "postgres") { return "(CAST(" + c + " AS JSONB) #>> '{" + Str.join(parts, ",") + "}')"; }
+            let jp = "'$." + Str.join(parts, ".") + "'";
+            return d == "mysql" ? "JSON_UNQUOTE(JSON_EXTRACT(" + c + ", " + jp + "))" : "json_extract(" + c + ", " + jp + ")";
+        }
+        private fn fullText(join: string, names: Array<string>, text: string) -> Self {
+            let cols = new Array<string>();
+            for (n in names) { cols.push(self.col(n)); }
+            let d = self.conn().driver();
+            if (d == "mysql") { return self.condArgs(join, "MATCH (" + Str.join(cols, ", ") + ") AGAINST (? IN NATURAL LANGUAGE MODE)", Builder.one(text)); }
+            if (d == "postgres") {
+                let doc = new Array<string>();
+                for (c in cols) { doc.push("COALESCE(" + c + ", '')"); }
+                return self.condArgs(join, "to_tsvector('english', " + Str.join(doc, " || ' ' || ") + ") @@ plainto_tsquery('english', ?)", Builder.one(text));
+            }
+            let words = new Array<string>();
+            let a = new Array<any>();
+            for (w in Str.split(Str.trim(text), " ")) {
+                if (w == "") { continue; }
+                let any1 = new Array<string>();
+                for (c in cols) { any1.push("LOWER(" + c + ") LIKE ?"); a.push("%" + Str.lower(w) + "%"); }
+                words.push("(" + Str.join(any1, " OR ") + ")");
+            }
+            if (words.size() == 0) { return self; }
+            return self.condArgs(join, "(" + Str.join(words, " AND ") + ")", a);
+        }
+        // [foreign key on this class, key on the owner's] of the BelongsTo relation `relation` (or the owner class's name).
+        private fn ownerKeys(owner: ClassInfo, relation: string) -> Array<FieldMap> {
+            if (self.__map == null) { throw new StateError("whereBelongsTo needs a model: DB.table queries have none"); }
+            let simple = owner.simpleName();
+            let name = relation != "" ? relation : Str.lower(simple[..1]) + simple[1..];
+            let keys = Relation.named(self.__map, name).__ownerKeys();
+            if (keys == null) { throw new ValueError(self.__map.info.simpleName() + "." + name + "() is not a belongsTo relation"); }
+            return keys;
+        }
+        private fn morphCond(join: string, relation: string, types: Array<string>, f: fn(Builder), negate: bool) -> Self {
+            if (self.__map == null) { throw new StateError("relations need a model: DB.table queries have none"); }
+            let rel = Relation.named(self.__map, relation);
+            if (!(rel is MorphTo)) { throw new ValueError(self.__map.info.simpleName() + "." + relation + "() is not a morphTo relation"); }
+            let mt = rel as MorphTo;
+            let parts = new Array<string>();
+            let a = new Array<any>();
+            for (t in types) {
+                let inner = mt.existenceFor(self, t);
+                if (f != null) { f(inner); }
+                parts.push("(" + self.col(mt.typeField.field.name) + " = ? AND EXISTS (" + inner.__subSql("1") + "))");
+                a.push(t);
+                for (x in inner.__bindings()) { a.push(x); }
+            }
+            let sql = parts.size() == 0 ? "1 = 0" : "(" + Str.join(parts, " OR ") + ")";
+            return self.condArgs(join, negate ? "NOT " + sql : sql, a);
         }
         private fn between(join: string, name: string, lo: any, hi: any, negate: bool) -> Self {
             let a = new Array<any>();
@@ -603,7 +767,7 @@ namespace orbit {
             return db.execute("UPDATE " + db.quote(self.__table) + " SET " + sets + self.whereSql(true), a);
         }
         private fn aggregate(expr: string) -> any {
-            if (self.groups.size() > 0 || self.distinctRows) {
+            if (self.groups.size() > 0 || self.distinctRows || self.unionParts.size() > 0) {
                 let inner = self.__sql("");
                 return self.conn().queryValue("SELECT " + Str.replace(expr, self.q(self.__alias) + ".", "") + " FROM (" + inner + ") AS " + self.q("__orbit_agg"), self.__bindings());
             }
@@ -671,6 +835,27 @@ namespace orbit {
         fn isEmpty() -> bool { return self.items.size() == 0; }
     }
 
+    // A page from simplePaginate: its items, and whether another page follows (no total).
+    class SimplePage<T> {
+        public items: Array<T>
+        public page: long
+        public perPage: long
+        public more: bool
+        constructor(items: Array<T>, page: long, perPage: long, more: bool) { self.items = items; self.page = page; self.perPage = perPage; self.more = more; }
+        fn hasMorePages() -> bool { return self.more; }
+        fn isEmpty() -> bool { return self.items.size() == 0; }
+    }
+
+    // A page from cursorPaginate: its items, and the cursor of the next page ("" when this is the last).
+    class CursorPage<T> {
+        public items: Array<T>
+        public perPage: long
+        public nextCursor: string
+        constructor(items: Array<T>, perPage: long, nextCursor: string) { self.items = items; self.perPage = perPage; self.nextCursor = nextCursor; }
+        fn hasMorePages() -> bool { return self.nextCursor != ""; }
+        fn isEmpty() -> bool { return self.items.size() == 0; }
+    }
+
     // A query for objects of model class T: the clauses of Builder, and answers as Ts.
     class Query<T> extends Builder {
         constructor(map: TableMap) { super(map, map.table, null); self.__applyScopes(); }
@@ -687,7 +872,7 @@ namespace orbit {
             if (self.__withs.size() > 0 && out.size() > 0) {
                 let models = new Array<Model>();
                 for (o in out) { models.push(o as Model); }
-                for (w in self.__withs) { Relation.eagerLoad(models, w); }
+                for (i, w in self.__withs) { Relation.eagerLoad(models, w, self.__withFns[i]); }
             }
             return out;
         }
@@ -761,6 +946,44 @@ namespace orbit {
         }
         // Each match, one at a time.
         fn each(f: fn(T)) { self.chunk(500, fn(part: Array<T>) { for (x in part) { f(x); } }); }
+        // Each match, one at a time, from one query whose rows are read as they come
+        // (with() is not applied: load relations per object, or use lazy).
+        fn cursor(f: fn(T)) {
+            let at = new Array<int>();                                 // (filled from the first row: captures are copies)
+            let extras = new Array<string>();
+            let ready = new Array<bool>();
+            self.conn().each(self.__sql(""), self.__bindings(), fn(row: Row) {
+                if (ready.size() == 0) {
+                    ready.push(true);
+                    for (p in Persister.positions(self.__map, row.columns())) { at.push(p); }
+                    for (c in self.extraColumns(row.columns())) { extras.push(c); }
+                }
+                f(self.hydrate(row, extras, at) as T);
+            });
+        }
+        // Each match, one at a time, read `size` at a time in id order (chunkById: with() applies).
+        fn lazy(f: fn(T), size: int = 1000) { self.chunkById(size, fn(part: Array<T>) { for (x in part) { f(x); } }); }
+        // Page `page` of `perPage` matches without counting them all: whether there are more comes from one extra row.
+        fn simplePaginate(page: long = 1, perPage: long = 15) -> SimplePage<T> {
+            self.forPage(page, perPage + 1);
+            self.offset((page - 1) * perPage);
+            let got = self.get();
+            let more = got.size() as long > perPage;
+            if (more) { got.pop(); }
+            return new SimplePage<T>(got, page, perPage, more);
+        }
+        // `perPage` matches after `cursor` (the previous page's nextCursor; "" for the first), in id order:
+        // no OFFSET, so pages stay fast and rows added meanwhile are not skipped or repeated.
+        fn cursorPaginate(perPage: long = 15, cursor: string = "") -> CursorPage<T> {
+            let id = self.__map.requireId();
+            self.reorder().orderBy(id.field.name).limit(perPage + 1);
+            if (cursor != "") { self.__cursor(self.col(id.field.name), id.kind == "string" ? cursor as any : Integer.parseOr(cursor, 0) as any); }
+            let got = self.get();
+            let more = got.size() as long > perPage;
+            if (more) { got.pop(); }
+            let next = more && got.size() > 0 ? "${id.field.get(got[got.size() - 1])}" : "";
+            return new CursorPage<T>(got, perPage, next);
+        }
         // Page `page` (from 1) of `perPage` matches, with the total.
         fn paginate(page: long = 1, perPage: long = 15) -> Page<T> {
             let total = self.count();
