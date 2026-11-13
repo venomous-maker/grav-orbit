@@ -74,6 +74,9 @@ namespace orbit {
         // so a result cached by another thread meanwhile does not outlive it.
         private static pending: HashMap<string, HashSet<string>> = new HashMap<string, HashSet<string>>()
         private static pendingOn: AtomicInt = new AtomicInt(0)
+        // DB.stickyReads: when each connection last wrote (Time.monotonicMs()), kept only while asked for.
+        private static trackOn: AtomicInt = new AtomicInt(0)
+        private static writes: HashMap<string, long> = new HashMap<string, long>()
 
         // ── the query log ────────────────────────────────────────────────────────
         static fn enableLog() { Sql.lock.lock(); Sql.logging = true; Sql.rewatch(); Sql.lock.unlock(); }
@@ -90,6 +93,9 @@ namespace orbit {
         static fn forgetListeners() { Sql.lock.lock(); Sql.listeners.clear(); Sql.rewatch(); Sql.lock.unlock(); }
         private static fn rewatch() { Sql.watchOn.set(Sql.logging || Sql.listeners.size() > 0 ? 1 : 0); }
         static fn isWatching() -> bool { return Sql.watchOn.get() != 0; }
+        // DB.stickyReads: whether writes' times are kept.
+        static fn trackWrites(on: bool) { Sql.trackOn.set(on ? 1 : 0); }
+        static fn isTracking() -> bool { return Sql.trackOn.get() != 0; }
 
         // ── reads ────────────────────────────────────────────────────────────────
         // `cacheMs` >= 0 (remember) answers from the cache when it can; `tags` are
@@ -242,6 +248,7 @@ namespace orbit {
         // Drops the cached results a write to `table` made stale; inside a
         // transaction, again when it ends (Sql.ended).
         static fn wrote(db: Connection, name: string, table: string) {
+            if (Sql.isTracking()) { Sql.lock.lock(); Sql.writes.put(name, Time.monotonicMs()); Sql.lock.unlock(); }
             if (Sql.cache == null) { return; }
             Sql.invalidate(name, table);
             if (db.inTransaction()) {
@@ -262,6 +269,13 @@ namespace orbit {
             out.push(Sql.tag(name, ""));
             for (t in tables) { let g = Sql.tag(name, t); if (!out.contains(g)) { out.push(g); } }
             return out;
+        }
+        // When `name` last wrote (0: not since stickyReads was asked for).
+        static fn lastWrite(name: string) -> long {
+            Sql.lock.lock();
+            let t = Sql.writes.getOr(name, 0 as long);
+            Sql.lock.unlock();
+            return t;
         }
         // A transaction on `name` committed or rolled back: what it wrote is invalidated again.
         static fn ended(name: string) {
@@ -321,8 +335,8 @@ namespace orbit {
             }
             return last;
         }
-        // Whether a statement needs its connection's name (for the log, or the cache).
-        static fn busy() -> bool { return Sql.isWatching() || Sql.cache != null; }
+        // Whether a statement needs its connection's name (for the log, the cache, or sticky reads).
+        static fn busy() -> bool { return Sql.isWatching() || Sql.cache != null || Sql.isTracking(); }
         // The cache key of a read: the connection, the SQL, and each argument with its kind.
         static fn cacheKey(name: string, sql: string, args: Array<any>) -> string {
             let sb = new StringBuilder();

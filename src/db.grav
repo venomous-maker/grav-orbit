@@ -17,36 +17,113 @@ import "querylog.grav"
 
 namespace orbit {
 
+    // A write connection's read replicas, taken in turn.
+    class ReplicaSet {
+        public conns: Array<Connection> = new Array<Connection>()
+        public next: AtomicInt = new AtomicInt(0)
+        // The next open replica, in turn (null when none is open).
+        fn pick() -> Connection {
+            let n = self.conns.size();
+            if (n == 1) { return self.conns[0].isOpen() ? self.conns[0] : null; }
+            let start = (self.next.increment() % n + n) % n;
+            for (i in 0..n) {
+                let c = self.conns[(start + i) % n];
+                if (c.isOpen()) { return c; }
+            }
+            return null;
+        }
+    }
+
     // The database connections, transactions and raw SQL (see the top of this file).
     class DB {
         private static named: HashMap<string, Connection> = new HashMap<string, Connection>()
 
-        private static reads: HashMap<string, Connection> = new HashMap<string, Connection>()
+        private static reads: HashMap<string, ReplicaSet> = new HashMap<string, ReplicaSet>()
+        // useOnThisThread's connections, by "thread id\tname" (write) and "thread id\tname\tread".
+        private static threads: HashMap<string, Connection> = new HashMap<string, Connection>()
+        private static threadLock: Mutex = new Mutex()
+        // (Atomic: read without the lock on every query.)
+        private static threadsOn: AtomicInt = new AtomicInt(0)
+        // stickyReads: per name, how long after a write reads stay on the write connection.
+        private static sticky: HashMap<string, long> = new HashMap<string, long>()
 
         // Makes `db` the connection called `name` ("default": what models use).
-        static fn connect(db: Connection, name: string = "default") { DB.named.put(name, db); }
-        // Makes `write` the connection reads go to too, but `read` the one `select`,
-        // `selectOne`, `scalar` and a query's reading methods use instead (a read
-        // replica): until a transaction opens, when they go back to `write` (its
-        // replica may not have the transaction's own writes yet).
-        static fn connect(write: Connection, read: Connection, name: string = "default") {
-            DB.named.put(name, write);
-            DB.reads.put(name, read);
+        static fn connect(db: Connection, name: string = "default") {
+            DB.named.put(name, db);
+            DB.reads.remove(name);
         }
-        // The connection reads use: `read` while none is in a transaction, else `write`.
+        // Makes `write` the connection writes and transactions use, but `read` the
+        // one `select`, `selectOne`, `scalar` and a query's reading methods use
+        // instead (a read replica): until a transaction opens, when they go back to
+        // `write` (its replica may not have the transaction's own writes yet).
+        // (The two-connection forms are spelled out without the name as well: gravc
+        // does not yet fill in a trailing default when choosing between overloads.)
+        static fn connect(write: Connection, read: Connection) { DB.connect(write, read, "default"); }
+        static fn connect(write: Connection, read: Connection, name: string) {
+            let rs = new ReplicaSet();
+            rs.conns.push(read);
+            DB.named.put(name, write);
+            DB.reads.put(name, rs);
+        }
+        // The same with several read replicas: reads take them in turn (round
+        // robin), passing over any that is closed; with none open, reads use `write`.
+        static fn connect(write: Connection, reads: Array<Connection>) { DB.connect(write, reads, "default"); }
+        static fn connect(write: Connection, reads: Array<Connection>, name: string) {
+            let rs = new ReplicaSet();
+            for (r in reads) { rs.conns.push(r); }
+            DB.named.put(name, write);
+            if (rs.conns.size() > 0) { DB.reads.put(name, rs); } else { DB.reads.remove(name); }
+        }
+        // Adds one more read replica to the connection called `name`.
+        static fn addReadReplica(read: Connection, name: string = "default") {
+            DB.connection(name);                                      // (StateError when there is none)
+            let key = name == "" ? "default" : name;
+            if (!DB.reads.containsKey(key)) { DB.reads.put(key, new ReplicaSet()); }
+            DB.reads[key].conns.push(read);
+        }
+        // The read replicas of `name` (none: an empty list).
+        static fn readReplicas(name: string = "default") -> Array<Connection> {
+            let rs = DB.reads.getOr(name == "" ? "default" : name, null);
+            return rs == null ? new Array<Connection>() : rs.conns.copy();
+        }
+        // After a write on `name`, its reads stay on the write connection for
+        // `seconds` (0: switched off), so a program reads back what it just wrote
+        // even while the replicas lag behind.
+        static fn stickyReads(seconds: float, name: string = "default") {
+            let key = name == "" ? "default" : name;
+            if (seconds <= 0.0) { DB.sticky.remove(key); } else { DB.sticky.put(key, (seconds * 1000.0) as long); }
+            Sql.trackWrites(DB.sticky.size() > 0);
+        }
+        // The connection reads use: a read replica (in turn) while none is in a
+        // transaction, nor sticky after a write; else the write connection.
         static fn readConnection(name: string = "default") -> Connection {
             let key = name == "" ? "default" : name;
             let w = DB.connection(key);
-            let r = DB.reads.getOr(key, null);
-            return r == null || w.inTransaction() || r.inTransaction() ? w : r;
+            if ((DB.threadsOn.get() != 0)) {
+                let own = DB.forThread(key, true);
+                if (own != null) { return w.inTransaction() || own.inTransaction() ? w : own; }
+                if (DB.forThread(key, false) != null) { return w; }      // (bound alone: it reads too)
+            }
+            let rs = DB.reads.getOr(key, null);
+            if (rs == null || w.inTransaction()) { return w; }
+            if (Sql.isTracking()) {
+                let ms = DB.sticky.getOr(key, 0 as long);
+                if (ms > 0 && Time.monotonicMs() - Sql.lastWrite(key) < ms) { return w; }
+            }
+            let r = rs.pick();
+            return r == null || r.inTransaction() ? w : r;
         }
-        // Whether `db` is `name`'s read replica (for the query log).
+        // Whether `db` is one of `name`'s read replicas (for the query log).
         static fn isReplica(db: Connection, name: string = "default") -> bool {
             return db != DB.connection(name);
         }
         // The connection called `name`; StateError when there is none.
         static fn connection(name: string = "default") -> Connection {
             let key = name == "" ? "default" : name;
+            if ((DB.threadsOn.get() != 0)) {
+                let own = DB.forThread(key, false);
+                if (own != null) { return own; }
+            }
             let db = DB.named.getOr(key, null);
             if (db == null) {
                 throw new StateError(key == "default" ? "no database for Orbit: call DB.connect(db) first"
@@ -55,12 +132,55 @@ namespace orbit {
             return db;
         }
         // Whether a connection called `name` is set.
-        static fn hasConnection(name: string = "default") -> bool { return DB.named.containsKey(name == "" ? "default" : name); }
+        static fn hasConnection(name: string = "default") -> bool {
+            let key = name == "" ? "default" : name;
+            return DB.named.containsKey(key) || ((DB.threadsOn.get() != 0) && DB.forThread(key, false) != null);
+        }
         // Forgets the connection called `name` (closing it is yours; its read
-        // replica too, if `connect` gave one).
+        // replicas too, if `connect` gave them).
         static fn disconnect(name: string = "default") {
             DB.named.remove(name);
             DB.reads.remove(name);
+            DB.sticky.remove(name);
+        }
+
+        // ── one connection per thread ────────────────────────────────────────────
+        // A grav-db connection is for one thread at a time: a thread that uses
+        // Orbit while others do gives itself its own (and, if wanted, its own read
+        // replica). Until this thread calls `leaveThread`, its models and queries
+        // on `name` use them; other threads keep theirs, or the shared one.
+        //
+        //   Thread.spawn(fn() {
+        //       DB.useOnThisThread(Sqlite.open("app.db"))
+        //       User.create(fields("name", "Ada"))
+        //       DB.leaveThread()
+        //   })
+        static fn useOnThisThread(db: Connection, name: string = "default") { DB.bindThread(db, null, name); }
+        static fn useOnThisThread(write: Connection, read: Connection) { DB.bindThread(write, read, "default"); }
+        static fn useOnThisThread(write: Connection, read: Connection, name: string) { DB.bindThread(write, read, name); }
+        // Forgets this thread's own connections for `name` (closing them is yours).
+        static fn leaveThread(name: string = "default") {
+            let key = "${Thread.currentId()}\t" + (name == "" ? "default" : name);
+            DB.threadLock.lock();
+            DB.threads.remove(key);
+            DB.threads.remove(key + "\tread");
+            DB.threadsOn.set(DB.threads.size() > 0 ? 1 : 0);
+            DB.threadLock.unlock();
+        }
+        private static fn bindThread(write: Connection, read: Connection, name: string) {
+            let key = "${Thread.currentId()}\t" + (name == "" ? "default" : name);
+            DB.threadLock.lock();
+            DB.threads.put(key, write);
+            if (read != null) { DB.threads.put(key + "\tread", read); } else { DB.threads.remove(key + "\tread"); }
+            DB.threadsOn.set(1);
+            DB.threadLock.unlock();
+        }
+        private static fn forThread(name: string, read: bool) -> Connection {
+            let key = "${Thread.currentId()}\t" + name + (read ? "\tread" : "");
+            DB.threadLock.lock();
+            let c = DB.threads.getOr(key, null);
+            DB.threadLock.unlock();
+            return c;
         }
 
         // ── the query log ────────────────────────────────────────────────────────
@@ -149,8 +269,17 @@ namespace orbit {
         // The DB name `db` is connected under (a replica: its write connection's
         // name; an unnamed one: "@" and a number), for the query log and cache.
         static fn nameOf(db: Connection) -> string {
+            if ((DB.threadsOn.get() != 0)) {
+                DB.threadLock.lock();
+                let found = "";
+                for (k in DB.threads.keys()) {
+                    if (DB.threads[k] == db) { let parts = Str.split(k, "\t"); found = parts[1]; break; }
+                }
+                DB.threadLock.unlock();
+                if (found != "") { return found; }
+            }
             for (k in DB.named.keys()) { if (DB.named[k] == db) { return k; } }
-            for (k in DB.reads.keys()) { if (DB.reads[k] == db) { return k; } }
+            for (k in DB.reads.keys()) { for (r in DB.reads[k].conns) { if (r == db) { return k; } } }
             return Sql.anonymous(db);
         }
         // nameOf, only while something needs it (the log, the cache, sticky reads); "" otherwise.
