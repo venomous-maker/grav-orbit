@@ -187,7 +187,7 @@ namespace orbit {
                 args.push(m.columnValue(obj));
             }
             let sql = "INSERT INTO " + db.quote(map.table) +
-                      (cols.size() == 0 ? (db.driver() == "mysql" ? " () VALUES ()" : " DEFAULT VALUES") : " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")");
+                (cols.size() == 0 ? (db.driver() == "mysql" ? " () VALUES ()" : " DEFAULT VALUES") : " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")");
             if (numbered) {
                 if (db.driver() == "postgres") { sql = sql + " RETURNING " + db.quote(map.id.column); }
                 map.id.field.set(obj, db.insert(sql, args));
@@ -338,6 +338,8 @@ namespace orbit {
         static fn where(group: fn(Builder)) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).where(group); }
         static fn whereIn(name: string, values: Array<any>) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).whereIn(name, values); }
         static fn whereNotIn(name: string, values: Array<any>) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).whereNotIn(name, values); }
+        static fn whereIn(name: string, sub: Builder) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).whereIn(name, sub); }
+        static fn whereNotIn(name: string, sub: Builder) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).whereNotIn(name, sub); }
         static fn whereNull(name: string) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).whereNull(name); }
         static fn whereNotNull(name: string) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).whereNotNull(name); }
         static fn whereBetween(name: string, lo: any, hi: any) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).whereBetween(name, lo, hi); }
@@ -370,6 +372,17 @@ namespace orbit {
         static fn latest(name: string = "createdAt") -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).latest(name); }
         static fn oldest(name: string = "createdAt") -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).oldest(name); }
         static fn limit(n: long) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).limit(n); }
+        static fn scope(name: string, args: Array<any> = new Array<any>()) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).scope(name, args); }
+        static fn with(relation: string, f: fn(Builder)) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).with(relation, f); }
+        static fn withWhereHas(relation: string, f: fn(Builder)) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).withWhereHas(relation, f); }
+        static fn whereBelongsTo(owner: Model, relation: string = "") -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).whereBelongsTo(owner, relation); }
+        static fn whereHasMorph(relation: string, types: Array<string>, f: fn(Builder)) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).whereHasMorph(relation, types, f); }
+        static fn whereFullText(names: Array<string>, text: string) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).whereFullText(names, text); }
+        static fn whereExists(sub: Builder) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).whereExists(sub); }
+        static fn cursor(f: fn(Self)) { new Query<Self>(TableMap.of(reflect(Self))).cursor(f); }
+        static fn lazy(f: fn(Self), size: int = 1000) { new Query<Self>(TableMap.of(reflect(Self))).lazy(f, size); }
+        static fn simplePaginate(page: long = 1, perPage: long = 15) -> SimplePage<Self> { return new Query<Self>(TableMap.of(reflect(Self))).simplePaginate(page, perPage); }
+        static fn cursorPaginate(perPage: long = 15, cursor: string = "") -> CursorPage<Self> { return new Query<Self>(TableMap.of(reflect(Self))).cursorPaginate(perPage, cursor); }
 
         // ── answers ──────────────────────────────────────────────────────────────
         static fn all() -> Array<Self> { return new Query<Self>(TableMap.of(reflect(Self))).get(); }
@@ -544,6 +557,13 @@ namespace orbit {
             let list = new Array<Model>();
             list.push(self);
             Relation.eagerLoad(list, relation);
+            return self;
+        }
+        // Loads `relation` now, narrowed by `f` (as with(relation, f)).
+        fn load(relation: string, f: fn(Builder)) -> Self {
+            let list = new Array<Model>();
+            list.push(self);
+            Relation.eagerLoad(list, relation, f);
             return self;
         }
         // Loads `relation` unless it is loaded already.
