@@ -102,7 +102,7 @@ namespace orbit {
             let d = db.driver();
             let id = d == "postgres" ? "BIGSERIAL PRIMARY KEY" : d == "mysql" ? "BIGINT AUTO_INCREMENT PRIMARY KEY" : "INTEGER PRIMARY KEY AUTOINCREMENT";
             db.exec("CREATE TABLE IF NOT EXISTS " + db.quote(self.table) + " (" + db.quote("id") + " " + id + ", " +
-                    db.quote("migration") + " VARCHAR(255) NOT NULL, " + db.quote("batch") + " INTEGER NOT NULL)");
+                db.quote("migration") + " VARCHAR(255) NOT NULL, " + db.quote("batch") + " INTEGER NOT NULL)");
         }
         private fn ran(db: Connection) -> HashMap<string, long> {
             let out = new HashMap<string, long>();
