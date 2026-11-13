@@ -1,0 +1,147 @@
+// Orbit left running: THREADS threads (default 4) for SECONDS (default 600)
+// doing what a long-lived server does — transfers in retried transactions,
+// counter bumps, remembered and plain reads, eager and lazy loads, inserts, and
+// pruning old rows so the table stays bounded — with the query log, the query
+// cache, N+1 counting and two read replicas on. Every 10 seconds it prints the
+// resident memory, the log's and cache's sizes and the work done so far.
+//
+// It fails when anything throws unexpectedly, when the totals stop adding up,
+// when the log or cache grows past its limit, or when memory keeps growing:
+// the resident size at the end may exceed the one a quarter of the way in by
+// at most 25% (and 8 MB at least, for allocator noise).
+//
+//   grav tests/stress/soak.grav --release -o /tmp/orbit_soak --emit bin && /tmp/orbit_soak 600 4
+import "std"
+import "models.grav"
+use db.*
+use orbit.*
+
+const ACCOUNTS: int = 50
+const START: long = 1000
+const COUNTERS: int = 4
+
+fn main() {
+    let seconds = argc() > 1 ? Integer.parseOr(argv(1), 600) : 600
+    let threads = argc() > 2 ? Integer.parseOr(argv(2), 4) as int : 4
+    let path = Stress.path("soak")
+    Stress.create(path, ACCOUNTS, START, COUNTERS)
+    let r1: Connection = Sqlite.openReadOnly(path)
+    let r2: Connection = Sqlite.openReadOnly(path)
+    DB.connect(DB.connection(), [r1, r2])
+    Orbit.cacheQueries(200)
+    DB.enableQueryLog()
+    Sql.logLimit = 1000
+    Orbit.detectLazyLoading()
+
+    let stop = new AtomicInt(0)
+    let ops = new AtomicInt(0)
+    let increments = new AtomicInt(0)
+    let errors = new AtomicInt(0)
+    let firstErrors = new Array<string>()
+    let errorLock = new Mutex()
+    let workers = new Array<Thread>()
+    for (t in 0..threads) {
+        workers.push(Thread.spawn("soak${t}", fn() {
+            let write = Stress.open(path)
+            let read: Connection = Sqlite.openReadOnly(path)
+            DB.useOnThisThread(write, read)
+            let rng = new Rng(4242 + t)
+            let i = 0
+            while (stop.get() == 0) {
+                i += 1
+                let k = rng.nextInt(0, 99)
+                try {
+                    if (k < 35) {
+                        let a = rng.nextInt(1, ACCOUNTS) as long
+                        let b = rng.nextInt(1, ACCOUNTS) as long
+                        let amount = rng.nextInt(1, 50) as long
+                        if (a != b) {
+                            try {
+                                DB.transaction(fn() {
+                                    let from = Account.findOrFail(a)
+                                    let to = Account.findOrFail(b)
+                                    from.balance -= amount
+                                    to.balance += amount
+                                    from.save()
+                                    to.save()
+                                    Event.create(fields("accountId", a, "kind", "transfer", "amount", amount))
+                                }, 8)
+                            } catch (e: DbError) { if (!DB.isDeadlock(e, "default")) { throw e } }
+                        }
+                    } else if (k < 50) {
+                        let id = rng.nextInt(1, COUNTERS) as long
+                        for (attempt in 0..8) {
+                            try { Counter.where("id", id).increment("n"); increments.increment(); break }
+                            catch (e: DbError) { if (!DB.isDeadlock(e, "default")) { throw e } Time.sleepMs(2 * (attempt + 1)) }
+                        }
+                    } else if (k < 75) {
+                        let n = Account.where("balance", ">", rng.nextInt(0, 2000)).remember(0.2).count()
+                        if (n > ACCOUNTS as long || Account.query().count() != ACCOUNTS as long) { throw new StateError("account count drifted") }
+                    } else if (k < 88) {
+                        for (acct in Account.with("events", fn(q: Builder) { q.latest("id").limit(20) }).where("id", "<=", 5).get()) { acct.events().get() }
+                        for (ev in Event.latest("id").limit(3).get()) { ev.account().get() }
+                    } else if (k < 97) {
+                        for (attempt in 0..8) {
+                            try { Event.create(fields("accountId", rng.nextInt(1, ACCOUNTS), "kind", "note", "amount", 0)); break }
+                            catch (e: DbError) { if (!DB.isDeadlock(e, "default")) { throw e } Time.sleepMs(2 * (attempt + 1)) }
+                        }
+                    } else {
+                        // Pruning: keep the newest 2000 events, so the table (and its reads) stay bounded.
+                        let newest = Builder.toLong(Event.query().max("id"))
+                        for (attempt in 0..8) {
+                            try { Event.where("id", "<", newest - 2000).delete(); break }
+                            catch (e: DbError) { if (!DB.isDeadlock(e, "default")) { throw e } Time.sleepMs(2 * (attempt + 1)) }
+                        }
+                    }
+                    ops.increment()
+                } catch (e: Exception) {
+                    errors.increment()
+                    errorLock.lock()
+                    if (firstErrors.size() < 5) { firstErrors.push("thread ${t}, op ${i}: " + e.describe()) }
+                    errorLock.unlock()
+                }
+            }
+            DB.leaveThread()
+            write.close()
+            read.close()
+        }))
+    }
+
+    let started = Time.monotonicMs()
+    let baseline = 0 as long
+    let peak = 0 as long
+    let last = 0 as long
+    let logOver = false
+    let cacheOver = false
+    while (Time.monotonicMs() - started < seconds * 1000) {
+        Time.sleepMs(10000)
+        let el = (Time.monotonicMs() - started) / 1000
+        let rss = Stress.rssKb()
+        if (baseline == 0 && el * 4 >= seconds) { baseline = rss }
+        if (rss > peak) { peak = rss }
+        last = rss
+        let logged = DB.getQueryLog().size()
+        let cached = Orbit.queryCache().size()
+        if (logged > Sql.logLimit) { logOver = true }
+        if (cached > 200) { cacheOver = true }
+        print("t=${el}s rss=${rss / 1024}MB ops=${ops.get()} (${ops.get() * 1000 / (Time.monotonicMs() - started)}/s) errors=${errors.get()} log=${logged} cache=${cached}")
+    }
+    stop.set(1)
+    for (w in workers) { w.join() }
+
+    let total = Builder.toLong(DB.scalar("SELECT SUM(balance) FROM accounts"))
+    let counted = Builder.toLong(DB.scalar("SELECT SUM(n) FROM counters"))
+    let want = (ACCOUNTS as long) * START
+    let allowed = baseline + (baseline / 4 > 8192 ? baseline / 4 : 8192)
+    print("soak: ${seconds}s, ${threads} threads, ${ops.get()} ops, ${errors.get()} errors")
+    print("total=${total} (want ${want})  counters=${counted} (want ${increments.get()})")
+    print("rss: ${baseline / 1024} MB a quarter in, ${last / 1024} MB at the end (allowed ${allowed / 1024}), peak ${peak / 1024} MB")
+    for (e in firstErrors) { print("error: " + e) }
+    let ok = errors.get() == 0 && total == want && counted == increments.get() && !logOver && !cacheOver && last <= allowed
+    print(ok ? "SOAK OK" : "SOAK FAILED")
+    r1.close()
+    r2.close()
+    DB.disconnect()
+    Stress.remove(path)
+    if (!ok) { exit(1) }
+}

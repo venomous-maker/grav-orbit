@@ -1,0 +1,134 @@
+// Orbit under real concurrent load: THREADS threads (default 8), each with its
+// own write and read connection (DB.useOnThisThread) on one SQLite file in WAL
+// mode, run OPS operations each (default 1500): transfers between accounts in
+// retried transactions, in-place counter increments, remembered and plain
+// reads, eager loads, lazy loads and inserts, while the shared query log, query
+// cache and N+1 counting are all on. At the end the totals must add up: no
+// money made or lost, every increment that reported success counted once, every
+// event inserted readable, and no unexpected error anywhere.
+//
+//   grav tests/stress/load.grav --release -o /tmp/orbit_load --emit bin && /tmp/orbit_load 8 1500
+//   grav tests/stress/load.grav --race -o /tmp/orbit_load_race --emit bin && /tmp/orbit_load_race 4 200
+import "std"
+import "models.grav"
+use db.*
+use orbit.*
+
+const ACCOUNTS: int = 50
+const START: long = 1000
+const COUNTERS: int = 4
+
+fn main() {
+    let threads = argc() > 1 ? Integer.parseOr(argv(1), 8) as int : 8
+    let ops = argc() > 2 ? Integer.parseOr(argv(2), 1500) as int : 1500
+    let path = Stress.path("load")
+    Stress.create(path, ACCOUNTS, START, COUNTERS)
+    Orbit.cacheQueries(256)
+    DB.enableQueryLog()
+    Sql.logLimit = 2000
+    Orbit.detectLazyLoading()
+
+    let transfers = new AtomicInt(0)
+    let gaveUp = new AtomicInt(0)
+    let increments = new AtomicInt(0)
+    let inserted = new AtomicInt(0)
+    let reads = new AtomicInt(0)
+    let errors = new AtomicInt(0)
+    let firstError = new Array<string>()
+    let errorLock = new Mutex()
+    let started = Time.monotonicMs()
+    let workers = new Array<Thread>()
+    for (t in 0..threads) {
+        workers.push(Thread.spawn("load${t}", fn() {
+            let write = Stress.open(path)
+            let read: Connection = Sqlite.openReadOnly(path)
+            DB.useOnThisThread(write, read)
+            let rng = new Rng(1000 + t)
+            for (i in 0..ops) {
+                let k = rng.nextInt(0, 99)
+                try {
+                    if (k < 40) {
+                        let a = rng.nextInt(1, ACCOUNTS) as long
+                        let b = rng.nextInt(1, ACCOUNTS) as long
+                        let amount = rng.nextInt(1, 50) as long
+                        if (a == b) { continue }
+                        let done = new Array<bool>()
+                        try {
+                            DB.transaction(fn() {
+                                done.clear()
+                                let from = Account.findOrFail(a)
+                                let to = Account.findOrFail(b)
+                                from.balance -= amount
+                                to.balance += amount
+                                from.save()
+                                to.save()
+                                Event.create(fields("accountId", a, "kind", "transfer", "amount", amount))
+                                done.push(true)
+                            }, 8)
+                        } catch (e: DbError) {
+                            if (!DB.isDeadlock(e, "default")) { throw e }
+                            gaveUp.increment()                         // every attempt hit a lock: rolled back
+                        }
+                        if (done.size() > 0) { transfers.increment(); inserted.increment() }
+                    } else if (k < 60) {
+                        let id = rng.nextInt(1, COUNTERS) as long
+                        let ok = false
+                        for (attempt in 0..8) {
+                            try { Counter.where("id", id).increment("n"); ok = true; break }
+                            catch (e: DbError) { if (!DB.isDeadlock(e, "default")) { throw e } Time.sleepMs(2 * (attempt + 1)) }
+                        }
+                        if (ok) { increments.increment() }
+                    } else if (k < 80) {
+                        let rich = Account.where("balance", ">", rng.nextInt(0, 2000)).remember(0.05).count()
+                        let all = Account.query().count()
+                        if (rich > all || all != ACCOUNTS as long) { throw new StateError("read ${rich} rich of ${all} accounts") }
+                        reads.increment()
+                    } else if (k < 90) {
+                        let total = 0 as long
+                        for (acct in Account.with("events").where("id", "<=", 5).get()) { total += acct.events().get().size() as long }
+                        for (ev in Event.latest("id").limit(3).get()) { ev.account().get() }   // lazy: counted as N+1
+                        if (total < 0) { throw new StateError("negative") }
+                        reads.increment()
+                    } else {
+                        let ok = false
+                        for (attempt in 0..8) {
+                            try { Event.create(fields("accountId", rng.nextInt(1, ACCOUNTS), "kind", "note", "amount", 0)); ok = true; break }
+                            catch (e: DbError) { if (!DB.isDeadlock(e, "default")) { throw e } Time.sleepMs(2 * (attempt + 1)) }
+                        }
+                        if (ok) { inserted.increment() }
+                    }
+                } catch (e: Exception) {
+                    errors.increment()
+                    errorLock.lock()
+                    let what = k < 40 ? "transfer" : k < 60 ? "increment" : k < 80 ? "count" : k < 90 ? "eager/lazy" : "insert"
+                    if (firstError.size() < 5) { firstError.push("thread ${t}, op ${i} (" + what + "): " + e.describe()) }
+                    errorLock.unlock()
+                }
+            }
+            DB.leaveThread()
+            write.close()
+            read.close()
+        }))
+    }
+    for (w in workers) { w.join() }
+    let ms = Time.monotonicMs() - started
+
+    // The totals, read back on the shared connection.
+    let total = Builder.toLong(DB.scalar("SELECT SUM(balance) FROM accounts"))
+    let counted = Builder.toLong(DB.scalar("SELECT SUM(n) FROM counters"))
+    let events = Event.query().count()
+    let log = DB.getQueryLog()
+    let lazy = Orbit.lazyLoads()
+    let want = (ACCOUNTS as long) * START
+    print("threads=${threads} ops=${threads * ops} in ${ms} ms (${(threads * ops * 1000) / (ms + 1)} ops/s)")
+    print("transfers=${transfers.get()} gaveUp=${gaveUp.get()} increments=${increments.get()} inserted=${inserted.get()} reads=${reads.get()} errors=${errors.get()}")
+    print("total=${total} (want ${want})  counters=${counted} (want ${increments.get()})  events=${events} (want ${inserted.get()})")
+    print("log kept ${log.size()} (limit ${Sql.logLimit})  cache ${Orbit.queryCache().size()}  N+1 seen: ${lazy.getOr("Event.account", 0)}")
+    let ok = errors.get() == 0 && total == want && counted == increments.get() && events == inserted.get() &&
+        log.size() <= Sql.logLimit && Orbit.queryCache().size() <= 256 && lazy.getOr("Event.account", 0) > 0
+    for (e in firstError) { print("error: " + e) }
+    print(ok ? "LOAD OK" : "LOAD FAILED")
+    DB.disconnect()
+    Stress.remove(path)
+    if (!ok) { exit(1) }
+}

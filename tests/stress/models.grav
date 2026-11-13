@@ -1,0 +1,58 @@
+// The models and set-up the stress programs (load.grav, soak.grav) share: bank
+// accounts whose total never changes, counters bumped in place, and an
+// append-only event log, in one SQLite file in WAL mode.
+import "std"
+import "../../src/orbit.grav"
+use db.*
+use orbit.*
+
+class Account extends Model {
+    public id: long = 0
+    public owner: string = ""
+    public balance: long = 0
+    fn events() -> HasMany<Event> { return self.hasMany() }
+}
+
+class Event extends Model {
+    public id: long = 0
+    public accountId: long = 0
+    public kind: string = ""
+    public amount: long = 0
+    fn account() -> BelongsTo<Account> { return self.belongsTo("account_id") }
+}
+
+class Counter extends Model {
+    public id: long = 0
+    public n: long = 0
+}
+
+class Stress {
+    static fn path(name: string) -> string { return Dir.temp() + "/orbit_stress_${Process.pid()}_" + name + ".db"; }
+    static fn remove(path: string) { for (s in ["", "-wal", "-shm"]) { new File(path + s).delete(); } }
+    static fn open(path: string) -> Connection {
+        let c = Sqlite.open(path);
+        c.setBusyTimeout(10000);
+        return c;
+    }
+    // A fresh database with `accounts` accounts of `each` and `counters` counters at 0.
+    static fn create(path: string, accounts: int, each: long, counters: int) {
+        Stress.remove(path);
+        let db = Stress.open(path);
+        db.exec("PRAGMA journal_mode = WAL");
+        DB.connect(db);
+        Schema.create("accounts", fn(t: Blueprint) { t.id(); t.varchar("owner"); t.bigInteger("balance") });
+        Schema.create("events", fn(t: Blueprint) { t.id(); t.foreignId("account_id"); t.varchar("kind"); t.bigInteger("amount"); t.index("account_id") });
+        Schema.create("counters", fn(t: Blueprint) { t.id(); t.bigInteger("n") });
+        DB.transaction(fn() {
+            for (i in 0..accounts) { Account.create(fields("owner", "owner${i}", "balance", each)); }
+            for (i in 0..counters) { Counter.create(fields("n", 0)); }
+        });
+    }
+    // The resident set size of this process, in KiB (from /proc/self/status).
+    static fn rssKb() -> long {
+        for (line in Str.lines(new File("/proc/self/status").readOr(""))) {
+            if (Str.startsWith(line, "VmRSS:")) { return Integer.parseOr(Str.trim(Str.replace(line[6..], "kB", "")), 0); }
+        }
+        return 0;
+    }
+}
