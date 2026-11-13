@@ -23,6 +23,14 @@ class User extends Model implements HasTimestamps {
     fn roles() -> BelongsToMany<Role> { return self.belongsToMany() }
     fn rankedRoles() -> BelongsToMany<Role> { return self.belongsToMany::<Role>().withPivot(["level"]).withTimestamps() }
     fn seniorRoles() -> BelongsToMany<Role> { return self.belongsToMany::<Role>().withPivot(["level"]).wherePivot("level", ">=", 3) }
+    // One of many, and a default for none.
+    fn latestPost() -> HasOne<Post> { return self.hasOne::<Post>().latestOfMany() }
+    fn firstPost() -> HasOne<Post> { return self.hasOne::<Post>().oldestOfMany("id") }
+    fn mostViewed() -> HasOne<Post> { return self.hasOne::<Post>().ofMany("views", "max") }
+    fn profileOrBlank() -> HasOne<Profile> { return self.hasOne::<Profile>().withDefault(fields("bio", "No bio yet")) }
+    // Local scopes: User.scope("adults"), q.scope("named", ["B"]).
+    @Scope fn adults(q: Builder) { q.where("age", ">=", 18) }
+    @Scope fn named(q: Builder, prefix: string) { q.whereLike("name", prefix + "%") }
 }
 
 class Post extends Model implements SoftDeletes {
@@ -33,6 +41,7 @@ class Post extends Model implements SoftDeletes {
     public views: int = 0
 
     fn author() -> BelongsTo<User> { return self.belongsTo("user_id") }
+    fn user() -> BelongsTo<User> { return self.belongsTo("user_id") }
     fn comments() -> MorphMany<Comment> { return self.morphMany("commentable") }
     fn tags() -> BelongsToMany<Tag> { return self.morphToMany("taggable") }
 }
@@ -55,6 +64,7 @@ class Profile extends Model {
     public id: long = 0
     public userId: long = 0
     public bio: string = ""
+    fn owner() -> BelongsTo<User> { return self.belongsTo::<User>("user_id").withDefault(fields("name", "Guest")) }
 }
 
 class Role extends Model {
@@ -533,4 +543,84 @@ test "accessors, mutators and casts" {
     try { Unregistered.count() } catch (e: StateError) { msg = e.message() }
     assertEq(msg, "Unregistered.amount is @Cast(\"cents\"), and no cast has that name: Casts.register it first")
     Schema.dropIfExists("orders")
+}
+
+class Setting extends Model {
+    public id: long = 0
+    public name: string = ""
+    public data: JsonValue = null
+}
+
+test "query gaps: constrained eager loads, scopes, ofMany, subqueries, unions, JSON, paging" {
+    setUp()
+    let ada = User.firstWhere("email", "ada@example.com")
+    let bob = User.firstWhere("email", "bob@example.com")
+    let hello = Post.firstWhere("title", "Hello")
+    hello.comments().create(fields("body", "Nice post"))
+    hello.comments().create(fields("body", "Meh"))
+    let clip = Video.create(fields("title", "Clip"))
+    clip.comments().create(fields("body", "Nice video"))
+    // with(name, constraint), nested, withWhereHas, load(name, constraint).
+    let users = User.with("posts", fn(q: Builder) { q.where("published", true) }).orderBy("name").get()
+    assertEq("${users[0].posts().get().size()} ${users[1].posts().get().size()} ${users[2].posts().get().size()}", "2 1 0")
+    let deep = User.with("posts.comments", fn(q: Builder) { q.whereLike("body", "Nice%") }).where("name", "Ada").first()
+    let counts = new Array<int>()
+    for (p in deep.posts().get()) { counts.push(p.comments().get().size()) }
+    assertEq("${counts}", "[1, 0, 0]")
+    let busy = User.withWhereHas("posts", fn(q: Builder) { q.where("views", ">", 6) }).get()
+    assertEq("${busy.size()} ${busy[0].name} ${busy[0].posts().get().size()}", "1 Ada 1")
+    assertEq(bob.load("posts", fn(q: Builder) { q.where("published", false) }).posts().get().size(), 0)
+    // Local scopes.
+    assertEq("${User.scope("adults").count()} ${User.scope("named", ["B"]).first().name} ${User.query().scope("adults").scope("named", ["A"]).count()}", "1 Bob 1")
+    let msg = ""
+    try { User.scope("posts") } catch (e: ValueError) { msg = e.message() }
+    assertEq(msg, "User has no scope 'posts' (a method marked @Scope taking the query first)")
+    // One of many, eagerly too, and in whereHas; withDefault.
+    assertEq("${ada.latestPost().get().title}|${ada.firstPost().get().title}|${ada.mostViewed().get().title}", "Grav tips|Hello|Hello")
+    let latest = User.with("latestPost").orderBy("name").get()
+    assertEq("${latest[0].latestPost().get().title}|${latest[1].latestPost().get().title}|${latest[2].latestPost().get() == null}", "Grav tips|Bob's post|true")
+    assertEq(User.whereHas("latestPost", fn(q: Builder) { q.where("title", "Grav tips") }).count(), 1)
+    assertEq("${bob.profileOrBlank().get().bio} ${bob.profileOrBlank().get().userId == bob.id} ${ada.profileOrBlank().get().bio}", "No bio yet true First programmer")
+    let stray = Profile.create(fields("userId", 999999, "bio", "orphan"))
+    assertEq("${stray.owner().get().name} ${Profile.with("owner").where("bio", "orphan").first().owner().get().name}", "Guest Guest")
+    // whereBelongsTo, whereHasMorph, hasMorph.
+    assertEq("${Post.whereBelongsTo(ada).count()} ${Post.whereBelongsTo(bob, "author").count()}", "3 1")
+    assertEq("${Comment.whereHasMorph("commentable", ["Post"], fn(q: Builder) { q.where("title", "Hello") }).count()} " +
+             "${Comment.whereHasMorph("commentable", ["Post", "Video"], fn(q: Builder) { q.whereLike("title", "%") }).count()} " +
+             "${Comment.query().hasMorph("commentable", ["Video"]).count()}", "2 3 1")
+    // Subqueries: whereIn, whereExists, a value, a column; unions.
+    assertEq(User.whereIn("id", Post.query().select(["userId"]).where("published", true)).count(), 2)
+    assertEq(User.whereExists(DB.table("profiles").whereColumn("profiles.user_id", "=", "users.id")).count(), 1)
+    assertEq(Post.where("views", ">", DB.table("posts").selectRaw("AVG(views)")).count(), 2)
+    let tops = User.query().selectSub(Post.query().select(["title"]).whereColumn("posts.user_id", "=", "users.id").orderBy("views", "desc").limit(1), "top_post").orderBy("name").get()
+    assertEq("${tops[0].extra("top_post")}|${tops[1].extra("top_post")}|${tops[2].extra("top_post")}", "Hello|Bob's post|null")
+    let both = User.where("name", "Ada").union(User.where("name", "Cy")).orderBy("name", "desc").get()
+    assertEq("${both.size()} ${both[0].name} ${both[1].name} ${User.where("name", "Ada").unionAll(User.where("name", "Ada")).count()}", "2 Cy Ada 2")
+    // JSON paths.
+    Schema.dropIfExists("settings")
+    Setting.createTable()
+    Setting.create(fields("name", "a", "data", Json.parse("{\"lang\": \"en\", \"qty\": 3, \"dark\": true, \"nested\": {\"x\": \"y\"}}")))
+    Setting.create(fields("name", "b", "data", Json.parse("{\"lang\": \"fr\", \"qty\": 1, \"dark\": false, \"nested\": {\"x\": \"z\"}}")))
+    assertEq("${Setting.where("data->lang", "en").first().name} ${Setting.where("data->nested->x", "z").first().name} " +
+             "${Setting.where("data->qty", ">", 2).count()} ${Setting.where("data->dark", true).first().name}", "a b 1 a")
+    let bad = ""
+    try { Setting.where("data->x'y", "1").count() } catch (e: ValueError) { bad = e.message() }
+    assertEq(bad, "not a column or table name: 'x'y' (whereRaw and selectRaw take SQL)")
+    Schema.dropIfExists("settings")
+    // Full text (a fullText index for MySQL).
+    Schema.alter("posts", fn(t: Blueprint) { t.fullText(["title"]) })
+    assertEq("${Post.whereFullText(["title"], "grav tips").count()} ${Post.whereFullText(["title"], "grav tips").first().title}", "1 Grav tips")
+    // Locks, streaming, and pages without a total or an offset.
+    DB.transaction(fn() { assertEq(User.query().sharedLock().where("name", "Ada").first().name, "Ada") })
+    let streamed = new Array<string>()
+    User.query().orderBy("name").cursor(fn(u: User) { streamed.push(u.name) })
+    let lazily = new Array<string>()
+    User.lazy(fn(u: User) { lazily.push(u.name) }, 2)
+    assertEq("${streamed} ${lazily.size()}", "[\"Ada\", \"Bob\", \"Cy\"] 3")
+    let p1 = User.query().orderBy("name").simplePaginate(1, 2)
+    let p2 = User.query().orderBy("name").simplePaginate(2, 2)
+    assertEq("${p1.items.size()} ${p1.hasMorePages()} ${p2.items.size()} ${p2.hasMorePages()} ${p2.items[0].name}", "2 true 1 false Cy")
+    let c1 = User.cursorPaginate(2)
+    let c2 = User.cursorPaginate(2, c1.nextCursor)
+    assertEq("${c1.items[0].name} ${c1.items[1].name} ${c1.hasMorePages()} ${c2.items.size()} ${c2.items[0].name} ${c2.hasMorePages()}", "Ada Bob true 1 Cy false")
 }
