@@ -16,7 +16,8 @@
 // first, then any of length, unique, precision, scale, type (the SQL type,
 // as written) and nullable. On fields also: @Ignore (not a column), @Hidden
 // (left out of toMap and toJson), @Guarded (not set by fill or create),
-// @NotNull, @Unique. On classes: @Table("name"), @SoftDeletes (needs a
+// @NotNull, @Unique, @Cast("name") (a field of any type, stored through a
+// registered Cast: casts.grav). On classes: @Table("name"), @SoftDeletes (needs a
 // `deletedAt: DateTime?` field), @NoTimestamps (createdAt and updatedAt fields
 // are otherwise filled in on save), @Connection("name") (a DB connection by
 // name), @MorphName("post") (its name in polymorphic relations; the class name
@@ -24,6 +25,7 @@
 import "std"
 import "grav-db"
 import "behaviors.grav"
+import "casts.grav"
 
 namespace orbit {
 
@@ -81,12 +83,21 @@ namespace orbit {
         public guarded: bool = false
         // Its place in TableMap.fields (a model's snapshot keeps values by it).
         public index: int = 0
+        // @Cast("name"): how its value goes into the column and back (null: as it is).
+        public cast: Cast = null
 
         constructor(field: FieldInfo, column: string, kind: string) {
             self.field = field;
             self.column = column;
             self.kind = kind;
         }
+        // The value its column gets from `obj` (through its cast).
+        fn columnValue(obj: any) -> any {
+            let v = self.field.get(obj);
+            return self.cast == null || v == null ? v : self.cast.set(v);
+        }
+        // Sets the field from its column's value (through its cast).
+        fn setFromColumn(obj: any, v: any) { self.field.set(obj, self.cast == null || v == null ? v : self.cast.get(v)); }
     }
 
     // A class's table: built once per class from its fields and decorators.
@@ -124,6 +135,13 @@ namespace orbit {
             for (f in info.fields()) {
                 if (f.has("Ignore")) { continue; }
                 let kind = TableMap.kindOf(f);
+                let cd = f.decorator("Cast");
+                let cast: Cast = null;
+                if (cd != null) {
+                    cast = Casts.find(cd.text(0));
+                    if (cast == null) { throw new StateError(info.simpleName() + "." + f.name + " is @Cast(\"" + cd.text(0) + "\"), and no cast has that name: Casts.register it first"); }
+                    kind = cast.column();
+                }
                 if (kind == "") { continue; }
                 let c = f.decorator("Column");
                 let column = c != null && c.args.size() > 0 && c.keys[0] == "" ? c.text(0) : Naming.snake(f.name);
@@ -148,6 +166,7 @@ namespace orbit {
                     if (m.auto) { m.guarded = true; }
                     self.id = m;
                 }
+                m.cast = cast;
                 m.index = self.fields.size();
                 self.fields.push(m);
                 self.byName.put(f.name, m);

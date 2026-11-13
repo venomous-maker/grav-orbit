@@ -2,6 +2,7 @@
 // `import "grav-orbit"` brings in Model, the relations, Query and Builder, DB,
 // Schema and Blueprint, migrations, factories and seeders (and grav-db).
 import "mapping.grav"
+import "casts.grav"
 import "db.grav"
 import "builder.grav"
 import "model.grav"

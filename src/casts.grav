@@ -1,0 +1,102 @@
+// casts.grav — custom casts: how a field's value is stored in its column, for
+// types Orbit does not map itself. Put @Cast("name") on the field, and register
+// the cast under that name at start-up.
+//
+//   class Money { public cents: long; constructor(cents: long) { self.cents = cents; } }
+//   class MoneyCast extends Cast {
+//       fn get(value: any) -> any { return new Money(value as long) }          // column -> field
+//       fn set(value: any) -> any { return (value as Money).cents }            // field -> column
+//       fn column() -> string { return "long" }                                // its column's kind
+//   }
+//   Casts.register("money", new MoneyCast())
+//
+//   class Order extends Model {
+//       public id: long = 0
+//       @Cast("money") public total: Money = null
+//       @Cast("json") public options: HashMap<string, any> = null    // built in: JSON text
+//       @Cast("csv") public tags: Array<string> = null               // built in: "a,b,c"
+//   }
+//
+// A null stays null both ways; the cast sees only values.
+import "std"
+import "grav-db"
+import "model.grav"
+
+namespace orbit {
+
+    // How one kind of field value goes into its column and back.
+    abstract class Cast {
+        // The field's value from the column's (never null).
+        abstract fn get(value: any) -> any
+        // The column's value from the field's (never null).
+        abstract fn set(value: any) -> any
+        // The column's kind, for Schema and createTable: "string", "long", "float", "bool", ...
+        fn column() -> string { return "string"; }
+    }
+
+    // The casts, by name.
+    class Casts {
+        private static registry: HashMap<string, Cast> = new HashMap<string, Cast>()
+        private static lock: Mutex = new Mutex()
+        private static builtIn: bool = false
+
+        // Makes @Cast(name) use `c` (for classes mapped after this: register casts at start-up).
+        static fn register(name: string, c: Cast) {
+            Casts.lock.lock();
+            Casts.registry.put(name, c);
+            Casts.lock.unlock();
+        }
+        // The cast registered as `name`, or null.
+        static fn find(name: string) -> Cast {
+            Casts.lock.lock();
+            if (!Casts.builtIn) {
+                Casts.builtIn = true;
+                if (!Casts.registry.containsKey("json")) { Casts.registry.put("json", new JsonCast()); }
+                if (!Casts.registry.containsKey("csv")) { Casts.registry.put("csv", new CsvCast()); }
+            }
+            let c = Casts.registry.getOr(name, null);
+            Casts.lock.unlock();
+            return c;
+        }
+        // A JSON value as plain values: objects as HashMap<string, any>, arrays as Array<any>.
+        static fn plain(j: JsonValue) -> any {
+            if (j == null || j.isNull()) { return null; }
+            if (j.isBool()) { return j.asBool(); }
+            if (j.isInteger()) { return j.asLong(); }
+            if (j.isNumber()) { return j.asFloat(); }
+            if (j.isString()) { return j.asString(); }
+            if (j.isArray()) {
+                let a = new Array<any>();
+                for (x in j.asArray()) { a.push(Casts.plain(x)); }
+                return a;
+            }
+            let m = new HashMap<string, any>();
+            for (k in j.keys()) { m.put(k, Casts.plain(j.get(k))); }
+            return m;
+        }
+    }
+
+    // @Cast("json"): a HashMap<string, any>, Array<any> or any field kept as JSON text.
+    class JsonCast extends Cast {
+        fn get(value: any) -> any {
+            if (value is JsonValue) { return Casts.plain(value as JsonValue); }
+            return Casts.plain(Json.parse("${value}"));
+        }
+        fn set(value: any) -> any { return Persister.json(value).toJson(); }
+    }
+
+    // @Cast("csv"): an Array<string> kept as "a,b,c" (no commas in the values).
+    class CsvCast extends Cast {
+        fn get(value: any) -> any {
+            let text = "${value}";
+            let out = new Array<string>();
+            if (text == "") { return out; }
+            for (s in Str.split(text, ",")) { out.push(s); }
+            return out;
+        }
+        fn set(value: any) -> any {
+            if (value is Array<string>) { return Str.join(value as Array<string>, ","); }
+            throw new ValueError("a @Cast(\"csv\") field holds an Array<string>, got " + typename(value));
+        }
+    }
+}

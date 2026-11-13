@@ -72,7 +72,7 @@ namespace orbit {
             for (m in map.fields) {
                 let p = pos[m.index];
                 if (p < 0) {
-                    if (orig != null) { orig.push(m.field.get(obj)); }
+                    if (orig != null) { orig.push(m.columnValue(obj)); }
                     continue;
                 }
                 let v = row.at(p);
@@ -81,8 +81,8 @@ namespace orbit {
                     else if (m.kind == "json" && !(v is JsonValue)) { v = row.getJson(m.column); }
                     else if (m.kind == "datetime" && !(v is DateTime)) { v = row.getDateTime(m.column); }
                 }
-                m.field.set(obj, v);
-                if (orig != null) { orig.push(m.field.get(obj)); } // (the snapshot, as set: bools from 1/0 and so on)
+                m.setFromColumn(obj, v);
+                if (orig != null) { orig.push(m.cast == null ? m.field.get(obj) : v); } // (the snapshot, as set: bools from 1/0 and so on)
             }
             if (model != null) { model.__orig = orig; }
         }
@@ -90,7 +90,7 @@ namespace orbit {
         static fn snapshot(obj: any, map: TableMap) {
             if (!(obj is Model)) { return; }
             let orig = new Array<any>();
-            for (m in map.fields) { orig.push(m.field.get(obj)); }
+            for (m in map.fields) { orig.push(m.columnValue(obj)); }   // (a cast field as its column has it: changes in place show)
             (obj as Model).__orig = orig;
         }
         // The fields whose values differ from the snapshot (all of them for an object that is not a Model).
@@ -100,7 +100,7 @@ namespace orbit {
             for (m in map.fields) {
                 if (m.isId) { continue; }
                 if (model == null || model.__orig == null ||
-                    !Persister.same(model.__orig[m.index], m.field.get(obj))) { out.push(m); }
+                    !Persister.same(model.__orig[m.index], m.columnValue(obj))) { out.push(m); }
             }
             return out;
         }
@@ -177,7 +177,7 @@ namespace orbit {
                 if (numbered && m.isId) { continue; }
                 cols.push(db.quote(m.column));
                 marks.push("?");
-                args.push(m.field.get(obj));
+                args.push(m.columnValue(obj));
             }
             let sql = "INSERT INTO " + db.quote(map.table) +
                       (cols.size() == 0 ? (db.driver() == "mysql" ? " () VALUES ()" : " DEFAULT VALUES") : " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")");
@@ -197,7 +197,7 @@ namespace orbit {
             for (m in only == null ? map.fields : only) {
                 if (m.isId) { continue; }
                 sets.push(db.quote(m.column) + " = ?");
-                args.push(m.field.get(obj));
+                args.push(m.columnValue(obj));
             }
             if (sets.size() == 0) { return 0; }
             args.push(id.field.get(obj));
@@ -443,7 +443,9 @@ namespace orbit {
         // A field's value as its row had it (null when not loaded or saved).
         fn getOriginal(name: string) -> any {
             let m = self.__map().find(name);
-            return m == null || self.__orig == null ? null : self.__orig[m.index];
+            if (m == null || self.__orig == null) { return null; }
+            let v = self.__orig[m.index];
+            return m.cast == null || v == null ? v : m.cast.get(v);     // (the snapshot keeps a cast field as its column has it)
         }
         // What the last save changed, and whether it changed a field (any, with no name).
         fn getChanges() -> HashMap<string, any> { return self.__changes(); }
