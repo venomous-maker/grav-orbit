@@ -116,6 +116,8 @@ namespace orbit {
         public connection: string = ""
         // The behaviors its class wears (behaviors.grav).
         public behaviors: Array<BehaviorUse> = new Array<BehaviorUse>()
+        // Properties put into toMap and toJson (`@Appended get x()`, or @Appends("x", ...) on the class).
+        public appends: Array<PropertyInfo> = new Array<PropertyInfo>()
         private byName: HashMap<string, FieldMap> = new HashMap<string, FieldMap>()
 
         private static cache: HashMap<string, TableMap> = new HashMap<string, TableMap>()
@@ -172,6 +174,18 @@ namespace orbit {
                 self.byName.put(f.name, m);
                 if (!self.byName.containsKey(column)) { self.byName.put(column, m); }
             }
+            // Properties in toMap: those marked @Appended, and those @Appends names.
+            let named = new HashSet<string>();
+            let c: ClassInfo = info;
+            while (c != null) {
+                let ap = c.decorator("Appends");
+                if (ap != null) { for (a in ap.args) { named.add("${a}"); } }
+                c = c.base();
+            }
+            for (p in info.properties()) {
+                if ((p.has("Appended") || named.contains(p.name)) && p.canGet() && !p.isStatic()) { self.appends.push(p); named.remove(p.name); }
+            }
+            for (n in named.toArray()) { throw new StateError(info.simpleName() + " @Appends \"" + n + "\", and it has no such property: write `get " + n + "() -> T { ... }`"); }
             // Its behaviors (decorators naming one: @SoftDeletes, yours), each booted once.
             self.behaviors = Behaviors.on(info);
             for (u in self.behaviors) { u.behavior.boot(self, u.decorator); }

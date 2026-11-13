@@ -123,8 +123,15 @@ namespace orbit {
                     m.field.set(obj, values[k]);
                     continue;
                 }
+                let p = map.info.property(k);                     // a setter (a mutator): set name(v) { ... }
+                if (p != null && !p.isStatic() && !p.isPrivate() && !p.isProtected()) {
+                    if (mass && p.has("Guarded")) { continue; }
+                    if (p.isReadonly()) { throw new ValueError(map.info.simpleName() + "." + k + " is a read-only property"); }
+                    p.set(obj, values[k]);
+                    continue;
+                }
                 let f = map.info.field(k);
-                if (f == null) { throw new ValueError(map.info.simpleName() + " has no field '" + k + "'"); }
+                if (f == null) { throw new ValueError(map.info.simpleName() + " has no field or property '" + k + "'"); }
                 f.set(obj, values[k]);
             }
         }
@@ -234,6 +241,21 @@ namespace orbit {
                     if (model0.__hd != null && model0.__hd.contains(name)) { hidden = true; }
                 }
                 if (!hidden) { out.put(name, m.field.get(obj)); }
+            }
+            for (p in map.appends) {                               // accessors: @Appended get fullName()
+                let shown = !p.has("Hidden");
+                if (model0 != null) {
+                    if (model0.__sh != null && model0.__sh.contains(p.name)) { shown = true; }
+                    if (model0.__hd != null && model0.__hd.contains(p.name)) { shown = false; }
+                }
+                if (shown) { out.put(p.name, p.get(obj)); }
+            }
+            if (model0 != null && model0.__sh != null) {             // append("x"): any other getter, for this object
+                for (n in model0.__sh) {
+                    if (out.containsKey(n) || map.find(n) != null) { continue; }
+                    let p = map.info.property(n);
+                    if (p != null && p.canGet() && !p.isStatic()) { out.put(n, p.get(obj)); }
+                }
             }
             if (obj is Model) {
                 let model = obj as Model;
@@ -557,6 +579,8 @@ namespace orbit {
         fn toMap() -> HashMap<string, any> { return Persister.toMap(self, self.__map()); }
         // Hides (or shows, though @Hidden) these fields in this object's toMap and toJson.
         fn makeHidden(names: Array<string>) -> Self { for (n in names) { self.__hide().push(n); } return self; }
+        // Puts these properties' getters (accessors) into its toMap and toJson too.
+        fn append(names: Array<string>) -> Self { return self.makeVisible(names); }
         fn makeVisible(names: Array<string>) -> Self {
             for (n in names) { self.__show().push(n); self.__hide().remove(n); }
             return self;
