@@ -337,10 +337,74 @@ User.query().whereDate("createdAt", ">=", "2026-01-01")   // the date part (a Da
 User.query().whereYear("createdAt", "=", 2026)
 User.query().whereKey(7)                           // by id; whereKey([1, 2, 3])
 User.whereRaw("LOWER(name) = ?", ["ada"])          // SQL, with ? arguments; orWhereRaw
+Post.whereBelongsTo(ada)                           // posts.user_id = ada.id (the relation named after the class: user)
+Post.whereBelongsTo(ada, "author")                 // through another belongsTo; a list of owners works too
 ```
 
 An empty `whereIn` list matches no rows, and an empty `whereNotIn` list matches
 every row.
+
+**JSON columns.** A name `column->key->key` reads a path inside a JSON column
+(a `JsonValue` field, or a `@Cast("json")` one), as text; numbers compare as
+numbers and bools as bools, on every database:
+
+```grav
+Setting.where("data->lang", "en")
+Setting.where("data->nested->x", "y")
+Setting.where("data->qty", ">", 2)
+Setting.where("data->dark", true)
+```
+
+Each key is a plain identifier (letters, digits, `_`). It is SQLite's
+`json_extract`, MySQL's `JSON_EXTRACT` and PostgreSQL's `#>>`.
+
+**Full-text search.** `whereFullText(["title", "body"], "grav tips")` (and
+`orWhereFullText`) is MySQL's `MATCH ... AGAINST` (it needs a full-text index:
+`t.fullText(["title", "body"])` in the schema), PostgreSQL's
+`to_tsvector(...) @@ plainto_tsquery(...)` (English; `t.fullText` makes the
+matching GIN index), and on SQLite every word in one of the columns
+(`LIKE`, no index).
+
+**Subqueries.** A query can stand where a value does, or as a list for
+`whereIn`, or as a test for `whereExists`. Name the outer table's columns as
+`table.column` to tie them together:
+
+```grav
+// users with a published post
+User.whereIn("id", Post.query().select(["userId"]).where("published", true))
+// users with a profile
+User.whereExists(DB.table("profiles").whereColumn("profiles.user_id", "=", "users.id"))   // whereNotExists, orWhereExists
+// posts above the average
+Post.where("views", ">", DB.table("posts").selectRaw("AVG(views)"))
+// a column from a subquery, read with extra("top_post")
+User.query().selectSub(Post.query().select(["title"])
+    .whereColumn("posts.user_id", "=", "users.id").orderBy("views", "desc").limit(1), "top_post")
+```
+
+**Unions.** `union(other)` adds another query's rows (the same columns),
+without duplicates; `unionAll(other)` keeps them. The first query's order,
+limit and offset apply to all the rows:
+
+```grav
+User.where("name", "Ada").union(User.where("role", "admin")).orderBy("name").get()
+```
+
+**Local scopes.** A method marked `@Scope` takes the query first (and any
+arguments after); `scope(name, args)` applies it, from the class or from a
+query:
+
+```grav
+class User extends Model {
+    ...
+    @Scope fn adults(q: Builder) { q.where("age", ">=", 18) }
+    @Scope fn named(q: Builder, prefix: string) { q.whereLike("name", prefix + "%") }
+}
+
+User.scope("adults").count()
+User.query().scope("adults").scope("named", ["B"]).get()
+```
+
+A name that is no `@Scope` method of the class is a `ValueError`.
 
 **Optional parts.** `when(condition, f)` applies `f` when the condition holds,
 `unless(condition, f)` when it does not, and `tap(f)` always (a reusable piece
@@ -370,6 +434,7 @@ User.orderBy("name").reorder()             // drops the order so far
 User.limit(10)                             // take(10) is the same
 User.query().offset(20).limit(10)          // skip(20) is the same
 User.query().forPage(3, 25)                // rows 51 to 75
+User.query().sharedLock()                  // FOR SHARE (MySQL: LOCK IN SHARE MODE); lockForUpdate: FOR UPDATE
 ```
 
 **Pages.** `paginate(page = 1, perPage = 15)` runs a count and the page, and
@@ -382,6 +447,18 @@ print("page ${page.page} of ${page.lastPage()}, ${page.total} users")
 for (u in page.items) { print(u.name) }
 ```
 
+**Pages without a total.** `simplePaginate(page, perPage)` skips the count: it
+reads one row more than the page to know whether another follows, and gives a
+`SimplePage<T>` (`items`, `page`, `perPage`, `hasMorePages()`).
+`cursorPaginate(perPage, cursor = "")` pages by id without an OFFSET (so deep
+pages stay fast, and rows added meanwhile are not skipped or repeated): pass
+the previous page's `nextCursor` for the next one (`""` after the last):
+
+```grav
+let first = User.cursorPaginate(50)
+let second = User.cursorPaginate(50, first.nextCursor)     // second.hasMorePages()
+```
+
 **A big table, a part at a time.** `chunk(size, f)` reads `size` rows at a
 time in id order and hands each part to `f`; `chunkById(size, f)` pages by id
 (`id > last`) instead of by offset, so rows changed meanwhile are not skipped
@@ -392,7 +469,13 @@ User.where("active", false).chunkById(500, fn(part: Array<User>) {
     for (u in part) { u.delete() }
 })
 User.query().each(fn(u: User) { print(u.email) })
+User.lazy(fn(u: User) { print(u.email) }, 1000)        // chunkById underneath: one object at a time
+User.where("active", true).cursor(fn(u: User) { print(u.email) })
 ```
+
+`cursor(f)` runs one query and makes each object as its row arrives (MySQL
+streams it); it applies no `with()`, and `f` should not query the same
+connection meanwhile (MySQL does not allow it while a result is streaming).
 
 ### Columns, joins, groups
 
@@ -495,12 +578,14 @@ database.
 They cover the common starts: `query`, `where` (all three forms), `whereIn`,
 `whereNotIn`, `whereNull`, `whereNotNull`, `whereBetween`, `whereLike`,
 `whereColumn`, `whereRaw`, `has`, `doesntHave`, `whereHas`,
-`whereDoesntHave`, `whereRelation`, `with`, `withCount`, `withSum`,
-`withExists`, `withoutScope`, `withTrashed`, `onlyTrashed`, `select`,
-`orderBy`, `latest`, `oldest` and `limit`; and the answers `all`, `first`,
-`firstWhere(name, value)`, `find`, `findOrFail`, `findMany`, `findOrNew`,
-`count`, `sum`, `avg`, `min`, `max`, `pluck`, `paginate`, `chunk`, `chunkById`,
-`upsert` and `insertOrIgnore`. Anything else starts with `User.query()`:
+`whereDoesntHave`, `whereRelation`, `whereHasMorph`, `whereBelongsTo`,
+`whereExists`, `whereFullText`, `scope`, `with` (with a constraint too),
+`withWhereHas`, `withCount`, `withSum`, `withExists`, `withoutScope`,
+`withTrashed`, `onlyTrashed`, `select`, `orderBy`, `latest`, `oldest` and
+`limit`; and the answers `all`, `first`, `firstWhere(name, value)`, `find`,
+`findOrFail`, `findMany`, `findOrNew`, `count`, `sum`, `avg`, `min`, `max`,
+`pluck`, `paginate`, `simplePaginate`, `cursorPaginate`, `chunk`, `chunkById`,
+`cursor`, `lazy`, `upsert` and `insertOrIgnore`. Anything else starts with `User.query()`:
 `User.query().whereDate(...)`, `User.query().when(...)`.
 
 ## Relations
@@ -565,6 +650,27 @@ user.profile().create(fields("bio", "First programmer"))
 post.author().associate(bob)                                // sets user_id (save to keep it)
 post.save()
 post.author().dissociate()
+```
+
+**One of many.** A `hasOne` can pick one row out of many: the one with the
+largest (or smallest) value of a column, the id by default. It loads, counts
+and filters like any `hasOne`:
+
+```grav
+fn latestPost() -> HasOne<Post> { return self.hasOne::<Post>().latestOfMany() }            // the largest id
+fn firstPost() -> HasOne<Post> { return self.hasOne::<Post>().oldestOfMany("createdAt") }
+fn mostViewed() -> HasOne<Post> { return self.hasOne::<Post>().ofMany("views", "max") }
+
+User.with("latestPost").get()
+User.whereHas("latestPost", fn(q: Builder) { q.where("published", true) })
+```
+
+**Defaults.** `withDefault()` on a `hasOne` or `belongsTo` makes `get()` give a
+new, unsaved object instead of null, with the fields given:
+
+```grav
+fn author() -> BelongsTo<User> { return self.belongsTo::<User>("user_id").withDefault(fields("name", "Guest")) }
+post.author().get().name           // "Guest" when the post has no author
 ```
 
 ### Many-to-many
@@ -693,6 +799,12 @@ let users = User.with("posts").with("profile").get()
 let deep = User.with("posts.comments").get()             // posts, and their comments
 let both = User.with(["posts", "roles"]).get()
 let comments = Comment.with("commentable").get()          // morphTo too: one query per type
+
+// Only some of them: a constraint on the loaded relation (the last part of a path)
+let users = User.with("posts", fn(q: Builder) { q.where("published", true).latest() }).get()
+let nice = User.with("posts.comments", fn(q: Builder) { q.whereLike("body", "Nice%") }).get()
+// The users that have such posts, with just those loaded
+let busy = User.withWhereHas("posts", fn(q: Builder) { q.where("views", ">", 100) }).get()
 ```
 
 **By what they have.**
@@ -709,8 +821,13 @@ User.whereDoesntHave("posts", fn(q: Builder) { q.where("published", true) })   /
 User.whereRelation("posts", "views", ">", 7)              // whereHas with one condition; orWhereRelation
 ```
 
-`whereHas` cannot follow a `morphTo` (its rows are in several tables): query
-each type's own relation instead.
+A `morphTo` points into several tables, so name the types to look in
+(their morph names):
+
+```grav
+Comment.whereHasMorph("commentable", ["Post", "Video"], fn(q: Builder) { q.whereLike("title", "Grav%") })
+Comment.query().hasMorph("commentable", ["Video"])        // orWhereHasMorph, whereDoesntHaveMorph
+```
 
 **Counts and other aggregates** of a relation come with each row:
 
@@ -733,6 +850,7 @@ The added columns are `<relation>_count`, `<relation>_sum_<field>` (and
 user.load("posts")                    // now, as with() would have
 user.loadMissing("posts")             // unless it is loaded already
 user.relationLoaded("posts")          // whether it is
+user.load("posts", fn(q: Builder) { q.where("published", true) })   // with a constraint
 user.loadCount("posts").countOf("posts")
 user.posts().get()[0].title = "Edited"
 user.push()                           // saves the user and every loaded related object, all the way down
@@ -1262,6 +1380,7 @@ Schema.table("posts", fn(t: Blueprint) {
     t.index("title")                     // posts_title_index
     t.index(["user_id", "created_at"])   // posts_user_id_created_at_index
     t.unique(["user_id", "slug"])        // posts_user_id_slug_unique
+    t.fullText(["title", "body"])        // for whereFullText (MySQL FULLTEXT, PostgreSQL GIN; none on SQLite)
 })
 Schema.table("posts", fn(t: Blueprint) {
     t.dropIndex("posts_title_index")
@@ -1401,19 +1520,18 @@ Most of Eloquent's names are here and mean the same. What differs:
   `@Guarded` ones (and a numbered id); `@Hidden` hides; a field's type is its
   cast, and `@Cast("name")` covers other types. Accessors and mutators are
   [properties](#accessors-mutators-and-casts): `get` and `set`.
-- **No local scope methods**: keep a scope in a function and `tap` it. Global
+- **Local scopes are `@Scope` methods**, applied by name: `User.scope("popular", [100])`
+  for Eloquent's `User::popular(100)`. Global
   scopes and traits are [behaviors](#behaviors-model-traits), put on by
   decorators; hooks are methods on the model or a behavior (there is no event
   dispatcher or observer).
-- **No constraints in `with`**: it takes relation names only, so there is no
-  `with(['posts' => fn])`. Query the relation (`user.posts().where(...)`), or
-  load it and filter the list; a `BelongsToMany` method can carry its own
-  `wherePivot` conditions, which `with` keeps. `withCount` takes a constraint.
+- **Constraints in `with` are a second argument**: `with("posts", fn(q: Builder) { ... })`
+  for `with(['posts' => fn])`, one relation per call.
 - **Counts and aggregates** are read with `countOf("posts")` and
   `extra("posts_sum_views")`, a pivot column with `role.pivot("level")`.
 - **Morph types** hold the class's simple name (`Post`) or its `@MorphName`,
-  not a namespaced class name; `Orbit.morphMap` maps others. `morphTo` cannot
-  be used in `whereHas`.
+  not a namespaced class name; `Orbit.morphMap` maps others. A `morphTo` is
+  queried with `whereHasMorph(name, [types], f)`, not `whereHas`.
 - **Errors**: `findOrFail` and `firstOrFail` throw std's `NotFound`; `sole`
   `NotFound` or `StateError`.
 - **Numbers**: `sum` gives a `Decimal`, `avg` a `float`, `count` a `long`.
