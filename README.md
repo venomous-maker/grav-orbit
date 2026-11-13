@@ -945,6 +945,49 @@ without loading them, so they run no hooks.
 `u.saveQuietly()` saves without any of them, and without the behaviors'
 lifecycle hooks (so `@Uuids` fills nothing in); timestamps are still set.
 
+### $touches: touching a related row's timestamp
+
+`@Touches("relation", ...)` on a model touches the named relation's single
+related object (`belongsTo`, `hasOne`, `morphOne` or `morphTo`) every time it
+saves — so saving a comment can bump its post's `updatedAt`:
+
+```grav
+@Touches("post")
+class Comment extends Model implements HasTimestamps {
+    public id: long = 0
+    public postId: long = 0
+    public body: string = ""
+    fn post() -> BelongsTo<Post> { return self.belongsTo() }
+}
+
+comment.body = "edited"
+comment.save()              // post.updatedAt is now, too
+```
+
+Nothing happens when the relation has no related object yet (a null foreign key).
+
+### Prunable: deleting old rows in batches
+
+A model implementing `fn prunable() -> Query<Self>` can prune itself:
+`Model.prune(chunk = 1000)` runs that query a chunk at a time, calling the
+optional `fn pruning()` on each match before `forceDelete()`-ing it (even for
+a `@SoftDeletes` class: prune removes rows for good), and gives how many it
+removed.
+
+```grav
+class Reservation extends Model {
+    public id: long = 0
+    public expiresAt: DateTime = DateTime.now()
+    // Rows expired for a week.
+    fn prunable() -> Query<Reservation> { return Reservation.where("expiresAt", "<", DateTime.now().addDays(-7)) }
+    fn pruning() { Log.info("pruning reservation ${self.id}") }
+}
+
+Reservation.prune()                 // run it from a schedule, or a maintenance command
+```
+
+A class with no `prunable()` method is a `StateError` naming it.
+
 ### Serialization
 
 ```grav
@@ -1151,6 +1194,23 @@ compiled, so reflection, mapping, mass assignment and every behavior see them
 as the model's own. Traits with fields need a Grav compiler with trait state
 (November 2026 or later).
 
+### Observers
+
+An observer is a `Behavior` attached to a class by a call instead of a
+decorator — the same hooks (`saving`, `created`, `deleting`, ...), for code
+that should not have to change the model:
+
+```grav
+class SendsWelcomeMail extends Behavior {
+    fn created(m: Model, d: Decorator) { Mail.send((m as User).email, "Welcome!") }
+}
+User.observe(new SendsWelcomeMail())        // runs for User, and any subclass
+```
+
+`d` is a placeholder (`d.name` is `"Observer"`): an observer has no decorator
+of its own to read arguments from. Register observers once, at start-up;
+`User.observe(...)` works even after `User`'s mapping has already been built.
+
 ## Repository: classes that do not extend Model
 
 `Repository<T>` gives the same saving and querying to a class with no base,
@@ -1208,6 +1268,36 @@ DB.inTransaction()
 A transaction inside another is a savepoint: only its own changes are undone.
 `beginTransaction`, `commit`, `rollBack` and `inTransaction` take a connection
 name too.
+
+**Retries.** `DB.transaction(body, attempts)` runs it again, rolling back
+first, when it fails on a deadlock or a serialization conflict (SQLSTATE
+`40001` / `40P01`, or MySQL error 1213 / 1205) — any other error, or the last
+attempt's, goes on unchanged. Each retry waits a little longer than the last.
+
+```grav
+DB.transaction(fn() {
+    let acct = Account.findOrFail(1)
+    acct.balance -= amount
+    acct.save()
+}, 3)                                  // up to 3 attempts total
+```
+
+`DB.isDeadlock(e)` is the check itself, for code that wants to retry by hand.
+
+**Read and write connections.** `DB.connect(write, read, name)` sends writes
+and transactions to `write`, but a model's reads (and `DB.select`,
+`selectOne`, `scalar`) to `read` — a read replica — except inside a
+transaction, where everything stays on `write` (the replica may not have its
+own writes yet):
+
+```grav
+DB.connect(MySql.open(writeUrl), MySql.open(readUrl))
+User.all()                            // from the replica
+DB.transaction(fn() { User.create(fields("name", "Ada")) })   // writes, and reads inside it, go to write
+```
+
+A query that names its own connection (`.on(db)`, a `@Connection`) always uses
+exactly that one.
 
 **Raw SQL**, with `?` arguments, on the default connection:
 
@@ -1523,8 +1613,9 @@ Most of Eloquent's names are here and mean the same. What differs:
 - **Local scopes are `@Scope` methods**, applied by name: `User.scope("popular", [100])`
   for Eloquent's `User::popular(100)`. Global
   scopes and traits are [behaviors](#behaviors-model-traits), put on by
-  decorators; hooks are methods on the model or a behavior (there is no event
-  dispatcher or observer).
+  decorators; hooks are methods on the model or a behavior.
+  [Observers](#observers) are behaviors attached by a call (`User.observe(...)`)
+  instead of an event dispatcher.
 - **Constraints in `with` are a second argument**: `with("posts", fn(q: Builder) { ... })`
   for `with(['posts' => fn])`, one relation per call.
 - **Counts and aggregates** are read with `countOf("posts")` and
