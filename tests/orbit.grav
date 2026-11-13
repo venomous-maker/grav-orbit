@@ -655,15 +655,45 @@ class CountingObserver extends Behavior {
     fn created(m: Model, d: Decorator) { CountingObserver.created += 1 }
     fn deleted(m: Model, d: Decorator) { CountingObserver.deleted += 1 }
 }
+// The soft-delete lifecycle an observer sees beyond plain deleting/deleted.
+class LifecycleObserver extends Behavior {
+    static trashed: int = 0
+    static restoring: int = 0
+    static restored: int = 0
+    static forceDeleting: int = 0
+    static forceDeleted: int = 0
+    fn trashed(m: Model, d: Decorator) { LifecycleObserver.trashed += 1 }
+    fn restoring(m: Model, d: Decorator) { LifecycleObserver.restoring += 1 }
+    fn restored(m: Model, d: Decorator) { LifecycleObserver.restored += 1 }
+    fn forceDeleting(m: Model, d: Decorator) { LifecycleObserver.forceDeleting += 1 }
+    fn forceDeleted(m: Model, d: Decorator) { LifecycleObserver.forceDeleted += 1 }
+}
+// $touches on a hasMany: one save bulk-touches every related row directly,
+// none of them loaded.
+class Spoke extends Model implements HasTimestamps {
+    public id: long = 0
+    public hubId: long = 0
+    public name: string = ""
+}
+@Touches("spokes")
+class Hub extends Model {
+    public id: long = 0
+    public name: string = ""
+    fn spokes() -> HasMany<Spoke> { return self.hasMany::<Spoke>("hub_id") }
+}
 
 test "observers, Prunable, touches, transaction retries, read/write connections" {
     setUp()
     Schema.dropIfExists("note2s")
     Schema.dropIfExists("citizen2s")
     Schema.dropIfExists("touch_targets")
+    Schema.dropIfExists("spokes")
+    Schema.dropIfExists("hubs")
     Note2.createTable()
     Citizen2.createTable()
     TouchTarget.createTable()
+    Hub.createTable()
+    Spoke.createTable()
     // Observers: the same hooks as a Behavior, attached by call, inherited by subclasses too.
     User.observe(new CountingObserver())
     let before = CountingObserver.created;
@@ -690,6 +720,26 @@ test "observers, Prunable, touches, transaction retries, read/write connections"
     c.save()
     let touched = TouchTarget.find(target.id)
     assertEq(touched.updatedAt != stamp1, true)
+    // $touches on a hasMany: touching "spokes" bulk-updates every spoke's
+    // updatedAt in one UPDATE, with none of them loaded.
+    let hub = Hub.create(fields("name", "H"))
+    let s1 = Spoke.create(fields("hubId", hub.id, "name", "s1"))
+    let s2 = Spoke.create(fields("hubId", hub.id, "name", "s2"))
+    let spokeStamp = s1.updatedAt
+    Time.sleepMs(1100)
+    hub.name = "H2"
+    hub.save()
+    assertEq("${Spoke.find(s1.id).updatedAt != spokeStamp} ${Spoke.find(s2.id).updatedAt != spokeStamp}", "true true")
+    // The rest of the soft-delete lifecycle: trashed (a soft delete), restoring
+    // and restored, forceDeleting and forceDeleted (deleting/deleted fire too).
+    Post.observe(new LifecycleObserver())
+    let p = Post.firstWhere("title", "Hello")
+    p.delete()
+    assertEq(LifecycleObserver.trashed, 1)
+    p.restore()
+    assertEq("${LifecycleObserver.restoring} ${LifecycleObserver.restored}", "1 1")
+    p.forceDelete()
+    assertEq("${LifecycleObserver.forceDeleting} ${LifecycleObserver.forceDeleted} ${Post.withTrashed().find(p.id) == null}", "1 1 true")
     // Transaction retries: succeeds without retrying when nothing throws, and
     // reports a deadlock as retryable.
     let runs = new Array<bool>()
@@ -698,6 +748,14 @@ test "observers, Prunable, touches, transaction retries, read/write connections"
     let deadlock = new DbError("deadlock", 1213, "")
     deadlock.state = "40001"
     assertEq("${DB.isDeadlock(deadlock)} ${DB.isDeadlock(new DbError("syntax error", 1, ""))}", "true false")
+    // isDeadlock is driver-aware: SQLite has no SQLSTATE, so it goes by code
+    // (SQLITE_BUSY 5, SQLITE_LOCKED 6), regardless of which database this suite
+    // is actually running against.
+    DB.connect(Sqlite.open(":memory:"), "sqlite_check")
+    let busy = new DbError("database is locked", 5, "")
+    let notBusy = new DbError("database is locked", 99, "")
+    assertEq("${DB.isDeadlock(busy, "sqlite_check")} ${DB.isDeadlock(notBusy, "sqlite_check")}", "true false")
+    DB.disconnect("sqlite_check")
     // Read/write connections: a plain connect has no replica (reads == writes);
     // connect(write, read) gives select/selectOne/scalar and a query's reads the
     // read connection, but inside a transaction everything goes to the write one.
@@ -711,4 +769,6 @@ test "observers, Prunable, touches, transaction retries, read/write connections"
     Schema.dropIfExists("note2s")
     Schema.dropIfExists("citizen2s")
     Schema.dropIfExists("touch_targets")
+    Schema.dropIfExists("spokes")
+    Schema.dropIfExists("hubs")
 }
