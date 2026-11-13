@@ -41,6 +41,9 @@ namespace orbit {
         public parent: Model
         public parentMap: TableMap
         public relatedMap: TableMap
+        // with(name, f): narrows the eager query (`constraint`), or the next level's (`nestedConstraint`).
+        public constraint: fn(Builder) = null
+        public nestedConstraint: fn(Builder) = null
 
         constructor(parent: Model, related: ClassInfo) {
             self.parent = parent;
@@ -54,6 +57,14 @@ namespace orbit {
         abstract fn eager(parents: Array<Model>, nested: string)
         // Where a parent keeps it once loaded.
         abstract fn key() -> string
+
+        // An eager query, before it runs: the nested relations to load with it, and with's constraint.
+        fn prepare(q: Builder, nested: string) {
+            if (nested != "") { q.with(nested, self.nestedConstraint); }
+            if (self.constraint != null) { self.constraint(q); }
+        }
+        // [the foreign key on the owner's class, the key on the related class] for a belongsTo; null for the others.
+        fn __ownerKeys() -> Array<FieldMap> { return null; }
 
         fn db() -> Connection { return DB.connection(self.relatedMap == null ? self.parentMap.connection : self.relatedMap.connection); }
         fn loaded() -> bool { return self.parent.__ld != null && self.parent.__ld.containsKey(self.key()); }
@@ -74,7 +85,7 @@ namespace orbit {
             return r as Relation;
         }
         // Loads `path` ("posts", "posts.comments") for all of `models` (one query a level).
-        static fn eagerLoad(models: Array<Model>, path: string) {
+        static fn eagerLoad(models: Array<Model>, path: string, f: fn(Builder) = null) {
             if (models.size() == 0) { return; }
             let dot = Str.indexOf(path, ".");
             let first = dot > 0 ? path[..dot] : path;
@@ -85,6 +96,7 @@ namespace orbit {
             let r = m.invoke(models[0], new Array<any>());
             if (!(r is Relation)) { throw new ValueError(map.info.simpleName() + "." + first + "() is not a relation"); }
             let rel = r as Relation;
+            if (rest == "") { rel.constraint = f; } else { rel.nestedConstraint = f; }
             rel.eager(models, rest);
             for (x in models) { x.__names().put(first, rel.key()); }
         }
@@ -168,7 +180,7 @@ namespace orbit {
         fn eager(parents: Array<Model>, nested: string) {
             let q = new Query<T>(self.relatedMap);
             q.whereIn(self.foreignKey.field.name, Relation.keysOf(parents, self.localKey));
-            if (nested != "") { q.with(nested); }
+            self.prepare(q, nested);
             let groups = new HashMap<string, Array<T>>();
             for (kid in q.get()) {
                 let k = "${self.foreignKey.field.get(kid)}";
@@ -190,16 +202,50 @@ namespace orbit {
             self.foreignKey = Relation.field(self.relatedMap, fk, "the foreign key of " + self.parentMap.info.simpleName() + "'s hasOne");
             self.localKey = localKey != "" ? Relation.field(self.parentMap, localKey, "a local key") : self.parentMap.requireId();
         }
-        fn key() -> string { return "hasOne:" + self.relatedMap.table + "." + self.foreignKey.column; }
+        fn key() -> string { return "hasOne:" + self.relatedMap.table + "." + self.foreignKey.column + (self.ofAgg == "" ? "" : ":" + self.ofAgg + "." + self.ofCol.column); }
         fn query() -> Query<T> {
             let q = new Query<T>(self.relatedMap);
             q.where(self.foreignKey.field.name, self.localKey.field.get(self.parent));
+            self.ofManyCond(q);
             return q;
         }
-        // The related object, or null.
+        // The related object, or null (withDefault: a new T).
         fn get() -> T {
-            if (self.loaded()) { return self.parent.__loaded()[self.key()] as T; }
-            return self.query().first();
+            if (self.loaded()) { return self.orDefault(self.parent.__loaded()[self.key()] as T); }
+            return self.orDefault(self.query().first());
+        }
+        // One of many: the related row with the largest `name` (latestOfMany: the id by default;
+        // say "createdAt" for the newest), or the smallest (oldestOfMany); ofMany takes "max" or "min".
+        //   fn latestOrder() -> HasOne<Order> { return self.hasOne::<Order>().latestOfMany() }
+        fn latestOfMany(name: string = "") -> HasOne<T> { return self.ofMany(name, "max"); }
+        fn oldestOfMany(name: string = "") -> HasOne<T> { return self.ofMany(name, "min"); }
+        fn ofMany(name: string, agg: string) -> HasOne<T> {
+            let a = Str.lower(agg);
+            if (a != "max" && a != "min") { throw new ValueError("ofMany takes \"max\" or \"min\", not \"" + agg + "\""); }
+            self.ofCol = name == "" ? self.relatedMap.requireId() : Relation.field(self.relatedMap, name, "ofMany");
+            self.ofAgg = Str.upper(a);
+            return self;
+        }
+        // get() gives a new (unsaved) T, with these fields, instead of null.
+        fn withDefault(values: HashMap<string, any> = new HashMap<string, any>()) -> HasOne<T> { self.defaults = values; return self; }
+        private ofCol: FieldMap = null
+        private ofAgg: string = ""
+        private defaults: HashMap<string, any> = null
+        private fn orDefault(v: T) -> T {
+            if (v != null || self.defaults == null) { return v; }
+            let obj = self.relatedMap.info.create() as T;
+            Persister.fill(obj, self.relatedMap, self.defaults, false);
+            self.foreignKey.field.set(obj, self.localKey.field.get(self.parent));
+            return obj;
+        }
+        // ofMany's condition on a query over the related table: its row is the one with the MAX (MIN) of the column for its key.
+        private fn ofManyCond(b: Builder) {
+            if (self.ofAgg == "") { return; }
+            let x = b.q("__orbit_of${b.__depth}");
+            let c = b.q(self.ofCol.column);
+            let fk = b.q(self.foreignKey.column);
+            b.__addCond(" AND ", b.q(b.__alias) + "." + c + " = (SELECT " + self.ofAgg + "(" + x + "." + c + ") FROM " + b.q(self.relatedMap.table) +
+                " AS " + x + " WHERE " + x + "." + fk + " = " + b.q(b.__alias) + "." + fk + ")", new Array<any>());
         }
         fn save(child: T) -> T {
             self.foreignKey.field.set(child, self.localKey.field.get(self.parent));
@@ -215,12 +261,14 @@ namespace orbit {
         fn existence(outer: Builder) -> Builder {
             let inner = outer.__sub(self.relatedMap, "__orbit_${outer.__depth + 1}");
             inner.__addCond(" AND ", Relation.on(inner, self.foreignKey) + " = " + Relation.on(outer, self.localKey), new Array<any>());
+            self.ofManyCond(inner);
             return inner;
         }
         fn eager(parents: Array<Model>, nested: string) {
             let q = new Query<T>(self.relatedMap);
             q.whereIn(self.foreignKey.field.name, Relation.keysOf(parents, self.localKey));
-            if (nested != "") { q.with(nested); }
+            self.ofManyCond(q);
+            self.prepare(q, nested);
             let byKey = new HashMap<string, T>();
             for (kid in q.get()) {
                 let k = "${self.foreignKey.field.get(kid)}";
@@ -242,16 +290,26 @@ namespace orbit {
             self.ownerKey = ownerKey != "" ? Relation.field(self.relatedMap, ownerKey, "an owner key") : self.relatedMap.requireId();
         }
         fn key() -> string { return "belongsTo:" + self.parentMap.table + "." + self.foreignKey.column; }
+        fn __ownerKeys() -> Array<FieldMap> { let k = new Array<FieldMap>(); k.push(self.foreignKey); k.push(self.ownerKey); return k; }
+        // get() gives a new (unsaved) T, with these fields, instead of null.
+        fn withDefault(values: HashMap<string, any> = new HashMap<string, any>()) -> BelongsTo<T> { self.defaults = values; return self; }
+        private defaults: HashMap<string, any> = null
+        private fn orDefault(v: T) -> T {
+            if (v != null || self.defaults == null) { return v; }
+            let obj = self.relatedMap.info.create() as T;
+            Persister.fill(obj, self.relatedMap, self.defaults, false);
+            return obj;
+        }
         fn query() -> Query<T> {
             let q = new Query<T>(self.relatedMap);
             q.where(self.ownerKey.field.name, self.foreignKey.field.get(self.parent));
             return q;
         }
-        // The owner, or null (when the foreign key is null or names no row).
+        // The owner, or null (when the foreign key is null or names no row; withDefault: a new T).
         fn get() -> T {
-            if (self.loaded()) { return self.parent.__loaded()[self.key()] as T; }
-            if (self.foreignKey.field.get(self.parent) == null) { return null; }
-            return self.query().first();
+            if (self.loaded()) { return self.orDefault(self.parent.__loaded()[self.key()] as T); }
+            if (self.foreignKey.field.get(self.parent) == null) { return self.orDefault(null); }
+            return self.orDefault(self.query().first());
         }
         // Sets the foreign key to `owner`'s key (save the object to keep it).
         fn associate(owner: T) -> Model {
@@ -271,7 +329,7 @@ namespace orbit {
             if (keys.size() > 0) {
                 let q = new Query<T>(self.relatedMap);
                 q.whereIn(self.ownerKey.field.name, keys);
-                if (nested != "") { q.with(nested); }
+                self.prepare(q, nested);
                 for (o in q.get()) { byKey.put("${self.ownerKey.field.get(o)}", o); }
             }
             for (p in parents) {
@@ -502,7 +560,7 @@ namespace orbit {
             let q = new Query<T>(self.relatedMap);
             self.joinPivot(q);
             q.whereIn(self.table + "." + self.foreignPivotKey, Relation.keysOf(parents, self.parentKey));
-            if (nested != "") { q.with(nested); }
+            self.prepare(q, nested);
             let groups = new HashMap<string, Array<T>>();
             for (o in q.get()) {
                 let k = "${(o as Model).__extra().getOr("pivot_" + self.foreignPivotKey, null)}";
@@ -516,7 +574,7 @@ namespace orbit {
             let db = q.conn();
             q.join(self.table, self.relatedMap.table + "." + self.relatedKey.field.name, "=", self.table + "." + self.relatedPivotKey);
             q.selectRaw(db.quote(self.relatedMap.table) + ".*, " + db.quote(self.table) + "." + db.quote(self.foreignPivotKey) +
-                        " AS " + db.quote("pivot_" + self.foreignPivotKey));
+                " AS " + db.quote("pivot_" + self.foreignPivotKey));
             for (c in self.pivotCols) { q.selectRaw(db.quote(self.table) + "." + db.quote(c) + " AS " + db.quote("pivot_" + c)); }
             if (self.typeColumn != "") { q.where(self.table + "." + self.typeColumn, self.typeValue); }
             for (w in self.pivotWheres) { q.where(self.table + "." + (w[0] as string), w[1] as string, w[2]); }
@@ -578,7 +636,7 @@ namespace orbit {
             let q = new Query<T>(self.relatedMap);
             self.joinThrough(q);
             q.whereIn(self.throughMap.table + "." + self.firstKey.column, Relation.keysOf(parents, self.localKey));
-            if (nested != "") { q.with(nested); }
+            self.prepare(q, nested);
             let groups = new HashMap<string, Array<T>>();
             for (o in q.get()) {
                 let k = "${(o as Model).extra("__through_key")}";
@@ -613,6 +671,8 @@ namespace orbit {
         }
         fn existence(outer: Builder) -> Builder { return self.many.existence(outer); }
         fn eager(parents: Array<Model>, nested: string) {
+            self.many.constraint = self.constraint;
+            self.many.nestedConstraint = self.nestedConstraint;
             self.many.eager(parents, nested);
             for (p in parents) {
                 let all = p.__loaded()[self.many.key()] as Array<T>;
@@ -669,7 +729,7 @@ namespace orbit {
             let q = new Query<T>(self.relatedMap);
             q.whereIn(self.idField.field.name, Relation.keysOf(parents, self.localKey));
             q.where(self.typeField.field.name, self.parentMap.morphName);
-            if (nested != "") { q.with(nested); }
+            self.prepare(q, nested);
             let groups = new HashMap<string, Array<T>>();
             for (kid in q.get()) {
                 let k = "${self.idField.field.get(kid)}";
@@ -697,6 +757,8 @@ namespace orbit {
         fn create(values: HashMap<string, any>) -> T { return self.many.create(values); }
         fn existence(outer: Builder) -> Builder { return self.many.existence(outer); }
         fn eager(parents: Array<Model>, nested: string) {
+            self.many.constraint = self.constraint;
+            self.many.nestedConstraint = self.nestedConstraint;
             self.many.eager(parents, nested);
             for (p in parents) {
                 let all = p.__loaded()[self.many.key()] as Array<T>;
@@ -742,7 +804,14 @@ namespace orbit {
             return self.parent;
         }
         fn existence(outer: Builder) -> Builder {
-            throw new StateError("whereHas cannot follow the polymorphic '" + self.name + "': query each type's own relation instead");
+            throw new StateError("whereHas cannot follow the polymorphic '" + self.name + "': use whereHasMorph(\"" + self.name + "\", [types], ...)");
+        }
+        // A query over the table of morph name `kind`, tied to `outer`'s rows by the id column (whereHasMorph adds the type test).
+        fn existenceFor(outer: Builder, kind: string) -> Builder {
+            let map = MorphTo.mapOf(kind);
+            let inner = outer.__sub(map, "__orbit_${outer.__depth + 1}");
+            inner.__addCond(" AND ", Relation.on(inner, map.requireId()) + " = " + Relation.on(outer, self.idField), new Array<any>());
+            return inner;
         }
         fn eager(parents: Array<Model>, nested: string) {
             let byType = new HashMap<string, Array<Model>>();
@@ -758,7 +827,7 @@ namespace orbit {
                 let group = byType[t];
                 let q = new Query<Model>(map);
                 q.whereIn(map.requireId().field.name, Relation.keysOf(group, self.idField));
-                if (nested != "") { q.with(nested); }
+                self.prepare(q, nested);
                 let byId = new HashMap<string, Model>();
                 for (o in q.get()) { byId.put("${map.id.field.get(o)}", o); }
                 for (p in group) { p.__loaded().put(self.key(), byId.getOr("${self.idField.field.get(p)}", null)); }
