@@ -11,11 +11,24 @@
 //   m.migrate()          // runs those not run yet, as one batch
 //   m.rollback()         // undoes the last batch
 //   m.status()           // ["CreateUsers: ran (batch 1)", "CreatePosts: pending"]
+//
+// Several servers may migrate the same database at once (a deploy starting
+// them together): migrate, rollback, reset and refresh hold a lock while they
+// work, so the others wait and then find nothing left to do. tryMigrate skips
+// instead of waiting. The lock is MySQL's GET_LOCK, a PostgreSQL advisory
+// lock (both let go if the process dies), or elsewhere a row in
+// `<table>_lock` (taken over when its process has died, or after
+// lockStaleSeconds). A unique index on the migration's name backs it up.
 import "std"
 import "grav-db"
 import "db.grav"
 
 namespace orbit {
+
+    %{
+    #include <errno.h>
+    #include <signal.h>
+    %}
 
     // One change to the database: up makes it, down undoes it.
     abstract class Migration {
@@ -30,16 +43,30 @@ namespace orbit {
         private list: Array<Migration> = new Array<Migration>()
         private db: Connection = null
         public table: string = "migrations"
+        // How long migrate (rollback, reset, refresh) waits for another process
+        // that is migrating; then StateError.
+        public lockWaitSeconds: int = 600
+        // A lock row older than this is taken over, its process presumed gone
+        // (where the database has no lock of its own: SQLite).
+        public lockStaleSeconds: int = 3600
+        private indexed: bool = false
 
         // Uses `db` instead of the default connection.
         fn on(db: Connection) -> Migrator { self.db = db; return self; }
         // Adds a migration (they run in the order added).
         fn add(m: Migration) -> Migrator { self.list.push(m); return self; }
 
-        // Runs the migrations not run yet, as one batch; their names.
+        // Runs the migrations not run yet, as one batch; their names. Waits
+        // while another process migrates.
         fn migrate() -> Array<string> {
+            return self.exclusive(self.lockWaitSeconds, true, fn() -> Array<string> { return self.runPending(); });
+        }
+        // migrate, unless another process is migrating right now: then null.
+        fn tryMigrate() -> Array<string> {
+            return self.exclusive(0, false, fn() -> Array<string> { return self.runPending(); });
+        }
+        private fn runPending() -> Array<string> {
             let db = self.conn();
-            self.prepare(db);
             let done = self.ran(db);
             let batch = self.lastBatch(db) + 1;
             let out = new Array<string>();
@@ -59,8 +86,10 @@ namespace orbit {
         }
         // Undoes the last `steps` batches, newest first; the names undone.
         fn rollback(steps: int = 1) -> Array<string> {
+            return self.exclusive(self.lockWaitSeconds, true, fn() -> Array<string> { return self.undoBatches(steps); });
+        }
+        private fn undoBatches(steps: int) -> Array<string> {
             let db = self.conn();
-            self.prepare(db);
             let out = new Array<string>();
             for (i in 0..steps) {
                 let batch = self.lastBatch(db);
@@ -77,13 +106,17 @@ namespace orbit {
         }
         // Undoes every migration run.
         fn reset() -> Array<string> {
-            self.prepare(self.conn());
+            return self.exclusive(self.lockWaitSeconds, true, fn() -> Array<string> { return self.undoAll(); });
+        }
+        private fn undoAll() -> Array<string> {
             let out = new Array<string>();
-            while (self.lastBatch(self.conn()) > 0) { for (n in self.rollback(1)) { out.push(n); } }
+            while (self.lastBatch(self.conn()) > 0) { for (n in self.undoBatches(1)) { out.push(n); } }
             return out;
         }
-        // Undoes everything, then runs everything.
-        fn refresh() -> Array<string> { self.reset(); return self.migrate(); }
+        // Undoes everything, then runs everything (under one lock).
+        fn refresh() -> Array<string> {
+            return self.exclusive(self.lockWaitSeconds, true, fn() -> Array<string> { self.undoAll(); return self.runPending(); });
+        }
         // Each migration, "name: ran (batch n)" or "name: pending".
         fn status() -> Array<string> {
             let db = self.conn();
@@ -103,6 +136,101 @@ namespace orbit {
             let id = d == "postgres" ? "BIGSERIAL PRIMARY KEY" : d == "mysql" ? "BIGINT AUTO_INCREMENT PRIMARY KEY" : "INTEGER PRIMARY KEY AUTOINCREMENT";
             db.exec("CREATE TABLE IF NOT EXISTS " + db.quote(self.table) + " (" + db.quote("id") + " " + id + ", " +
                 db.quote("migration") + " VARCHAR(255) NOT NULL, " + db.quote("batch") + " INTEGER NOT NULL)");
+            if (self.indexed) { return; }
+            // No name recorded twice, should two processes get past the lock
+            // (tables made before the index get it here; MySQL has no IF NOT
+            // EXISTS for indexes, so there it fails once it exists, as it does
+            // where duplicates already are).
+            let index = db.quote(self.table + "_migration_unique");
+            try {
+                db.exec("CREATE UNIQUE INDEX " + (d == "mysql" ? "" : "IF NOT EXISTS ") + index + " ON " + db.quote(self.table) + " (" + db.quote("migration") + ")");
+            } catch (e: Exception) {}
+            self.indexed = true;
+        }
+
+        // ── the lock ──────────────────────────────────────────────────────────
+        // `body`'s result, run holding the migration lock, waiting up to
+        // `waitSeconds` for it; when it stays taken, StateError if `mustRun`,
+        // else null (body skipped).
+        private fn exclusive(waitSeconds: int, mustRun: bool, body: fn() -> Array<string>) -> Array<string> {
+            let db = self.conn();
+            self.prepare(db);
+            if (!self.lock(db, waitSeconds)) {
+                if (mustRun) { throw new StateError("another process has been migrating for ${waitSeconds} s (the migration lock is held)"); }
+                return null;
+            }
+            try { return body(); } finally { self.unlock(db); }
+        }
+        private fn lockName() -> string { return "orbit:" + self.table; }
+        private fn lock(db: Connection, waitSeconds: int) -> bool {
+            let d = db.driver();
+            let deadline = Time.monotonicMs() + (waitSeconds as long) * 1000;
+            while (true) {
+                if (self.tryLock(db, d)) { return true; }
+                if (Time.monotonicMs() >= deadline) { return false; }
+                Time.sleepMs(100);
+            }
+            return false;
+        }
+        private fn tryLock(db: Connection, d: string) -> bool {
+            let a = new Array<any>();
+            if (d == "mysql") {
+                a.push(self.lockName());
+                return Integer.parseOr("${db.queryValue("SELECT GET_LOCK(CONCAT(DATABASE(), '/', ?), 0)", a)}", 0) == 1;
+            }
+            if (d == "postgres") {
+                a.push(Migrator.key(self.lockName()));
+                return "${db.queryValue("SELECT pg_try_advisory_lock(?)", a)}" == "true";
+            }
+            let table = db.quote(self.table + "_lock");
+            db.exec("CREATE TABLE IF NOT EXISTS " + table + " (" + db.quote("id") + " INTEGER PRIMARY KEY, " +
+                db.quote("owner") + " VARCHAR(255) NOT NULL, " + db.quote("since") + " BIGINT NOT NULL)");
+            a.push(Migrator.owner());
+            a.push(Time.now());
+            try {
+                db.execute("INSERT INTO " + table + " (" + db.quote("id") + ", " + db.quote("owner") + ", " + db.quote("since") + ") VALUES (1, ?, ?)", a);
+                return true;
+            } catch (e: Exception) {}
+            // Taken: by a process that is gone (on this host), or for too long?
+            let row = db.queryOne("SELECT " + db.quote("owner") + ", " + db.quote("since") + " FROM " + table + " WHERE " + db.quote("id") + " = 1");
+            if (row == null) { return false; }
+            let owner = row.getString("owner");
+            let stale = Time.now() - row.getInt("since") > (self.lockStaleSeconds as long) || Migrator.ownerGone(owner);
+            if (stale) {
+                let b = new Array<any>();
+                b.push(owner);
+                db.execute("DELETE FROM " + table + " WHERE " + db.quote("id") + " = 1 AND " + db.quote("owner") + " = ?", b);
+            }
+            return false;
+        }
+        private fn unlock(db: Connection) {
+            let d = db.driver();
+            let a = new Array<any>();
+            try {
+                if (d == "mysql") { a.push(self.lockName()); db.queryValue("SELECT RELEASE_LOCK(CONCAT(DATABASE(), '/', ?))", a); return; }
+                if (d == "postgres") { a.push(Migrator.key(self.lockName())); db.queryValue("SELECT pg_advisory_unlock(?)", a); return; }
+                a.push(Migrator.owner());
+                db.execute("DELETE FROM " + db.quote(self.table + "_lock") + " WHERE " + db.quote("id") + " = 1 AND " + db.quote("owner") + " = ?", a);
+            } catch (e: Exception) {}
+        }
+        // This process, as a lock row names it: host:pid.
+        private static fn owner() -> string { return OS.hostname() + ":${Process.pid()}"; }
+        // Whether `owner` is a process on this host that no longer runs.
+        private static fn ownerGone(owner: string) -> bool {
+            let at = Str.lastIndexOf(owner, ":");
+            if (at < 0 || owner[..at] != OS.hostname()) { return false; }
+            let pid = Integer.parseOr(owner[at + 1..], 0) as int;
+            if (pid <= 0) { return false; }
+            return %{ (kill((pid_t)pid, 0) != 0 && errno == ESRCH) %} as bool;
+        }
+        // A 63-bit key for PostgreSQL's advisory locks (FNV-1a of the name).
+        private static fn key(name: string) -> long {
+            let h = %{ (unsigned long long)1469598103934665603ULL %} as long;
+            for (i in 0..name.length) {
+                let c = name[i] as int as long;
+                h = %{ (long long)(((unsigned long long)h ^ (unsigned long long)c) * 1099511628211ULL) %} as long;
+            }
+            return %{ (long long)((unsigned long long)h & 0x7fffffffffffffffULL) %} as long;
         }
         private fn ran(db: Connection) -> HashMap<string, long> {
             let out = new HashMap<string, long>();

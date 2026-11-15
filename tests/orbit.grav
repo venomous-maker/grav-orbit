@@ -326,6 +326,79 @@ test "schema, migrations, factories" {
     assertEq(User.where("age", ">=", 18).count(), 5 as long)
 }
 
+// Slow, and counts its runs: two migrators overlap on it.
+class SlowMigration extends Migration {
+    public static runs: AtomicInt = new AtomicInt(0)
+    fn up() { SlowMigration.runs.increment(); Time.sleepMs(300) }
+    fn down() {}
+}
+class SlowerMigration extends Migration {
+    fn up() { Time.sleepMs(600) }
+    fn down() {}
+}
+// A second connection to the same database (SQLite: a file, as two servers would share).
+fn racer() -> Connection {
+    if (env("ORBIT_DB") != "") { return connect() }
+    return Sqlite.open("${Dir.temp()}/orbit-race-${Process.pid()}.db")
+}
+fn racing(m: Migration) -> Migrator {
+    let r = new Migrator()
+    r.table = "race_migrations"
+    r.add(m)
+    return r
+}
+
+test "migrations: servers migrating at once run each one once" {
+    let setup = racer()
+    setup.exec("DROP TABLE IF EXISTS race_migrations")
+    setup.exec("DROP TABLE IF EXISTS race_migrations_lock")
+    let results = new Array<string>()
+    let lock = new Mutex()
+    let threads = new Array<Thread>()
+    for (i in 0..3) {
+        threads.push(Thread.spawn("migrator", fn() {
+            let db = racer()
+            DB.useOnThisThread(db)
+            let ran = racing(new SlowMigration()).migrate()          // the others wait, then find it done
+            lock.withLock(fn() { results.push("${ran.size()}") })
+            DB.leaveThread()
+            db.close()
+        }))
+    }
+    for (t in threads) { t.join() }
+    Sort.sort(results)
+    assertEq("${SlowMigration.runs.get()} ${results}", "1 [\"0\", \"0\", \"1\"]")
+    // tryMigrate (migrate --isolated) skips while another migrates
+    let busy = Thread.spawn("migrator", fn() {
+        let db = racer()
+        DB.useOnThisThread(db)
+        racing(new SlowerMigration()).migrate()
+        DB.leaveThread()
+        db.close()
+    })
+    Time.sleepMs(200)
+    let other = racer()
+    DB.useOnThisThread(other)
+    assertEq(racing(new SlowerMigration()).tryMigrate() == null, true)
+    busy.join()
+    assertEq("${racing(new SlowerMigration()).tryMigrate()}", "[]")
+    // a lock left by a process that died is taken over
+    if (setup.driver() == "sqlite") {
+        setup.exec("INSERT INTO race_migrations_lock (id, owner, since) VALUES (1, '" + OS.hostname() + ":2000000000', 0)")
+        let r = racing(new SlowerMigration())
+        r.lockWaitSeconds = 2
+        assertEq("${r.migrate()}", "[]")
+        assertEq(setup.queryValue("SELECT COUNT(*) FROM race_migrations_lock") as long, 0 as long)
+        assertEq(setup.queryValue("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'race_migrations_migration_unique'") as long, 1 as long)
+    }
+    DB.leaveThread()
+    other.close()
+    setup.exec("DROP TABLE IF EXISTS race_migrations")
+    setup.exec("DROP TABLE IF EXISTS race_migrations_lock")
+    setup.close()
+    if (env("ORBIT_DB") == "") { new File("${Dir.temp()}/orbit-race-${Process.pid()}.db").delete() }
+}
+
 // Behaviors: traits written here, put on models with their decorators.
 class Sluggable extends Behavior {
     fn saving(m: Model, d: Decorator) {

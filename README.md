@@ -1683,6 +1683,7 @@ m.status()           // ["CreateUsers: ran (batch 1)", "CreatePosts: ran (batch 
 m.rollback()         // undoes the last batch, newest first; rollback(2) the last two
 m.reset()            // undoes every migration run
 m.refresh()          // reset, then migrate
+m.tryMigrate()       // migrate, or null while another process is migrating
 ```
 
 Each migration runs in a transaction with its record. A migration's name is
@@ -1690,6 +1691,23 @@ its class name (override `fn name() -> string` for another); `m.table` names
 the table that records them, and `m.on(db)` keeps that record on another
 connection. Rolling back a migration that is not in the `Migrator` is a
 `StateError`.
+
+**Several servers at once.** Several servers often start together in a
+deploy, and each may run `migrate`. `migrate`, `rollback`, `reset` and
+`refresh` hold a lock while they work, so the other servers wait (up to
+`m.lockWaitSeconds`, 600, then `StateError`). Once the lock is free they run
+what is still pending, which is usually nothing. `tryMigrate()` doesn't wait:
+it returns null while another process holds the lock. The lock is:
+
+- MySQL: `GET_LOCK`
+- PostgreSQL: an advisory lock
+
+Both are freed if the process dies. Elsewhere (SQLite) the lock is a row in
+`<table>_lock`, taken over when the process that holds it is gone from this
+host, or after `m.lockStaleSeconds` (3600). A unique index on the migration
+name is the backstop: if two runs ever get past the lock, the second one's
+record is refused. On PostgreSQL and SQLite its schema changes roll back with
+it; MySQL commits schema changes at once, so there they stay.
 
 ## Factories and seeders
 
