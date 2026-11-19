@@ -44,6 +44,8 @@ namespace orbit {
         // A global scope: conditions every query of the class gets
         // (`withoutScope("Name")` on a query drops it, `withoutScopes()` all).
         fn apply(q: Builder, map: TableMap, d: Decorator) {}
+        // Whether apply() may add conditions: false lets every query skip it.
+        fn scopes() -> bool { return true }
         fn saving(m: Model, d: Decorator) {}
         fn saved(m: Model, d: Decorator) {}
         fn creating(m: Model, d: Decorator) {}
@@ -173,6 +175,7 @@ namespace orbit {
     // `DateTime?` field, deletedAt by default) instead of removing it, and
     // queries leave marked rows out (withTrashed, onlyTrashed, restore, forceDelete).
     class SoftDeletesBehavior extends Behavior {
+        fn scopes() -> bool { return false }   // (its condition comes from the query's trashed setting)
         fn boot(map: TableMap, d: Decorator) {
             let name = d.args.size() > 0 ? d.text(0) : "deletedAt";
             let m = map.find(name);
@@ -187,6 +190,7 @@ namespace orbit {
     // Timestamps: createdAt and updatedAt (DateTime fields; or
     // @Timestamps("created", "updated")) are set on insert, and updatedAt on update.
     class TimestampsBehavior extends Behavior {
+        fn scopes() -> bool { return false }
         fn boot(map: TableMap, d: Decorator) {
             let c = map.find(d.args.size() > 0 ? d.text(0) : "createdAt");
             let u = map.find(d.args.size() > 1 ? d.text(1) : "updatedAt");
@@ -198,6 +202,7 @@ namespace orbit {
     // @Uuids, or @Uuids("field"): a new row gets a random UUID (v4) in that
     // string field (uuid by default) when it is empty.
     class UuidsBehavior extends Behavior {
+        fn scopes() -> bool { return false }
         fn creating(m: Model, d: Decorator) {
             let info = ClassInfo.of(m);
             let name = d.args.size() > 0 ? d.text(0) : "uuid";
