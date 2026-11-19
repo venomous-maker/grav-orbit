@@ -17,6 +17,7 @@ compiler versions it builds with.
   (`Behavior.scopes()` false: Timestamps, SoftDeletes, Uuids) no longer cost a
   scratch builder per query, the alias map is made only when needed, and a
   builder looks its quoting connection up once.
+- Uses grav-db v0.1.1 (its faster `quote()`).
 
 ## 0.1.0 (2026-11-19)
 
