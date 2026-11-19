@@ -163,13 +163,12 @@ namespace orbit {
             if (!Sql.isWatching()) { db.each(sql, args, f); return; }
             let e = new QueryEvent(sql, args, name, true);
             e.replica = replica;
-            let n = new Array<long>();
-            n.push(0);
+            let n = 0 as long;
             let t0 = Time.monotonicNs();
-            try { db.each(sql, args, fn(row: Row) { n[0] = n[0] + 1; f(row); }); }
+            try { db.each(sql, args, fn(row: Row) { n += 1; f(row); }); }
             catch (x: Exception) { Sql.failed(e, t0, x); throw x; }
             e.ms = Sql.since(t0);
-            e.rows = n[0];
+            e.rows = n;
             Sql.emit(e);
         }
 
