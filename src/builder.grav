@@ -28,6 +28,7 @@ namespace orbit {
         public __table: string
         public __alias: string
         public __db: Connection
+        private __quoter: Connection = null   // (the connection q() quotes with, looked up once)
         public __depth: int = 0
         private conds: Array<string> = new Array<string>()
         private ops: Array<string> = new Array<string>()
@@ -59,7 +60,7 @@ namespace orbit {
         private scopeArgs: Array<Array<any>> = new Array<Array<any>>()
         // selectRaw's `expr AS alias` pairs: having("alias", ...) puts the expression
         // back, since PostgreSQL takes no aliases in HAVING.
-        private aliases: HashMap<string, string> = new HashMap<string, string>()
+        private aliases: HashMap<string, string> = null   // (made by the first selectRaw alias)
         // 0: rows a soft delete removed are left out; 1: with them; 2: only them.
         public __trashed: int = 0
         // remember(): how long its reads' results are kept in the query cache (-1: not at all).
@@ -73,7 +74,7 @@ namespace orbit {
         }
 
         // Runs on `db` instead of the default connection.
-        fn on(db: Connection) -> Self { self.__db = db; return self; }
+        fn on(db: Connection) -> Self { self.__db = db; self.__quoter = null; return self; }
         // Answers this query's reads from the query cache (Orbit.cacheQueries) for
         // `seconds`: the first run reads the database, later identical ones (same
         // SQL, same arguments) the cache, until the time is up or Orbit writes to a
@@ -257,6 +258,7 @@ namespace orbit {
         fn __applyScopes() {
             if (self.__map == null) { return; }
             for (u in self.__map.behaviors) {
+                if (!u.behavior.scopes()) { continue; }
                 let inner = new Builder(self.__map, self.__table, self.__db);
                 inner.__alias = self.__alias;
                 inner.__trashed = 1;
@@ -284,7 +286,10 @@ namespace orbit {
                 else if (c == (',' as byte) && depth == 0) {
                     let piece = Str.trim(sql[start..i]);
                     let at = Str.lastIndexOf(Str.lower(piece), " as ");
-                    if (at > 0) { self.aliases.put(Str.trim(piece[at + 4..]), Str.trim(piece[..at])); }
+                    if (at > 0) {
+                        if (self.aliases == null) { self.aliases = new HashMap<string, string>(); }
+                        self.aliases.put(Str.trim(piece[at + 4..]), Str.trim(piece[..at]));
+                    }
                     start = i + 1;
                 }
             }
@@ -311,7 +316,7 @@ namespace orbit {
         // `having("total", ">", 10)` (a selected alias or a field), or havingRaw for an expression.
         fn having(name: string, op: string, value: any) -> Self {
             let lhs = self.__map != null && self.__map.find(name) != null ? self.col(name)
-            : self.aliases.containsKey(name) ? self.aliases[name] : self.q(Builder.ident(name));
+            : self.aliases != null && self.aliases.containsKey(name) ? self.aliases[name] : self.q(Builder.ident(name));
             self.havingOps.push(" AND ");
             self.havings.push(lhs + " " + Builder.operator(op) + " ?");
             self.havingArgs.push(value);
@@ -653,7 +658,10 @@ namespace orbit {
             if (m == null) { throw new ValueError(self.__map.info.simpleName() + " has no field or column '" + name + "' (whereRaw takes SQL)"); }
             return m.column;
         }
-        fn q(name: string) -> string { return self.conn().quote(name); }
+        fn q(name: string) -> string {
+            if (self.__quoter == null) { self.__quoter = self.conn(); }
+            return self.__quoter.quote(name);
+        }
 
         private fn idName() -> string {
             if (self.__map == null || self.__map.id == null) { return "id"; }
