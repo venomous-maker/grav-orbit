@@ -1,5 +1,6 @@
 name = "grav-orbit"
 lib = "src/orbit.grav"
+grav = ">=1.7.0"
 paths = ["src"]
 
 [dependencies]
