@@ -4,4 +4,4 @@ grav = ">=1.7.0"
 paths = ["src"]
 
 [dependencies]
-grav-db = "github.com/venomous-maker/grav-db@v0.1.0"
+grav-db = "github.com/venomous-maker/grav-db@v0.1.1"
