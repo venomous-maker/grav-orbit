@@ -425,7 +425,7 @@ namespace orbit {
             let db = self.conn();
             let sets = new Array<string>();
             let a = new Array<any>();
-            for (k in values.keys()) { sets.push(db.quote(self.column(k)) + " = ?"); a.push(values[k]); }
+            for ((k, v) in values) { sets.push(db.quote(self.column(k)) + " = ?"); a.push(v); }
             if (self.__map != null && self.__map.updatedAt != null && !values.containsKey(self.__map.updatedAt.field.name)) {
                 sets.push(db.quote(self.__map.updatedAt.column) + " = ?");
                 a.push(DateTime.now());
@@ -1062,7 +1062,7 @@ namespace orbit {
         private fn matching(attrs: HashMap<string, any>) -> Query<T> {
             let q = new Query<T>(self.__map);
             q.__db = self.__db;
-            for (k in attrs.keys()) { q.where(k, attrs[k]); }
+            for ((k, v) in attrs) { q.where(k, v); }
             return q;
         }
         private fn make(attrs: HashMap<string, any>, values: HashMap<string, any>) -> T {
@@ -1103,7 +1103,7 @@ namespace orbit {
             let cols = new Array<string>();
             let marks = new Array<string>();
             let args = new Array<any>();
-            for (k in values.keys()) { cols.push(db.quote(Builder.ident(k))); marks.push("?"); args.push(values[k]); }
+            for ((k, v) in values) { cols.push(db.quote(Builder.ident(k))); marks.push("?"); args.push(v); }
             return Sql.insert(db, self.__name(), "INSERT INTO " + db.quote(self.__table) + " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")", args, self.__table);
         }
         // Inserts the rows (all with the same columns as the first), batched; how many.

@@ -120,8 +120,8 @@ namespace orbit {
         fn raw() -> HashMap<string, any> {
             let f = self.fake == null ? Fake.shared() : self.fake;
             let v = self.definition(f);
-            for (s in self.states) { let more = s(f); for (k in more.keys()) { v.put(k, more[k]); } }
-            for (s in self.sequences) { let more = s(self.made); for (k in more.keys()) { v.put(k, more[k]); } }
+            for (s in self.states) { for ((k, x) in s(f)) { v.put(k, x); } }
+            for (s in self.sequences) { for ((k, x) in s(self.made)) { v.put(k, x); } }
             self.made += 1;
             return v;
         }

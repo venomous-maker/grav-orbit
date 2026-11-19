@@ -117,23 +117,23 @@ namespace orbit {
         // Sets fields from `values` (field names); with `mass`, @Guarded fields and a
         // numbered id are left out, as from user input.
         static fn fill(obj: any, map: TableMap, values: HashMap<string, any>, mass: bool) {
-            for (k in values.keys()) {
+            for ((k, value) in values) {
                 let m = map.find(k);
                 if (m != null) {
                     if (mass && m.guarded) { continue; }
-                    m.field.set(obj, values[k]);
+                    m.field.set(obj, value);
                     continue;
                 }
                 let p = map.info.property(k);                     // a setter (a mutator): set name(v) { ... }
                 if (p != null && !p.isStatic() && !p.isPrivate() && !p.isProtected()) {
                     if (mass && p.has("Guarded")) { continue; }
                     if (p.isReadonly()) { throw new ValueError(map.info.simpleName() + "." + k + " is a read-only property"); }
-                    p.set(obj, values[k]);
+                    p.set(obj, value);
                     continue;
                 }
                 let f = map.info.field(k);
                 if (f == null) { throw new ValueError(map.info.simpleName() + " has no field or property '" + k + "'"); }
-                f.set(obj, values[k]);
+                f.set(obj, value);
             }
         }
         // Whether `obj` is not saved yet: its numbered id is still 0 (or null).
@@ -276,10 +276,9 @@ namespace orbit {
             }
             if (obj is Model) {
                 let model = obj as Model;
-                if (model.__ex != null) { for (k in model.__ex.keys()) { out.put(k, model.__ex[k]); } }
+                if (model.__ex != null) { for ((k, x) in model.__ex) { out.put(k, x); } }
                 if (model.__nm != null) {
-                    for (k in model.__nm.keys()) {
-                        let key = model.__nm[k];
+                    for ((k, key) in model.__nm) {
                         let v = model.__loaded().getOr(key + "#models", model.__loaded().getOr(key, null));   // (a list as Array<Model>)
                         out.put(k, Persister.plain(v));
                     }
@@ -313,7 +312,7 @@ namespace orbit {
             if (v is HashMap<string, any>) {
                 let o = Json.object();
                 let m = v as HashMap<string, any>;
-                for (k in m.keys()) { o.set(k, Persister.json(m[k])); }
+                for ((k, x) in m) { o.set(k, Persister.json(x)); }
                 return o;
             }
             if (v is Array<any>) {
@@ -624,8 +623,8 @@ namespace orbit {
         // Saves it and every loaded related object (one level down, and theirs in turn).
         fn push() -> Self {
             self.save();
-            for (name in self.__names().keys()) {
-                let v = self.__loaded().getOr(self.__names()[name] + "#models", self.__loaded().getOr(self.__names()[name], null));
+            for (key in self.__names().values()) {
+                let v = self.__loaded().getOr(key + "#models", self.__loaded().getOr(key, null));
                 if (v is Model) { (v as Model).push(); }
                 else if (v is Array<Model>) { for (m in v as Array<Model>) { m.push(); } }
             }
@@ -708,7 +707,7 @@ namespace orbit {
             self.__loaded().remove(key);
             self.__loaded().remove(key + "#models");
             let gone = new Array<string>();
-            for (n in self.__names().keys()) { if (self.__names()[n] == key) { gone.push(n); } }
+            for ((n, k) in self.__names()) { if (k == key) { gone.push(n); } }
             for (n in gone) { self.__names().remove(n); }
         }
         fn __map() -> TableMap { return TableMap.of(ClassInfo.of(self)); }

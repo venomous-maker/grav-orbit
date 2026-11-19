@@ -267,14 +267,14 @@ namespace orbit {
             if ((DB.threadsOn.get() != 0)) {
                 DB.threadLock.lock();
                 let found = "";
-                for (k in DB.threads.keys()) {
-                    if (DB.threads[k] == db) { let parts = Str.split(k, "\t"); found = parts[1]; break; }
+                for ((k, c) in DB.threads) {
+                    if (c == db) { let parts = Str.split(k, "\t"); found = parts[1]; break; }
                 }
                 DB.threadLock.unlock();
                 if (found != "") { return found; }
             }
-            for (k in DB.named.keys()) { if (DB.named[k] == db) { return k; } }
-            for (k in DB.reads.keys()) { for (r in DB.reads[k].conns) { if (r == db) { return k; } } }
+            for ((k, c) in DB.named) { if (c == db) { return k; } }
+            for ((k, rs) in DB.reads) { for (r in rs.conns) { if (r == db) { return k; } } }
             return Sql.anonymous(db);
         }
         // nameOf, only while something needs it (the log, the cache, sticky reads); "" otherwise.

@@ -449,7 +449,7 @@ namespace orbit {
             let db = self.db();
             let sets = new Array<string>();
             let args = new Array<any>();
-            for (k in values.keys()) { sets.push(db.quote(Builder.ident(k)) + " = ?"); args.push(values[k]); }
+            for ((k, v) in values) { sets.push(db.quote(Builder.ident(k)) + " = ?"); args.push(v); }
             if (self.pivotTimes && !values.containsKey("updated_at")) { sets.push(db.quote("updated_at") + " = ?"); args.push(DateTime.now()); }
             if (sets.size() == 0) { return 0; }
             args.push(self.parentKey.field.get(self.parent));
@@ -875,9 +875,8 @@ namespace orbit {
                 if (!byType.containsKey(k)) { byType.put(k, new Array<Model>()); }
                 byType[k].push(p);
             }
-            for (t in byType.keys()) {
+            for ((t, group) in byType) {
                 let map = MorphTo.mapOf(t);
-                let group = byType[t];
                 let q = new Query<Model>(map);
                 q.whereIn(map.requireId().field.name, Relation.keysOf(group, self.idField));
                 self.prepare(q, nested);
@@ -931,7 +930,7 @@ namespace orbit {
         static fn seen() -> HashMap<string, int> {
             LazyLoads.lock.lock();
             let out = new HashMap<string, int>();
-            for (k in LazyLoads.counts.keys()) { out.put(k, LazyLoads.counts[k]); }
+            for ((k, n) in LazyLoads.counts) { out.put(k, n); }
             LazyLoads.lock.unlock();
             return out;
         }
