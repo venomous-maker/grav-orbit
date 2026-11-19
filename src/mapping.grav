@@ -62,6 +62,9 @@ namespace orbit {
         }
     }
 
+    // The moments in a model's life that behaviors and observers hear about.
+    enum ModelHook { Saving, Saved, Creating, Created, Updating, Updated, Deleting, Deleted, Trashed, ForceDeleting, ForceDeleted, Restoring, Restored, Retrieved }
+
     // One mapped field: its column and what the column is like.
     class FieldMap {
         public field: FieldInfo
@@ -85,11 +88,17 @@ namespace orbit {
         public index: int = 0
         // @Cast("name"): how its value goes into the column and back (null: as it is).
         public cast: Cast = null
+        // `kind` worked out once, for reading rows: 1 decimal, 2 json, 3 datetime
+        // (a column value that may need converting), 4 string, 5 int or long (one
+        // whose column value is already what the field holds), 0 anything else.
+        public code: int = 0
 
         constructor(field: FieldInfo, column: string, kind: string) {
             self.field = field;
             self.column = column;
             self.kind = kind;
+            self.code = kind == "decimal" ? 1 : kind == "json" ? 2 : kind == "datetime" ? 3 :
+                        kind == "string" ? 4 : kind == "int" || kind == "long" ? 5 : 0;
         }
         // The value its column gets from `obj` (through its cast).
         fn columnValue(obj: any) -> any {
@@ -196,31 +205,51 @@ namespace orbit {
             for (u in self.behaviors) { u.behavior.boot(self, u.decorator); }
         }
         private static noDeco: Decorator = new Decorator("Observer")
-        // Runs hook `hook` ("saving", "created", ...) of each behavior on `obj` (a
-        // Model), then of each observer registered for its class (Observers.of).
-        fn fire(hook: string, obj: any) {
+        // Runs hook `hook` of each behavior on `obj` (a Model), then of each
+        // observer registered for its class (Observers.of).
+        fn fire(hook: ModelHook, obj: any) {
+            if (self.behaviors.isEmpty() && !Observers.any()) { return; }   // (the usual case for every loaded row)
             if (!(obj is Model)) { return; }
             let m = obj as Model;
             for (u in self.behaviors) { TableMap.run(hook, u.behavior, m, u.decorator); }
             if (Observers.any()) { for (o in Observers.of(self.info)) { TableMap.run(hook, o, m, TableMap.noDeco); } }
         }
-        private static fn run(hook: string, b: Behavior, m: Model, d: Decorator) {
+        // The same, by the hook's name ("saving", "created", ...).
+        fn fire(hook: string, obj: any) {
             switch (hook) {
-                case "saving": b.saving(m, d)
-                case "saved": b.saved(m, d)
-                case "creating": b.creating(m, d)
-                case "created": b.created(m, d)
-                case "updating": b.updating(m, d)
-                case "updated": b.updated(m, d)
-                case "deleting": b.deleting(m, d)
-                case "deleted": b.deleted(m, d)
-                case "trashed": b.trashed(m, d)
-                case "forceDeleting": b.forceDeleting(m, d)
-                case "forceDeleted": b.forceDeleted(m, d)
-                case "restoring": b.restoring(m, d)
-                case "restored": b.restored(m, d)
-                case "retrieved": b.retrieved(m, d)
+                case "saving": self.fire(ModelHook.Saving, obj)
+                case "saved": self.fire(ModelHook.Saved, obj)
+                case "creating": self.fire(ModelHook.Creating, obj)
+                case "created": self.fire(ModelHook.Created, obj)
+                case "updating": self.fire(ModelHook.Updating, obj)
+                case "updated": self.fire(ModelHook.Updated, obj)
+                case "deleting": self.fire(ModelHook.Deleting, obj)
+                case "deleted": self.fire(ModelHook.Deleted, obj)
+                case "trashed": self.fire(ModelHook.Trashed, obj)
+                case "forceDeleting": self.fire(ModelHook.ForceDeleting, obj)
+                case "forceDeleted": self.fire(ModelHook.ForceDeleted, obj)
+                case "restoring": self.fire(ModelHook.Restoring, obj)
+                case "restored": self.fire(ModelHook.Restored, obj)
+                case "retrieved": self.fire(ModelHook.Retrieved, obj)
                 default: throw new ValueError("no behavior hook '" + hook + "'")
+            }
+        }
+        private static fn run(hook: ModelHook, b: Behavior, m: Model, d: Decorator) {
+            switch (hook) {
+                case ModelHook.Saving: b.saving(m, d)
+                case ModelHook.Saved: b.saved(m, d)
+                case ModelHook.Creating: b.creating(m, d)
+                case ModelHook.Created: b.created(m, d)
+                case ModelHook.Updating: b.updating(m, d)
+                case ModelHook.Updated: b.updated(m, d)
+                case ModelHook.Deleting: b.deleting(m, d)
+                case ModelHook.Deleted: b.deleted(m, d)
+                case ModelHook.Trashed: b.trashed(m, d)
+                case ModelHook.ForceDeleting: b.forceDeleting(m, d)
+                case ModelHook.ForceDeleted: b.forceDeleted(m, d)
+                case ModelHook.Restoring: b.restoring(m, d)
+                case ModelHook.Restored: b.restored(m, d)
+                case ModelHook.Retrieved: b.retrieved(m, d)
             }
         }
         // Whether it wears behavior `name`.
