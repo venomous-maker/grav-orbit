@@ -51,7 +51,7 @@ namespace orbit {
             let obj = map.info.create();
             Persister.read(obj, map, row, at);
             if (obj is Model) { (obj as Model).__exists = true; }
-            map.fire("retrieved", obj);
+            map.fire(ModelHook.Retrieved, obj);
             return obj;
         }
         // Where each of the class's fields is among `columns` (-1: not there), found
@@ -77,13 +77,19 @@ namespace orbit {
                     continue;
                 }
                 let v = row.at(p);
-                if (v != null) {
-                    if (m.kind == "decimal" && !(v is Decimal)) { v = row.getDecimal(m.column); }
-                    else if (m.kind == "json" && !(v is JsonValue)) { v = row.getJson(m.column); }
-                    else if (m.kind == "datetime" && !(v is DateTime)) { v = row.getDateTime(m.column); }
+                let code = m.code;
+                if (v != null && code != 0 && code < 4) {
+                    if (code == 1 && !(v is Decimal)) { v = row.getDecimal(m.column); }
+                    else if (code == 2 && !(v is JsonValue)) { v = row.getJson(m.column); }
+                    else if (code == 3 && !(v is DateTime)) { v = row.getDateTime(m.column); }
                 }
                 m.setFromColumn(obj, v);
-                if (orig != null) { orig.push(m.cast == null ? m.field.get(obj) : v); } // (the snapshot, as set: bools from 1/0 and so on)
+                if (orig != null) {
+                    // The snapshot, as set (bools from 1/0 and so on); a string or a whole
+                    // number goes in unchanged, so it is not read back.
+                    let direct = m.cast != null || (code == 4 && v is string) || (code == 5 && v is long);
+                    orig.push(direct ? v : m.field.get(obj));
+                }
             }
             if (model != null) { model.__orig = orig; }
         }
@@ -149,16 +155,16 @@ namespace orbit {
         static fn save(obj: any, map: TableMap, db: Connection, quiet: bool = false) {
             let now = DateTime.now();
             let model: Model = obj is Model ? obj as Model : null;
-            if (!quiet) { map.fire("saving", obj); if (model != null) { model.beforeSave(); } }
+            if (!quiet) { map.fire(ModelHook.Saving, obj); if (model != null) { model.beforeSave(); } }
             if (Persister.isNew(obj, map)) {
                 if (map.createdAt != null && map.createdAt.field.get(obj) == null) { map.createdAt.field.set(obj, now); }
                 if (map.updatedAt != null) { map.updatedAt.field.set(obj, now); }
-                if (!quiet) { map.fire("creating", obj); if (model != null) { model.beforeCreate(); } }
+                if (!quiet) { map.fire(ModelHook.Creating, obj); if (model != null) { model.beforeCreate(); } }
                 Persister.insert(obj, map, db);
                 if (model != null && model.__ch != null) { model.__ch.clear(); }
-                if (!quiet) { if (model != null) { model.afterCreate(); } map.fire("created", obj); }
+                if (!quiet) { if (model != null) { model.afterCreate(); } map.fire(ModelHook.Created, obj); }
             } else {
-                if (!quiet) { map.fire("updating", obj); if (model != null) { model.beforeUpdate(); } }
+                if (!quiet) { map.fire(ModelHook.Updating, obj); if (model != null) { model.beforeUpdate(); } }
                 let changed = Persister.dirty(obj, map);
                 if (model != null && model.__ch != null) { model.__ch.clear(); }
                 if (changed.size() > 0) {
@@ -171,10 +177,10 @@ namespace orbit {
                     if (Persister.update(obj, map, db, changed) == 0 && map.id != null && !map.id.auto) { Persister.insert(obj, map, db); }
                     if (model != null) { for (c in changed) { model.__changes().put(c.field.name, c.field.get(obj)); } }
                 }
-                if (!quiet) { if (model != null) { model.afterUpdate(); } map.fire("updated", obj); }
+                if (!quiet) { if (model != null) { model.afterUpdate(); } map.fire(ModelHook.Updated, obj); }
             }
             Persister.snapshot(obj, map);
-            if (!quiet) { if (model != null) { model.afterSave(); } map.fire("saved", obj); Persister.touch(obj, map); }
+            if (!quiet) { if (model != null) { model.afterSave(); } map.fire(ModelHook.Saved, obj); Persister.touch(obj, map); }
         }
         // Touches ($touches): every row map.touches' relations match, by a raw
         // UPDATE of their updatedAt (Relation.touchAll — no load, no hooks on them).
@@ -226,23 +232,23 @@ namespace orbit {
         // Deletes `obj`'s row (with `force` even for a @SoftDeletes class); whether there was one.
         static fn delete(obj: any, map: TableMap, db: Connection, force: bool) -> bool {
             let id = map.requireId();
-            map.fire("deleting", obj);
+            map.fire(ModelHook.Deleting, obj);
             let goingThrough = force && map.softDelete != null;   // a forceDelete of an otherwise-soft-deletable row
-            if (goingThrough) { map.fire("forceDeleting", obj); }
+            if (goingThrough) { map.fire(ModelHook.ForceDeleting, obj); }
             if (map.softDelete != null && !force) {
                 map.softDelete.field.set(obj, DateTime.now());
                 let marked = Persister.update(obj, map, db) > 0;
                 Persister.snapshot(obj, map);
-                map.fire("deleted", obj);
-                map.fire("trashed", obj);
+                map.fire(ModelHook.Deleted, obj);
+                map.fire(ModelHook.Trashed, obj);
                 return marked;
             }
             let args = new Array<any>();
             args.push(id.field.get(obj));
             let gone = Sql.execute(db, DB.nameFor(db), "DELETE FROM " + db.quote(map.table) + " WHERE " + db.quote(id.column) + " = ?", args, map.table) > 0;
             if (obj is Model) { (obj as Model).__exists = false; }
-            map.fire("deleted", obj);
-            if (goingThrough) { map.fire("forceDeleted", obj); }
+            map.fire(ModelHook.Deleted, obj);
+            if (goingThrough) { map.fire(ModelHook.ForceDeleted, obj); }
             return gone;
         }
         // The field values of `obj` as a map (column values; @Hidden left out;
@@ -550,12 +556,12 @@ namespace orbit {
         fn restore() -> Self {
             let map = self.__map();
             if (map.softDelete == null) { throw new StateError(map.info.simpleName() + " is not @SoftDeletes"); }
-            map.fire("restoring", self);
+            map.fire(ModelHook.Restoring, self);
             map.softDelete.field.set(self, null);
             if (map.updatedAt != null) { map.updatedAt.field.set(self, DateTime.now()); }
             Persister.update(self, map, self.__db());
             Persister.snapshot(self, map);
-            map.fire("restored", self);
+            map.fire(ModelHook.Restored, self);
             return self;
         }
         // Whether a soft delete marked it.
