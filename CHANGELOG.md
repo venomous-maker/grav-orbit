@@ -6,6 +6,8 @@ compiler versions it builds with.
 
 ## Unreleased
 
+## 0.1.1 (2026-11-19)
+
 ### Performance
 
 - Loading rows is about 25% cheaper: a field's kind is worked out once instead
