@@ -1,7 +1,7 @@
 name = "grav-orbit"
 lib = "src/orbit.grav"
-grav = ">=1.7.0"
+grav = ">=1.9.0"
 paths = ["src"]
 
 [dependencies]
-grav-db = "github.com/venomous-maker/grav-db@v0.1.1"
+grav-db = "github.com/venomous-maker/grav-db@v0.2.0"

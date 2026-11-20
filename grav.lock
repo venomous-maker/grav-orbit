@@ -1,2 +1,2 @@
 # grav.lock: exact commits of the installed dependencies (generated; commit this file)
-grav-db = { source = "github.com/venomous-maker/grav-db", version = "v0.1.1", commit = "fc065e0eb1467e9ca7de80feef1f954ef32420c4" }
+grav-db = { source = "github.com/venomous-maker/grav-db", version = "v0.2.0", commit = "8d60a239249f8533d750d70625baa0a33b991cfd" }
