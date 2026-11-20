@@ -978,6 +978,10 @@ namespace orbit {
                 self.__cursor(self.col(id.field.name), id.field.get(part[part.size() - 1]));
             }
         }
+        // The matches one at a time, read `size` at a time in id order (with() applies
+        // per page): `for (u in User.where("active", true).iterate())`. A loop that
+        // stops early reads no further pages.
+        fn iterate(size: int = 1000) -> QueryIterator<T> { return new QueryIterator<T>(self, size); }
         // The match with id `id`, or null; with ids, those that exist.
         fn find(id: any) -> T { return self.whereKey(id).first(); }
         fn findMany(ids: Array<any>) -> Array<T> { return self.whereKey(ids).get(); }
@@ -1129,6 +1133,38 @@ namespace orbit {
                 all.push(a);
             }
             return Sql.executeMany(db, self.__name(), "INSERT INTO " + db.quote(self.__table) + " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")", all, self.__table);
+        }
+    }
+
+    // A query's matches, read a page at a time in id order (see Query.iterate).
+    class QueryIterator<T> implements Iterator<T> {
+        private q: Query<T>
+        private size: int
+        private page: Array<T> = new Array<T>()
+        private at: int = 0
+        private started: bool = false
+        private done: bool = false
+        constructor(q: Query<T>, size: int) { self.q = q; self.size = size < 1 ? 1 : size; }
+        fn hasNext() -> bool {
+            if (self.at < self.page.size()) { return true; }
+            if (self.done) { return false; }
+            let id = self.q.__map.requireId();
+            if (!self.started) {
+                self.q.reorder().orderBy(id.field.name).limit(self.size as long);
+                self.q.__cursor(self.q.col(id.field.name), null);
+                self.started = true;
+            } else {
+                self.q.__cursor(self.q.col(id.field.name), id.field.get(self.page[self.page.size() - 1]));
+            }
+            self.page = self.q.get();
+            self.at = 0;
+            if (self.page.size() < self.size) { self.done = true; }
+            return self.page.size() > 0;
+        }
+        fn next() -> T {
+            if (!self.hasNext()) { throw new StateError("Query.iterate: no more rows"); }
+            self.at += 1;
+            return self.page[self.at - 1];
         }
     }
 }

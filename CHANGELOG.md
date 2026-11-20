@@ -6,6 +6,11 @@ compiler versions it builds with.
 
 ## Unreleased
 
+### Queries
+
+- `iterate(size)` on a query or a model class: its rows as a `for` loop, read
+  `size` at a time in id order; a loop that stops early reads no further pages.
+
 ## 0.1.1 (2026-11-19)
 
 ### Performance

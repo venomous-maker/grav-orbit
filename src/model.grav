@@ -405,6 +405,8 @@ namespace orbit {
         static fn whereExists(sub: Builder) -> Query<Self> { return new Query<Self>(TableMap.of(reflect(Self))).whereExists(sub); }
         static fn cursor(f: fn(Self)) { new Query<Self>(TableMap.of(reflect(Self))).cursor(f); }
         static fn lazy(f: fn(Self), size: int = 1000) { new Query<Self>(TableMap.of(reflect(Self))).lazy(f, size); }
+        // Every row, one at a time, read `size` at a time in id order: `for (u in User.iterate())`.
+        static fn iterate(size: int = 1000) -> QueryIterator<Self> { return new QueryIterator<Self>(new Query<Self>(TableMap.of(reflect(Self))), size); }
         static fn simplePaginate(page: long = 1, perPage: long = 15) -> SimplePage<Self> { return new Query<Self>(TableMap.of(reflect(Self))).simplePaginate(page, perPage); }
         static fn cursorPaginate(perPage: long = 15, cursor: string = "") -> CursorPage<Self> { return new Query<Self>(TableMap.of(reflect(Self))).cursorPaginate(perPage, cursor); }
 

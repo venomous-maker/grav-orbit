@@ -690,6 +690,16 @@ test "query gaps: constrained eager loads, scopes, ofMany, subqueries, unions, J
     let lazily = new Array<string>()
     User.lazy(fn(u: User) { lazily.push(u.name) }, 2)
     assertEq("${streamed} ${lazily.size()}", "[\"Ada\", \"Bob\", \"Cy\"] 3")
+    // iterate(): a loop over pages of `size`, which stops reading when the loop stops.
+    let iterated = new Array<string>()
+    for (u in User.iterate(2)) { iterated.push(u.name) }
+    let firstTwo = new Array<string>()
+    DB.enableQueryLog()
+    DB.flushQueryLog()
+    for (u in User.query().where("name", "!=", "Zed").iterate(1)) { firstTwo.push(u.name); if (firstTwo.size() == 2) { break } }
+    let pagesRead = DB.getQueryLog().size()
+    DB.disableQueryLog()
+    assertEq("${iterated.size()} ${firstTwo.size()} ${pagesRead}", "3 2 2")
     let p1 = User.query().orderBy("name").simplePaginate(1, 2)
     let p2 = User.query().orderBy("name").simplePaginate(2, 2)
     assertEq("${p1.items.size()} ${p1.hasMorePages()} ${p2.items.size()} ${p2.hasMorePages()} ${p2.items[0].name}", "2 true 1 false Cy")

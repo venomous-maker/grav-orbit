@@ -472,7 +472,14 @@ User.where("active", false).chunkById(500, fn(part: Array<User>) {
 User.query().each(fn(u: User) { print(u.email) })
 User.lazy(fn(u: User) { print(u.email) }, 1000)        // chunkById underneath: one object at a time
 User.where("active", true).cursor(fn(u: User) { print(u.email) })
+
+for (u in User.where("active", true).iterate(500)) {   // a loop: 500 rows a query, in id order
+    if (u.email == "") { break }                       // stops reading further pages
+}
 ```
+
+`iterate(size)` (on a query or a model class) is `lazy` as a `for` loop: it
+reads `size` rows at a time by id, and a loop that ends early reads no more.
 
 `cursor(f)` runs one query and makes each object as its row arrives (MySQL
 streams it); it applies no `with()`, and `f` should not query the same
