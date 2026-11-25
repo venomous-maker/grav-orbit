@@ -144,7 +144,7 @@ namespace orbit {
             let index = db.quote(self.table + "_migration_unique");
             try {
                 db.exec("CREATE UNIQUE INDEX " + (d == "mysql" ? "" : "IF NOT EXISTS ") + index + " ON " + db.quote(self.table) + " (" + db.quote("migration") + ")");
-            } catch (e: Exception) {}
+            } catch (e: Exception) {}   // (MySQL has no IF NOT EXISTS here: the index being there already is fine)
             self.indexed = true;
         }
 
@@ -190,7 +190,7 @@ namespace orbit {
             try {
                 db.execute("INSERT INTO " + table + " (" + db.quote("id") + ", " + db.quote("owner") + ", " + db.quote("since") + ") VALUES (1, ?, ?)", a);
                 return true;
-            } catch (e: Exception) {}
+            } catch (e: Exception) {}   // (another process holds the lock: the caller waits and tries again)
             // Taken: by a process that is gone (on this host), or for too long?
             let row = db.queryOne("SELECT " + db.quote("owner") + ", " + db.quote("since") + " FROM " + table + " WHERE " + db.quote("id") + " = 1");
             if (row == null) { return false; }
@@ -211,7 +211,7 @@ namespace orbit {
                 if (d == "postgres") { a.push(Migrator.key(self.lockName())); db.queryValue("SELECT pg_advisory_unlock(?)", a); return; }
                 a.push(Migrator.owner());
                 db.execute("DELETE FROM " + db.quote(self.table + "_lock") + " WHERE " + db.quote("id") + " = 1 AND " + db.quote("owner") + " = ?", a);
-            } catch (e: Exception) {}
+            } catch (e: Exception) {}   // (releasing a lock that is gone already is fine)
         }
         // This process, as a lock row names it: host:pid.
         private static fn owner() -> string { return OS.hostname() + ":${Process.pid()}"; }
