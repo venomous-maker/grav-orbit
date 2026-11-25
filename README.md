@@ -580,6 +580,18 @@ DB.transaction(fn() {
 `lockForUpdate` does nothing on SQLite, whose transactions lock the whole
 database.
 
+**After the commit.** `DB.afterCommit(fn() { ... })` runs work only once the
+transaction it was asked in commits: sending the mail, queueing the job,
+telling another service. It is dropped if the transaction, or the savepoint it
+was asked in, rolls back; outside a transaction it runs at once.
+
+```typescript
+DB.transaction(fn() {
+    order.save()
+    DB.afterCommit(fn() { mailer.send(new OrderPlaced(order)) })   // never for an order that was rolled back
+})
+```
+
 To see every statement a program sends, with its time, use
 [the query log](#watching-the-queries).
 

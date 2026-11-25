@@ -6,6 +6,12 @@ compiler versions it builds with.
 
 ## Unreleased
 
+Needs grav 1.12.0 or newer.
+
+- `DB.afterCommit(fn)`: work run once the transaction commits, dropped when it
+  (or its savepoint) rolls back, run at once outside a transaction.
+- Tidied with `grav lint --fix`; three deliberately empty catches say why.
+
 ## 0.2.0 (2026-11-20)
 
 ### Requirements
