@@ -1,0 +1,51 @@
+// DB.afterCommit: work that waits for the transaction to commit, and is dropped
+// when it (or the savepoint it was asked in) rolls back.
+import "std"
+import "grav-db"
+import "../src/orbit.grav"
+use db.*
+use orbit.*
+
+test "after the commit; never after a rollback; at once outside a transaction" {
+    let file = Dir.temp() + "/orbit_after_" + str(Process.pid()) + ".sqlite"
+    new File(file).delete()
+    DB.connect(Sqlite.open(file))
+    DB.statement("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)")
+    let log = new Array<string>()
+    DB.afterCommit(fn() { log.push("outside") })
+    assertEq(str(log), "[\"outside\"]")
+    DB.transaction(fn() {
+        DB.insert("INSERT INTO notes (body) VALUES ('a')")
+        DB.afterCommit(fn() { log.push("seen ${DB.scalar("SELECT COUNT(*) FROM notes")} notes") })
+        assertEq(log.size(), 1)                                        // (not yet)
+    })
+    assertEq(log[1], "seen 1 notes")
+    try {
+        DB.transaction(fn() {
+            DB.afterCommit(fn() { log.push("never") })
+            throw new StateError("no")
+        })
+    } catch (e: StateError) {}   // (the rollback is the point)
+    assertEq(log.size(), 2)
+    // a savepoint that rolls back drops its own; the outer transaction's still run
+    DB.transaction(fn() {
+        DB.afterCommit(fn() { log.push("outer") })
+        try {
+            DB.transaction(fn() {
+                DB.afterCommit(fn() { log.push("inner, rolled back") })
+                throw new StateError("inner")
+            })
+        } catch (e: StateError) {}   // (the savepoint's rollback is the point)
+        DB.transaction(fn() { DB.afterCommit(fn() { log.push("inner, kept") }) })
+    })
+    assertEq(str(log[2..]), "[\"outer\", \"inner, kept\"]")
+    // by hand: beginTransaction, commit, rollBack
+    DB.beginTransaction()
+    DB.afterCommit(fn() { log.push("manual") })
+    DB.commit()
+    DB.beginTransaction()
+    DB.afterCommit(fn() { log.push("manual, rolled back") })
+    DB.rollBack()
+    assertEq(log[log.size() - 1], "manual")
+    new File(file).delete()
+}
