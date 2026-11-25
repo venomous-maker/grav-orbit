@@ -167,7 +167,7 @@ namespace orbit {
                 if (!quiet) { map.fire(ModelHook.Updating, obj); if (model != null) { model.beforeUpdate(); } }
                 let changed = Persister.dirty(obj, map);
                 if (model != null && model.__ch != null) { model.__ch.clear(); }
-                if (changed.size() > 0) {
+                if (!changed.isEmpty()) {
                     if (map.updatedAt != null) {
                         map.updatedAt.field.set(obj, now);
                         let has = false;
@@ -185,7 +185,7 @@ namespace orbit {
         // Touches ($touches): every row map.touches' relations match, by a raw
         // UPDATE of their updatedAt (Relation.touchAll — no load, no hooks on them).
         static fn touch(obj: any, map: TableMap) {
-            if (map.touches.size() == 0 || !(obj is Model)) { return; }
+            if (map.touches.isEmpty() || !(obj is Model)) { return; }
             for (name in map.touches) {
                 let mi = map.info.method(name);
                 if (mi == null) { throw new StateError(map.info.simpleName() + " is @Touches(\"" + name + "\"), and it has no method '" + name + "'"); }
@@ -206,7 +206,7 @@ namespace orbit {
                 args.push(m.columnValue(obj));
             }
             let sql = "INSERT INTO " + db.quote(map.table) +
-                (cols.size() == 0 ? (db.driver() == "mysql" ? " () VALUES ()" : " DEFAULT VALUES") : " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")");
+                (cols.isEmpty() ? (db.driver() == "mysql" ? " () VALUES ()" : " DEFAULT VALUES") : " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")");
             if (numbered) {
                 if (db.driver() == "postgres") { sql = sql + " RETURNING " + db.quote(map.id.column); }
                 map.id.field.set(obj, Sql.insert(db, DB.nameFor(db), sql, args, map.table));
@@ -225,7 +225,7 @@ namespace orbit {
                 sets.push(db.quote(m.column) + " = ?");
                 args.push(m.columnValue(obj));
             }
-            if (sets.size() == 0) { return 0; }
+            if (sets.isEmpty()) { return 0; }
             args.push(id.field.get(obj));
             return Sql.execute(db, DB.nameFor(db), "UPDATE " + db.quote(map.table) + " SET " + Str.join(sets, ", ") + " WHERE " + db.quote(id.column) + " = ?", args, map.table);
         }
@@ -533,7 +533,7 @@ namespace orbit {
         }
         // What the last save changed, and whether it changed a field (any, with no name).
         fn getChanges() -> HashMap<string, any> { return self.__changes(); }
-        fn wasChanged(name: string = "") -> bool { return name == "" ? self.__changes().size() > 0 : self.__changes().containsKey(name); }
+        fn wasChanged(name: string = "") -> bool { return name == "" ? !self.__changes().isEmpty() : self.__changes().containsKey(name); }
         // Takes the current values as the row's (nothing is dirty after).
         fn syncOriginal() -> Self { Persister.snapshot(self, self.__map()); return self; }
         // Sets these fields (not @Guarded ones) and saves.

@@ -41,7 +41,7 @@ namespace orbit {
         // "Class.relation" -> lazy loads on objects read together (N+1s).
         public lazyLoads: HashMap<string, int> = new HashMap<string, int>()
         // Whether anything here deserves a look (repeats, duplicates, lazy loads, failures).
-        fn hasWarnings() -> bool { return self.repeated.size() > 0 || self.lazyLoads.size() > 0 || self.failed > 0; }
+        fn hasWarnings() -> bool { return !self.repeated.isEmpty() || !self.lazyLoads.isEmpty() || self.failed > 0; }
     }
 
     // The query debugbar (see the top of this file).
@@ -127,7 +127,7 @@ namespace orbit {
                 sb.append(r.identical ? "  duplicate " : "  repeated ").appendInt(r.count).append("× (")
                   .append(Format.fixed(r.ms, 2)).append(" ms): ").append(r.sql).append("\n");
             }
-            if (st.slowest.size() > 0) {
+            if (!st.slowest.isEmpty()) {
                 sb.append("  slowest:\n");
                 for (e in st.slowest) { sb.append("    ").append(e.toString()).append("\n"); }
             }
@@ -179,7 +179,7 @@ namespace orbit {
               .append("<summary style=\"cursor:pointer;padding:6px 10px\">Orbit · ").appendInt(st.queries)
               .append(st.queries == 1 ? " statement · " : " statements · ").append(Format.fixed(st.ms, 2)).append(" ms");
             if (st.cached > 0) { sb.append(" · ").appendInt(st.cached).append(" cached"); }
-            if (st.lazyLoads.size() > 0) { sb.append(" · <b style=\"color:#e5a50a\">N+1</b>"); }
+            if (!st.lazyLoads.isEmpty()) { sb.append(" · <b style=\"color:#e5a50a\">N+1</b>"); }
             if (st.failed > 0) { sb.append(" · <b style=\"color:#f66\">").appendInt(st.failed).append(" failed</b>"); }
             sb.append("</summary><div style=\"padding:0 10px 10px\">");
             for (k in Debugbar.sortedKeys(st.lazyLoads)) {

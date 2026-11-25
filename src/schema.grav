@@ -428,7 +428,7 @@ namespace orbit {
             if (c.hasDefault) { s = s + " DEFAULT " + (d == "sqlite" && c.defaultSql == "TRUE" ? "1" : d == "sqlite" && c.defaultSql == "FALSE" ? "0" : c.defaultSql); }
             if (c.isUnique) { s = s + " UNIQUE"; }
             if (c.isPrimary) { s = s + " PRIMARY KEY"; }
-            if (c.kind == "enum" && d != "mysql" && c.allowed.size() > 0) {
+            if (c.kind == "enum" && d != "mysql" && !c.allowed.isEmpty()) {
                 s = s + " CHECK (" + db.quote(c.name) + " IN (" + Schema.values(c) + "))";
             }
             return s;

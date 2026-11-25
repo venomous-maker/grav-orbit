@@ -13,7 +13,6 @@
 //   }
 //   Seeder.seed(new DatabaseSeeder())                          // in a transaction
 import "std"
-import "grav-db"
 import "mapping.grav"
 import "db.grav"
 import "model.grav"

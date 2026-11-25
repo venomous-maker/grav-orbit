@@ -44,7 +44,7 @@ namespace orbit {
         fn toString() -> string {
             let sb = new StringBuilder();
             sb.append(self.sql);
-            if (self.bindings.size() > 0) {
+            if (!self.bindings.isEmpty()) {
                 sb.append(" [");
                 for (i, b in self.bindings) { if (i > 0) { sb.append(", "); } sb.append(Sql.show(b)); }
                 sb.append("]");
@@ -91,7 +91,7 @@ namespace orbit {
         static fn clearLog() { Sql.lock.lock(); Sql.log.clear(); Sql.lock.unlock(); }
         static fn listen(f: fn(QueryEvent)) { Sql.lock.lock(); Sql.listeners.push(f); Sql.rewatch(); Sql.lock.unlock(); }
         static fn forgetListeners() { Sql.lock.lock(); Sql.listeners.clear(); Sql.rewatch(); Sql.lock.unlock(); }
-        private static fn rewatch() { Sql.watchOn.set(Sql.logging || Sql.listeners.size() > 0 ? 1 : 0); }
+        private static fn rewatch() { Sql.watchOn.set(Sql.logging || !Sql.listeners.isEmpty() ? 1 : 0); }
         static fn isWatching() -> bool { return Sql.watchOn.get() != 0; }
         // DB.stickyReads: whether writes' times are kept.
         static fn trackWrites(on: bool) { Sql.trackOn.set(on ? 1 : 0); }
@@ -213,7 +213,7 @@ namespace orbit {
             if (!Sql.isWatching()) {
                 n = db.executeMany(sql, rows);
             } else {
-                let e = new QueryEvent(sql, rows.size() > 0 ? rows[0] : new Array<any>(), name, false);
+                let e = new QueryEvent(sql, !rows.isEmpty() ? rows[0] : new Array<any>(), name, false);
                 e.batch = rows.size();
                 let t0 = Time.monotonicNs();
                 try { n = db.executeMany(sql, rows); }
@@ -282,7 +282,7 @@ namespace orbit {
             Sql.lock.lock();
             let tables = Sql.pending.getOr(name, null);
             if (tables != null) { Sql.pending.remove(name); }
-            Sql.pendingOn.set(Sql.pending.size() > 0 ? 1 : 0);
+            Sql.pendingOn.set(!Sql.pending.isEmpty() ? 1 : 0);
             Sql.lock.unlock();
             if (tables != null) { for (t in tables.toArray()) { Sql.invalidate(name, t); } }
         }
@@ -363,9 +363,9 @@ namespace orbit {
             Sql.lock.lock();
             if (Sql.logging) {
                 Sql.log.pushBack(e);
-                while (Sql.log.size() > Sql.logLimit && Sql.log.size() > 0) { Sql.log.popFront(); }
+                while (Sql.log.size() > Sql.logLimit && !Sql.log.isEmpty()) { Sql.log.popFront(); }
             }
-            let fs = Sql.listeners.size() == 0 ? null : Sql.listeners.toArray();
+            let fs = Sql.listeners.isEmpty() ? null : Sql.listeners.toArray();
             Sql.lock.unlock();
             if (fs != null) { for (f in fs) { f(e); } }
         }

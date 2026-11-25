@@ -23,7 +23,6 @@
 // name), @MorphName("post") (its name in polymorphic relations; the class name
 // otherwise).
 import "std"
-import "grav-db"
 import "behaviors.grav"
 import "casts.grav"
 
@@ -158,7 +157,7 @@ namespace orbit {
                 }
                 if (kind == "") { continue; }
                 let c = f.decorator("Column");
-                let column = c != null && c.args.size() > 0 && c.keys[0] == "" ? c.text(0) : Naming.snake(f.name);
+                let column = c != null && !c.args.isEmpty() && c.keys[0] == "" ? c.text(0) : Naming.snake(f.name);
                 let m = new FieldMap(f, column, kind);
                 m.nullable = f.isNullable() || (c != null && c.flag("nullable", false));
                 if (f.has("NotNull")) { m.nullable = false; }

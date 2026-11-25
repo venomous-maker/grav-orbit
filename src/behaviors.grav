@@ -28,7 +28,6 @@
 // (@Uuids, or @Uuids("field"): a new row gets a random UUID there). The traits in
 // traits.grav bring each one with its fields: `class Post extends Model implements SoftDeletes`.
 import "std"
-import "grav-db"
 import "mapping.grav"
 import "builder.grav"
 import "model.grav"
@@ -177,7 +176,7 @@ namespace orbit {
     class SoftDeletesBehavior extends Behavior {
         fn scopes() -> bool { return false }   // (its condition comes from the query's trashed setting)
         fn boot(map: TableMap, d: Decorator) {
-            let name = d.args.size() > 0 ? d.text(0) : "deletedAt";
+            let name = !d.args.isEmpty() ? d.text(0) : "deletedAt";
             let m = map.find(name);
             if (m == null || m.kind != "datetime") {
                 throw new StateError(map.info.simpleName() + " is @SoftDeletes but has no `" + name + ": DateTime?` field");
@@ -192,7 +191,7 @@ namespace orbit {
     class TimestampsBehavior extends Behavior {
         fn scopes() -> bool { return false }
         fn boot(map: TableMap, d: Decorator) {
-            let c = map.find(d.args.size() > 0 ? d.text(0) : "createdAt");
+            let c = map.find(!d.args.isEmpty() ? d.text(0) : "createdAt");
             let u = map.find(d.args.size() > 1 ? d.text(1) : "updatedAt");
             if (c != null && c.kind == "datetime") { map.createdAt = c; }
             if (u != null && u.kind == "datetime") { map.updatedAt = u; }
@@ -205,7 +204,7 @@ namespace orbit {
         fn scopes() -> bool { return false }
         fn creating(m: Model, d: Decorator) {
             let info = ClassInfo.of(m);
-            let name = d.args.size() > 0 ? d.text(0) : "uuid";
+            let name = !d.args.isEmpty() ? d.text(0) : "uuid";
             let f = info.field(name);
             if (f == null) { throw new StateError(info.simpleName() + " is @Uuids but has no `" + name + ": string` field"); }
             let v = f.get(m);

@@ -68,7 +68,7 @@ namespace orbit {
             let rs = new ReplicaSet();
             for (r in reads) { rs.conns.push(r); }
             DB.named.put(name, write);
-            if (rs.conns.size() > 0) { DB.reads.put(name, rs); } else { DB.reads.remove(name); }
+            if (!rs.conns.isEmpty()) { DB.reads.put(name, rs); } else { DB.reads.remove(name); }
         }
         // Adds one more read replica to the connection called `name`.
         static fn addReadReplica(read: Connection, name: string = "default") {
@@ -88,7 +88,7 @@ namespace orbit {
         static fn stickyReads(seconds: float, name: string = "default") {
             let key = name == "" ? "default" : name;
             if (seconds <= 0.0) { DB.sticky.remove(key); } else { DB.sticky.put(key, (seconds * 1000.0) as long); }
-            Sql.trackWrites(DB.sticky.size() > 0);
+            Sql.trackWrites(!DB.sticky.isEmpty());
         }
         // The connection reads use: a read replica (in turn) while none is in a
         // transaction, nor sticky after a write; else the write connection.
@@ -159,7 +159,7 @@ namespace orbit {
             DB.threadLock.lock();
             DB.threads.remove(key);
             DB.threads.remove(key + "\tread");
-            DB.threadsOn.set(DB.threads.size() > 0 ? 1 : 0);
+            DB.threadsOn.set(!DB.threads.isEmpty() ? 1 : 0);
             DB.threadLock.unlock();
         }
         private static fn bindThread(write: Connection, read: Connection, name: string) {

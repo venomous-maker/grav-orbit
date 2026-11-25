@@ -154,7 +154,7 @@ namespace orbit {
         }
         // Rows belonging to any of `owners` (all of one class).
         fn whereBelongsTo(owners: Array<Model>, relation: string = "") -> Self {
-            if (owners.size() == 0) { return self.cond(" AND ", "1 = 0"); }
+            if (owners.isEmpty()) { return self.cond(" AND ", "1 = 0"); }
             let keys = self.ownerKeys(ClassInfo.of(owners[0]), relation);
             let ids = new Array<any>();
             for (o in owners) { ids.push(keys[1].field.get(o)); }
@@ -263,7 +263,7 @@ namespace orbit {
                 inner.__alias = self.__alias;
                 inner.__trashed = 1;
                 u.behavior.apply(inner, self.__map, u.decorator);
-                if (inner.conds.size() == 0) { continue; }
+                if (inner.conds.isEmpty()) { continue; }
                 self.scopeNames.push(u.name);
                 self.scopeSqls.push("(" + inner.whereSql(false)[7..] + ")");
                 self.scopeArgs.push(inner.args);
@@ -398,7 +398,7 @@ namespace orbit {
             self.lim = 1;
             let all = self.pluck(name);
             self.lim = keep;
-            return all.size() == 0 ? null : all[0];
+            return all.isEmpty() ? null : all[0];
         }
         // The rows as they come (columns by name), for any query.
         fn rows() -> ResultSet { return self.__read(self.__sql(""), self.__bindings()); }
@@ -435,7 +435,7 @@ namespace orbit {
                 sets.push(db.quote(self.__map.updatedAt.column) + " = ?");
                 a.push(DateTime.now());
             }
-            if (sets.size() == 0) { return 0; }
+            if (sets.isEmpty()) { return 0; }
             for (x in self.whereArgs()) { a.push(x); }
             return self.__write(db, "UPDATE " + db.quote(self.__table) + " SET " + Str.join(sets, ", ") + self.whereSql(true), a);
         }
@@ -443,7 +443,7 @@ namespace orbit {
         // columns exists, updates its `update` columns; the rows written. One
         // statement per row, batched (ON CONFLICT, or MySQL's ON DUPLICATE KEY).
         fn upsert(rows: Array<HashMap<string, any>>, uniqueBy: Array<string>, update: Array<string>) -> long {
-            if (rows.size() == 0) { return 0; }
+            if (rows.isEmpty()) { return 0; }
             let db = self.conn();
             let d = db.driver();
             let keys = self.withStamps(rows);
@@ -461,13 +461,13 @@ namespace orbit {
             let target = new Array<string>();
             for (u in uniqueBy) { target.push(db.quote(self.column(u))); }
             let sql = "INSERT INTO " + db.quote(self.__table) + " (" + Str.join(cols, ", ") + ") VALUES (" + Str.join(marks, ", ") + ")";
-            if (d == "mysql") { sql = sql + (sets.size() > 0 ? " ON DUPLICATE KEY UPDATE " + Str.join(sets, ", ") : ""); }
-            else { sql = sql + " ON CONFLICT (" + Str.join(target, ", ") + ")" + (sets.size() > 0 ? " DO UPDATE SET " + Str.join(sets, ", ") : " DO NOTHING"); }
+            if (d == "mysql") { sql = sql + (!sets.isEmpty() ? " ON DUPLICATE KEY UPDATE " + Str.join(sets, ", ") : ""); }
+            else { sql = sql + " ON CONFLICT (" + Str.join(target, ", ") + ")" + (!sets.isEmpty() ? " DO UPDATE SET " + Str.join(sets, ", ") : " DO NOTHING"); }
             return Sql.executeMany(db, self.__name(), sql, self.rowArgs(rows, keys), self.__table);
         }
         // Inserts rows, skipping those a unique key already has; the rows inserted.
         fn insertOrIgnore(rows: Array<HashMap<string, any>>) -> long {
-            if (rows.size() == 0) { return 0; }
+            if (rows.isEmpty()) { return 0; }
             let db = self.conn();
             let d = db.driver();
             let keys = self.withStamps(rows);
@@ -566,7 +566,7 @@ namespace orbit {
         fn __sql(what: string) -> string {
             let db = self.conn();
             let sb = new StringBuilder();
-            if (self.unionParts.size() > 0 && what == "") {
+            if (!self.unionParts.isEmpty() && what == "") {
                 // (base) UNION (others): as a derived table, so the order and limit cover them all
                 sb.append("SELECT * FROM (");
                 sb.append(self.__coreSql(""));
@@ -576,7 +576,7 @@ namespace orbit {
             } else {
                 sb.append(self.__coreSql(what));
             }
-            if (self.orders.size() > 0 && !Str.startsWith(what, "COUNT(") ) { sb.append(" ORDER BY "); sb.append(Str.join(self.orders, ", ")); }
+            if (!self.orders.isEmpty() && !Str.startsWith(what, "COUNT(") ) { sb.append(" ORDER BY "); sb.append(Str.join(self.orders, ", ")); }
             if (self.lim >= 0) { sb.append(" LIMIT ${self.lim}"); }
             if (self.off > 0) {
                 if (self.lim < 0) {
@@ -597,13 +597,13 @@ namespace orbit {
             sb.append(self.distinctRows ? "SELECT DISTINCT " : "SELECT ");
             if (what != "") { sb.append(what); }
             else {
-                sb.append(self.selects.size() > 0 ? Str.join(self.selects, ", ") : db.quote(self.__alias) + ".*");
+                sb.append(!self.selects.isEmpty() ? Str.join(self.selects, ", ") : db.quote(self.__alias) + ".*");
                 for (x in self.extraSelects) { sb.append(", "); sb.append(x); }
             }
             sb.append(self.fromSql());
             sb.append(self.whereSql(true));
-            if (self.groups.size() > 0) { sb.append(" GROUP BY "); sb.append(Str.join(self.groups, ", ")); }
-            if (self.havings.size() > 0) {
+            if (!self.groups.isEmpty()) { sb.append(" GROUP BY "); sb.append(Str.join(self.groups, ", ")); }
+            if (!self.havings.isEmpty()) {
                 sb.append(" HAVING ");
                 for (i, h in self.havings) { if (i > 0) { sb.append(self.havingOps[i]); } sb.append(h); }
             }
@@ -669,7 +669,7 @@ namespace orbit {
         }
         private fn fromSql() -> string {
             let from = " FROM " + self.q(self.__table) + (self.__alias != self.__table ? " AS " + self.q(self.__alias) : "");
-            return self.joinSql.size() == 0 ? from : from + " " + Str.join(self.joinSql, " ");
+            return self.joinSql.isEmpty() ? from : from + " " + Str.join(self.joinSql, " ");
         }
         // " WHERE ..." for the conditions (and the soft-delete one when `scoped`), or "".
         private fn whereSql(scoped: bool) -> string {
@@ -724,11 +724,11 @@ namespace orbit {
             inner.__depth = self.__depth;
             inner.__trashed = 1;                                      // (the outer query adds that condition once)
             group(inner);
-            if (inner.conds.size() == 0) { return self; }
+            if (inner.conds.isEmpty()) { return self; }
             return self.condArgs(join, (negate ? "NOT (" : "(") + inner.whereSql(false)[7..] + ")", inner.args);
         }
         private fn inList(join: string, name: string, values: Array<any>, negate: bool) -> Self {
-            if (values.size() == 0) { return self.cond(join, negate ? "1 = 1" : "1 = 0"); }
+            if (values.isEmpty()) { return self.cond(join, negate ? "1 = 1" : "1 = 0"); }
             let marks = new StringBuilder();
             for (i in 0..values.size()) { marks.append(i == 0 ? "?" : ", ?"); }
             return self.condArgs(join, self.col(name) + (negate ? " NOT IN (" : " IN (") + marks.toString() + ")", values);
@@ -763,7 +763,7 @@ namespace orbit {
                 for (c in cols) { any1.push("LOWER(" + c + ") LIKE ?"); a.push("%" + Str.lower(w) + "%"); }
                 words.push("(" + Str.join(any1, " OR ") + ")");
             }
-            if (words.size() == 0) { return self; }
+            if (words.isEmpty()) { return self; }
             return self.condArgs(join, "(" + Str.join(words, " AND ") + ")", a);
         }
         // [foreign key on this class, key on the owner's] of the BelongsTo relation `relation` (or the owner class's name).
@@ -789,7 +789,7 @@ namespace orbit {
                 a.push(t);
                 for (x in inner.__bindings()) { a.push(x); }
             }
-            let sql = parts.size() == 0 ? "1 = 0" : "(" + Str.join(parts, " OR ") + ")";
+            let sql = parts.isEmpty() ? "1 = 0" : "(" + Str.join(parts, " OR ") + ")";
             return self.condArgs(join, negate ? "NOT " + sql : sql, a);
         }
         private fn between(join: string, name: string, lo: any, hi: any, negate: bool) -> Self {
@@ -821,7 +821,7 @@ namespace orbit {
             return self.__write(db, "UPDATE " + db.quote(self.__table) + " SET " + sets + self.whereSql(true), a);
         }
         private fn aggregate(expr: string) -> any {
-            if (self.groups.size() > 0 || self.distinctRows || self.unionParts.size() > 0) {
+            if (!self.groups.isEmpty() || self.distinctRows || !self.unionParts.isEmpty()) {
                 let inner = self.__sql("");
                 return self.__readValue("SELECT " + Str.replace(expr, self.q(self.__alias) + ".", "") + " FROM (" + inner + ") AS " + self.q("__orbit_agg"), self.__bindings());
             }
@@ -1120,7 +1120,7 @@ namespace orbit {
         }
         // Inserts the rows (all with the same columns as the first), batched; how many.
         fn insertMany(rows: Array<HashMap<string, any>>) -> long {
-            if (rows.size() == 0) { return 0; }
+            if (rows.isEmpty()) { return 0; }
             let db = self.conn();
             let keys = rows[0].keys();
             let cols = new Array<string>();

@@ -93,7 +93,7 @@ namespace orbit {
         }
         // Loads `path` ("posts", "posts.comments") for all of `models` (one query a level).
         static fn eagerLoad(models: Array<Model>, path: string, f: fn(Builder) = null, cacheMs: long = -1) {
-            if (models.size() == 0) { return; }
+            if (models.isEmpty()) { return; }
             let dot = Str.indexOf(path, ".");
             let first = dot > 0 ? path[..dot] : path;
             let rest = dot > 0 ? path[dot + 1..] : "";

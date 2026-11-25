@@ -84,7 +84,7 @@ namespace orbit {
             }
             self.order.pushBack(key);
             self.orderSeq.pushBack(self.seq);
-            while (self.entries.size() > self.capacity && self.order.size() > 0) {
+            while (self.entries.size() > self.capacity && !self.order.isEmpty()) {
                 let k = self.order.popFront();
                 let s = self.orderSeq.popFront();
                 let e = self.entries.getOr(k, null);
@@ -131,7 +131,7 @@ namespace orbit {
         private fn compact() {
             let keys = new Deque<string>();
             let seqs = new Deque<long>();
-            while (self.order.size() > 0) {
+            while (!self.order.isEmpty()) {
                 let k = self.order.popFront();
                 let s = self.orderSeq.popFront();
                 let e = self.entries.getOr(k, null);
