@@ -35,7 +35,19 @@ namespace orbit {
     }
 
     // The database connections, transactions and raw SQL (see the top of this file).
+    // Work to do once the transaction it was asked in commits (DB.afterCommit).
+    class AfterCommit {
+        public depth: int
+        public run: fn()
+        constructor(depth: int, run: fn()) { self.depth = depth; self.run = run; }
+    }
+
     class DB {
+        // Per thread (connections are), per connection name: the open
+        // transactions' depth as Orbit counts it, and what waits for the commit.
+        private static depths: ThreadLocal<HashMap<string, int>> = new ThreadLocal<HashMap<string, int>>(fn() -> HashMap<string, int> { return new HashMap<string, int>(); })
+        private static hooks: ThreadLocal<HashMap<string, Array<AfterCommit>>> = new ThreadLocal<HashMap<string, Array<AfterCommit>>>(fn() -> HashMap<string, Array<AfterCommit>> { return new HashMap<string, Array<AfterCommit>>(); })
+
         private static named: HashMap<string, Connection> = new HashMap<string, Connection>()
 
         private static reads: HashMap<string, ReplicaSet> = new HashMap<string, ReplicaSet>()
@@ -196,8 +208,61 @@ namespace orbit {
         static fn transaction(body: fn()) { DB.transaction("default", body); }
         static fn transaction(name: string, body: fn()) {
             let db = DB.connection(name);
-            try { db.transaction(body); } catch (e: Exception) { if (!db.inTransaction()) { Sql.ended(DB.key(name)); } throw e; }
-            if (!db.inTransaction()) { Sql.ended(DB.key(name)); }
+            let k = DB.key(name);
+            DB.entered(k);
+            try { db.transaction(body); } catch (e: Exception) {
+                if (!db.inTransaction()) { Sql.ended(k); }
+                DB.left(k, false);
+                throw e;
+            }
+            if (!db.inTransaction()) { Sql.ended(k); }
+            DB.left(k, true);
+        }
+
+        // Runs `body` once the current transaction commits: at once outside one;
+        // dropped if it (or the savepoint it was asked in) rolls back. For work
+        // that must only happen when the data is really there: sending the mail,
+        // queueing the job, telling the cache.
+        static fn afterCommit(body: fn(), name: string = "default") {
+            let k = DB.key(name);
+            let depth = DB.depths.get().getOr(k, 0);
+            if (depth == 0) { body(); return; }                                  // (not in a transaction Orbit opened)
+            let all = DB.hooks.get();
+            let list = all.getOr(k, null);
+            if (list == null) {
+                list = new Array<AfterCommit>();
+                all.put(k, list);
+            }
+            list.push(new AfterCommit(depth, body));
+        }
+        private static fn entered(k: string) {
+            let d = DB.depths.get();
+            d.put(k, d.getOr(k, 0) + 1);
+        }
+        // A transaction (or savepoint) ended: a rollback drops what was asked inside
+        // it; the outermost commit runs what is left, in the order it was asked.
+        private static fn left(k: string, committed: bool) {
+            let d = DB.depths.get();
+            let depth = d.getOr(k, 1) - 1;
+            if (depth <= 0) { d.remove(k); } else { d.put(k, depth); }
+            let all = DB.hooks.get();
+            let list = all.getOr(k, null);
+            if (list == null) { return; }
+            if (!committed) {
+                let keep = new Array<AfterCommit>();
+                for (h in list) { if (h.depth <= depth) { keep.push(h); } }
+                list = keep;
+                all.put(k, keep);
+            }
+            if (depth > 0) { return; }
+            all.remove(k);
+            if (!committed) { return; }
+            let first: Exception = null;
+            for (h in list) {
+                let run = h.run;
+                try { run(); } catch (e: Exception) { if (first == null) { first = e; } }    // (each runs; the first failure goes on)
+            }
+            if (first != null) { throw first; }
         }
         // Retries `body` up to `attempts` times, rolling back and running it again
         // when it fails on a deadlock or a serialization failure (see isDeadlock);
@@ -230,9 +295,9 @@ namespace orbit {
             return false;
         }
         // Starts a transaction (a savepoint inside one), to end with commit or rollBack.
-        static fn beginTransaction(name: string = "default") { DB.connection(name).begin(); }
-        static fn commit(name: string = "default") { let db = DB.connection(name); db.commit(); if (!db.inTransaction()) { Sql.ended(DB.key(name)); } }
-        static fn rollBack(name: string = "default") { let db = DB.connection(name); db.rollback(); if (!db.inTransaction()) { Sql.ended(DB.key(name)); } }
+        static fn beginTransaction(name: string = "default") { DB.connection(name).begin(); DB.entered(DB.key(name)); }
+        static fn commit(name: string = "default") { let db = DB.connection(name); db.commit(); if (!db.inTransaction()) { Sql.ended(DB.key(name)); } DB.left(DB.key(name), true); }
+        static fn rollBack(name: string = "default") { let db = DB.connection(name); db.rollback(); if (!db.inTransaction()) { Sql.ended(DB.key(name)); } DB.left(DB.key(name), false); }
         // Whether a transaction is open.
         static fn inTransaction(name: string = "default") -> bool { return DB.connection(name).inTransaction(); }
 
