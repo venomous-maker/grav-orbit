@@ -15,7 +15,7 @@ and query cache for seeing what it sends. It sits on
 database as `?` arguments, and the names in a query are checked against the
 model's fields, so a typo is an error before any SQL runs.
 
-```grav
+```typescript
 import "std"
 import "grav-orbit"
 
@@ -101,7 +101,7 @@ connection is made.
 
 Orbit works on grav-db connections that you open and hand to `DB`:
 
-```grav
+```typescript
 DB.connect(Sqlite.open("app.db"))                                           // the default connection
 DB.connect(MySql.open("mysql://app:secret@localhost/shop"))                 // (or a server)
 DB.connect(Postgres.open("postgresql://app:secret@localhost/reports"), "reports")   // a named one
@@ -109,7 +109,7 @@ DB.connect(Postgres.open("postgresql://app:secret@localhost/reports"), "reports"
 
 Models use the default connection unless their class says otherwise:
 
-```grav
+```typescript
 @Connection("reports")
 class DailyTotal extends Model {
     public id: long = 0
@@ -128,7 +128,7 @@ connection is for one thread at a time.
 
 A model is a class that extends `Model`. Its fields are its columns:
 
-```grav
+```typescript
 class User extends Model {
     public id: long = 0
     public name: string = ""
@@ -201,7 +201,7 @@ On a field:
 `@Column` takes the column name first (optional), then any of its named
 arguments:
 
-```grav
+```typescript
 @Table("accounts")
 class Account extends Model {
     @Id public number: long = 0
@@ -220,7 +220,7 @@ class Account extends Model {
 A string id (a UUID, a code) is not numbered: set it yourself, or let `@Uuids("id")`
 fill it in:
 
-```grav
+```typescript
 @Uuids("id")
 class ApiKey extends Model {
     public id: string = ""
@@ -236,7 +236,7 @@ The length, precision, scale, uniqueness, nullability and SQL type are what
 
 `fields(...)` makes the maps Orbit takes: names and values in pairs.
 
-```grav
+```typescript
 // Creating
 let ada = User.create(fields("name", "Ada", "age", 36))      // INSERT; ada.id is filled in
 let bob = User.make(fields("name", "Bob"))                    // a new User, not saved
@@ -269,7 +269,7 @@ User.destroy([4, 5, 6])                       // by id; how many
 
 **Find or make.**
 
-```grav
+```typescript
 // The first user with this email, or a new one with both maps' fields, saved.
 let eve = User.firstOrCreate(fields("email", "eve@example.com"), fields("name", "Eve"))
 // The same, not saved.
@@ -295,7 +295,7 @@ except the `@Guarded` ones and a numbered id, which they leave as they are, so
 a map built from a form cannot set them. Set them directly instead
 (`u.role = "admin"`). A name that is no field of the class is a `ValueError`.
 
-```grav
+```typescript
 let u = User.make(fields("name", "Dee", "role", "admin"))
 print(u.role)        // "member": role is @Guarded
 ```
@@ -306,7 +306,7 @@ print(u.role)        // "member": role is @Guarded
 `Query<User>`; each clause adds to it and returns it, and `get()`, `first()`,
 `count()` and the like run it.
 
-```grav
+```typescript
 let adults = User.where("age", ">=", 18)
                  .where("active", true)
                  .orderBy("name")
@@ -316,7 +316,7 @@ let adults = User.where("age", ">=", 18)
 
 ### Conditions
 
-```grav
+```typescript
 User.where("name", "Ada")                          // name = ? (IS NULL for null)
 User.where("age", ">", 30)                         // =, !=, <>, <, <=, >, >=, like, not like, ilike
 User.where("age", ">", 30).orWhere("role", "admin")
@@ -349,7 +349,7 @@ every row.
 (a `JsonValue` field, or a `@Cast("json")` one), as text; numbers compare as
 numbers and bools as bools, on every database:
 
-```grav
+```typescript
 Setting.where("data->lang", "en")
 Setting.where("data->nested->x", "y")
 Setting.where("data->qty", ">", 2)
@@ -370,7 +370,7 @@ matching GIN index), and on SQLite every word in one of the columns
 `whereIn`, or as a test for `whereExists`. Name the outer table's columns as
 `table.column` to tie them together:
 
-```grav
+```typescript
 // users with a published post
 User.whereIn("id", Post.query().select(["userId"]).where("published", true))
 // users with a profile
@@ -386,7 +386,7 @@ User.query().selectSub(Post.query().select(["title"])
 without duplicates; `unionAll(other)` keeps them. The first query's order,
 limit and offset apply to all the rows:
 
-```grav
+```typescript
 User.where("name", "Ada").union(User.where("role", "admin")).orderBy("name").get()
 ```
 
@@ -394,7 +394,7 @@ User.where("name", "Ada").union(User.where("role", "admin")).orderBy("name").get
 arguments after); `scope(name, args)` applies it, from the class or from a
 query:
 
-```grav
+```typescript
 class User extends Model {
     ...
     @Scope fn adults(q: Builder) { q.where("age", ">=", 18) }
@@ -411,7 +411,7 @@ A name that is no `@Scope` method of the class is a `ValueError`.
 `unless(condition, f)` when it does not, and `tap(f)` always (a reusable piece
 of a query, kept in a function):
 
-```grav
+```typescript
 fn active(q: Builder) { q.where("active", true).whereNotNull("email") }
 
 fn search(term: string, minAge: int) -> Array<User> {
@@ -425,7 +425,7 @@ fn search(term: string, minAge: int) -> Array<User> {
 
 ### Order and paging
 
-```grav
+```typescript
 User.orderBy("name")                       // orderBy(name, "desc"), orderByDesc(name)
 User.query().orderByRaw("LENGTH(name) DESC")
 User.latest()                              // createdAt, newest first; latest("updatedAt")
@@ -442,7 +442,7 @@ User.query().sharedLock()                  // FOR SHARE (MySQL: LOCK IN SHARE MO
 gives a `Page<T>`: its `items`, `total`, `page` and `perPage`, with
 `lastPage()`, `hasMorePages()` and `isEmpty()`.
 
-```grav
+```typescript
 let page = User.query().orderBy("name").paginate(2, 20)
 print("page ${page.page} of ${page.lastPage()}, ${page.total} users")
 for (u in page.items) { print(u.name) }
@@ -455,7 +455,7 @@ reads one row more than the page to know whether another follows, and gives a
 pages stay fast, and rows added meanwhile are not skipped or repeated): pass
 the previous page's `nextCursor` for the next one (`""` after the last):
 
-```grav
+```typescript
 let first = User.cursorPaginate(50)
 let second = User.cursorPaginate(50, first.nextCursor)     // second.hasMorePages()
 ```
@@ -465,7 +465,7 @@ time in id order and hands each part to `f`; `chunkById(size, f)` pages by id
 (`id > last`) instead of by offset, so rows changed meanwhile are not skipped
 or repeated; `each(f)` hands over one object at a time.
 
-```grav
+```typescript
 User.where("active", false).chunkById(500, fn(part: Array<User>) {
     for (u in part) { u.delete() }
 })
@@ -487,7 +487,7 @@ connection meanwhile (MySQL does not allow it while a result is streaming).
 
 ### Columns, joins, groups
 
-```grav
+```typescript
 User.select(["id", "name"])                              // only these columns
 User.query().select(["id", "name"]).selectRaw("LENGTH(name) AS name_length")
 Post.query().select(["userId"]).distinct()
@@ -530,7 +530,7 @@ alias works on PostgreSQL too: Orbit puts the expression back.
 | `value(name)` | one column of the first match, or null |
 | `rows()` | the rows as they come (a grav-db `ResultSet`) |
 
-```grav
+```typescript
 let total = Order.where("paid", true).sum("amount")       // a Decimal
 let names = User.orderBy("name").pluck("name")
 let email = User.where("name", "Ada").value("email")
@@ -539,7 +539,7 @@ let fallback = User.query().where("name", "Nobody").firstOr(fn() -> User => User
 
 ### Writing through a query
 
-```grav
+```typescript
 Post.where("published", false).update(fields("views", 0))     // how many rows; updatedAt is set too
 Post.where("views", 0).delete()                               // (marks them, for @SoftDeletes)
 Post.where("title", "Hello").increment("views")               // decrement, and a step: increment("views", 5)
@@ -551,7 +551,7 @@ with the same `uniqueBy` columns exists, updates its `update` columns.
 Both are batched, and fill in `createdAt` and `updatedAt` when the model has
 them.
 
-```grav
+```typescript
 let rows = new Array<HashMap<string, any>>()
 rows.push(fields("email", "ada@example.com", "name", "Ada", "age", 37))
 rows.push(fields("email", "zed@example.com", "name", "Zed", "age", 22))
@@ -565,7 +565,7 @@ KEY UPDATE`, which goes by any unique key.
 
 ### Looking at the SQL, and locking
 
-```grav
+```typescript
 let q = User.where("age", ">", 18).orderBy("name")
 print(q.toSql())          // SELECT "users".* FROM "users" WHERE "users"."age" > ? ORDER BY "users"."name" ASC
 print("${q.getBindings()}")
@@ -607,7 +607,7 @@ cache and count it. With none of that switched on, it costs nothing.
 
 ### The query log and listeners
 
-```grav
+```typescript
 DB.enableQueryLog()
 User.with("posts").where("active", true).get()
 for (q in DB.getQueryLog()) {
@@ -635,7 +635,7 @@ shape run again and again with only its arguments changing (the mark of an
 N+1), exact duplicates, relations lazy-loaded one object at a time, failures,
 and the slowest statements.
 
-```grav
+```typescript
 Debugbar.enable()
 for (u in User.all()) { print(u.posts().count()) }       // one COUNT per user
 print(Debugbar.report())
@@ -660,7 +660,7 @@ A relation read with `get()` (or `count()`) on an object that its query read
 together with others, without `with(...)`, runs one more query for each of
 them: an N+1. Orbit can stop it, warn about it, or count it:
 
-```grav
+```typescript
 Orbit.preventLazyLoading()            // throws LazyLoadingViolation (model, relation)
 Orbit.warnOnLazyLoading()             // or: one line on stderr per Class.relation
 Orbit.handleLazyLoadingViolationsUsing(fn(m: Model, relation: string) {
@@ -681,7 +681,7 @@ reads — a model's save or delete, a query's update, delete or insert, or a
 pivot change on that table drops the results that read it. Relations its
 `with` loads are remembered as long.
 
-```grav
+```typescript
 Orbit.cacheQueries()                                          // in memory, up to 1000 results
 let popular = Post.where("views", ">", 1000).with("author").remember(60).get()
 let n = User.where("active", true).remember(300).count()      // counts, pluck, exists too
@@ -703,7 +703,7 @@ when it ends. `Orbit.useQueryCache(store)` takes a `QueryCache` of your own;
 A relation is a method of the model that returns one. The type argument comes
 from the method's return type:
 
-```grav
+```typescript
 class User extends Model {
     public id: long = 0
     public name: string = ""
@@ -733,7 +733,7 @@ field or column name. Each can be given:
 | `morphMany<T>`, `morphOne<T>`, `morphTo` | `name` (the columns `<name>_id` and `<name>_type`) |
 | `morphToMany<T>`, `morphedByMany<T>` | `name`, `table` (`<name>` plural: `taggables`) |
 
-```grav
+```typescript
 fn writer() -> BelongsTo<User> { return self.belongsTo("author_id") }
 fn articles() -> HasMany<Post> { return self.hasMany("author_id") }
 ```
@@ -744,7 +744,7 @@ A relation's `get()` runs it (or gives what `with()` loaded); `query()`, and
 the shortcuts `where`, `whereIn`, `orderBy`, `latest`, `limit` and `with` on the
 many-sided relations, give a `Query<T>` to narrow further.
 
-```grav
+```typescript
 let posts = user.posts().get()                              // Array<Post>
 let recent = user.posts().where("published", true).latest().limit(5).get()
 let n = user.posts().count()
@@ -766,7 +766,7 @@ post.author().dissociate()
 largest (or smallest) value of a column, the id by default. It loads, counts
 and filters like any `hasOne`:
 
-```grav
+```typescript
 fn latestPost() -> HasOne<Post> { return self.hasOne::<Post>().latestOfMany() }            // the largest id
 fn firstPost() -> HasOne<Post> { return self.hasOne::<Post>().oldestOfMany("createdAt") }
 fn mostViewed() -> HasOne<Post> { return self.hasOne::<Post>().ofMany("views", "max") }
@@ -778,14 +778,14 @@ User.whereHas("latestPost", fn(q: Builder) { q.where("published", true) })
 **Defaults.** `withDefault()` on a `hasOne` or `belongsTo` makes `get()` give a
 new, unsaved object instead of null, with the fields given:
 
-```grav
+```typescript
 fn author() -> BelongsTo<User> { return self.belongsTo::<User>("user_id").withDefault(fields("name", "Guest")) }
 post.author().get().name           // "Guest" when the post has no author
 ```
 
 ### Many-to-many
 
-```grav
+```typescript
 class User extends Model {
     ...
     fn roles() -> BelongsToMany<Role> { return self.belongsToMany() }
@@ -806,7 +806,7 @@ class Role extends Model {
 
 (When the relation is chained further, give the type argument with `::<Role>`.)
 
-```grav
+```typescript
 user.roles().attach(admin.id)                           // a key, or the object: attach(admin)
 user.rankedRoles().attach(admin, fields("level", 5))    // with pivot columns
 user.roles().attachMany([1, 2, 3])
@@ -829,7 +829,7 @@ a relation sees, in queries, `whereHas` and `with` alike.
 
 ### Through another model
 
-```grav
+```typescript
 class Country extends Model {
     public id: long = 0
     public name: string = ""
@@ -852,7 +852,7 @@ let one = kenya.firstNote().get()        // a Note, or null
 A polymorphic relation `x` uses two columns, `x_id` and `x_type`; the type
 holds the class's morph name (its name, `Post`, or its `@MorphName`).
 
-```grav
+```typescript
 class Comment extends Model {
     public id: long = 0
     public body: string = ""
@@ -894,7 +894,7 @@ among the classes Orbit has mapped so far. A class is mapped the first time it
 is used, so before reading a `morphTo` whose classes may not have been used
 yet, register them, or give a type value its class by hand:
 
-```grav
+```typescript
 Orbit.register([reflect(Post), reflect(Video)])
 Orbit.morphMap("post", reflect(Post))        // "post" in commentable_type means Post
 ```
@@ -904,7 +904,7 @@ Orbit.morphMap("post", reflect(Post))        // "post" in commentable_type means
 **Eager loading.** `with` loads a relation for every result in one query (one
 query a level for a nested path), so `get()` on it afterwards runs nothing:
 
-```grav
+```typescript
 let users = User.with("posts").with("profile").get()
 let deep = User.with("posts.comments").get()             // posts, and their comments
 let both = User.with(["posts", "roles"]).get()
@@ -919,7 +919,7 @@ let busy = User.withWhereHas("posts", fn(q: Builder) { q.where("views", ">", 100
 
 **By what they have.**
 
-```grav
+```typescript
 User.has("posts")                                         // at least one post
 User.has("posts", ">=", 3)                                // a count; orHas
 User.has("posts.comments")                                // through both
@@ -934,14 +934,14 @@ User.whereRelation("posts", "views", ">", 7)              // whereHas with one c
 A `morphTo` points into several tables, so name the types to look in
 (their morph names):
 
-```grav
+```typescript
 Comment.whereHasMorph("commentable", ["Post", "Video"], fn(q: Builder) { q.whereLike("title", "Grav%") })
 Comment.query().hasMorph("commentable", ["Video"])        // orWhereHasMorph, whereDoesntHaveMorph
 ```
 
 **Counts and other aggregates** of a relation come with each row:
 
-```grav
+```typescript
 for (u in User.withCount("posts").get()) { print("${u.name}: ${u.countOf("posts")}") }
 User.query().withCount("posts", fn(q: Builder) { q.where("published", true) })
 
@@ -956,7 +956,7 @@ The added columns are `<relation>_count`, `<relation>_sum_<field>` (and
 
 **On an object you have.**
 
-```grav
+```typescript
 user.load("posts")                    // now, as with() would have
 user.loadMissing("posts")             // unless it is loaded already
 user.relationLoaded("posts")          // whether it is
@@ -980,7 +980,7 @@ fields. `implements HasTimestamps` gives a model both fields.
 
 ### Soft deletes
 
-```grav
+```typescript
 class Post extends Model implements SoftDeletes {   // brings deletedAt and @SoftDeletes
     public id: long = 0
     public title: string = ""
@@ -1012,7 +1012,7 @@ the first time it is used.
 A model remembers the values its row has, so a save sends only the columns
 that changed, and none at all (no UPDATE) when nothing did.
 
-```grav
+```typescript
 let ada = User.firstWhere("email", "ada@example.com")
 ada.isDirty()                       // false
 ada.name = "Ada K."
@@ -1030,7 +1030,7 @@ ada.syncOriginal()                  // takes the current values as the row's
 
 Override these on a model; throw from a `before` hook to stop the change.
 
-```grav
+```typescript
 class User extends Model {
     ...
     fn beforeSave() { self.email = Str.lower(Str.trim(self.email)) }
@@ -1060,7 +1060,7 @@ lifecycle hooks (so `@Uuids` fills nothing in); timestamps are still set.
 `@Touches("relation", ...)` on a model touches the named relation's
 `updatedAt` every time it saves — so saving a comment can bump its post's:
 
-```grav
+```typescript
 @Touches("post")
 class Comment extends Model implements HasTimestamps {
     public id: long = 0
@@ -1078,7 +1078,7 @@ It is a raw `UPDATE` through the relation's own query — not a load and a
 (every matching row, none of them loaded, and no hooks run on them), as well
 as `belongsTo`, `hasOne`, `morphOne` and `morphTo`:
 
-```grav
+```typescript
 @Touches("spokes")
 class Hub extends Model {
     public id: long = 0
@@ -1099,7 +1099,7 @@ optional `fn pruning()` on each match before `forceDelete()`-ing it (even for
 a `@SoftDeletes` class: prune removes rows for good), and gives how many it
 removed.
 
-```grav
+```typescript
 class Reservation extends Model {
     public id: long = 0
     public expiresAt: DateTime = DateTime.now()
@@ -1115,7 +1115,7 @@ A class with no `prunable()` method is a `StateError` naming it.
 
 ### Serialization
 
-```grav
+```typescript
 let m = user.toMap()                // field name -> value; @Hidden fields left out
 let json = user.toJson()            // DateTime as ISO text, Decimal as a string, Bytes as hex
 user.only(["name", "email"])        // a map of just these
@@ -1133,7 +1133,7 @@ Grav properties are Orbit's accessors and mutators. A getter marked
 `@Appended` (or named by `@Appends(...)` on the class) is put into `toMap` and
 `toJson`, and a setter is what `fill`, `create` and `update` call for its name:
 
-```grav
+```typescript
 @Appends("initials")
 class Person extends Model {
     public id: long = 0
@@ -1165,7 +1165,7 @@ strings, enums, `DateTime`, `Decimal`, `Bytes`, `JsonValue`, `T?`). For any
 other type, `@Cast("name")` names a `Cast` that turns the column's value into
 the field's and back. `json` and `csv` are built in:
 
-```grav
+```typescript
 class Money {
     public cents: long
     constructor(cents: long) { self.cents = cents }
@@ -1201,7 +1201,7 @@ A behavior is code a class gets by wearing a decorator, as `@SoftDeletes` gives
 soft deletes. Write one by extending `Behavior` and overriding the hooks you
 need, register it under its decorator's name, and put the decorator on models:
 
-```grav
+```typescript
 class Sluggable extends Behavior {
     // Before each save: slug = the source field (@Sluggable("title")), lower-case, dashed.
     fn saving(m: Model, d: Decorator) {
@@ -1291,7 +1291,7 @@ in one word. Orbit has three:
 | `HasTimestamps` | `createdAt: DateTime?` and `updatedAt: DateTime?` |
 | `HasUuids` | `uuid: string` and `@Uuids` |
 
-```grav
+```typescript
 class Post extends Model implements SoftDeletes, HasTimestamps, HasUuids {
     public id: long = 0
     public title: string = ""
@@ -1302,7 +1302,7 @@ Write your own the same way: a trait that wears your behavior's decorator and
 declares the fields the behavior needs. A field the model declares itself wins
 over the trait's, and a subclass gets the trait's members from its base.
 
-```grav
+```typescript
 @Sluggable("title")
 trait HasSlug {
     public slug: string = ""
@@ -1325,7 +1325,7 @@ An observer is a `Behavior` attached to a class by a call instead of a
 decorator — the same hooks (`saving`, `created`, `deleting`, ...), for code
 that should not have to change the model:
 
-```grav
+```typescript
 class SendsWelcomeMail extends Behavior {
     fn created(m: Model, d: Decorator) { Mail.send((m as User).email, "Welcome!") }
 }
@@ -1347,7 +1347,7 @@ too: `trashed` (after a soft delete marks the row), `forceDeleting` and
 `Repository<T>` gives the same saving and querying to a class with no base,
 on a connection you name:
 
-```grav
+```typescript
 class Point {
     public id: long = 0
     public x: float = 0.0
@@ -1377,7 +1377,7 @@ change tracking, hooks, behaviors' lifecycle hooks and relations need a
 
 **Transactions.**
 
-```grav
+```typescript
 let amount = Decimal.parse("25.00")
 DB.transaction(fn() {
     let from = Account.findOrFail(1)
@@ -1405,7 +1405,7 @@ first, when it fails on a deadlock or a serialization conflict — any other
 error, or the last attempt's, goes on unchanged. Each retry waits a little
 longer than the last.
 
-```grav
+```typescript
 DB.transaction(fn() {
     let acct = Account.findOrFail(1)
     acct.balance -= amount
@@ -1428,7 +1428,7 @@ and transactions to `write`, but a model's reads (and `DB.select`,
 transaction, where everything stays on `write` (the replica may not have its
 own writes yet):
 
-```grav
+```typescript
 DB.connect(MySql.open(writeUrl), MySql.open(readUrl))
 User.all()                            // from the replica
 DB.transaction(fn() { User.create(fields("name", "Ada")) })   // writes, and reads inside it, go to write
@@ -1443,7 +1443,7 @@ the write connection when none is open. `DB.stickyReads(seconds)` keeps a
 connection's reads on its writer for a while after each write, so a program
 reads back what it just wrote even while the replicas lag behind:
 
-```grav
+```typescript
 DB.connect(MySql.open(writeUrl), [MySql.open(replica1), MySql.open(replica2)])
 DB.addReadReplica(MySql.open(replica3))
 DB.stickyReads(2.0)                   // 2 s after a write, reads stay on the writer
@@ -1455,7 +1455,7 @@ time, so a thread that uses Orbit while others do gives itself its own (and, if
 wanted, its own replica): until it calls `DB.leaveThread()`, its models and
 queries use them, and other threads keep theirs or the shared one.
 
-```grav
+```typescript
 Thread.spawn(fn() {
     DB.useOnThisThread(MySql.open(writeUrl), MySql.open(readUrl))
     Order.create(fields("total", 10))
@@ -1479,7 +1479,7 @@ threads.
 | `DB.statement(sql, args)` | the rows changed, for any statement |
 | `DB.unprepared(sql)` | runs statements without arguments (a script) |
 
-```grav
+```typescript
 for (row in DB.select("SELECT name, age FROM users WHERE age > ?", [18])) {
     print(row.getString("name"))
 }
@@ -1493,7 +1493,7 @@ builder's clauses (with column names, and no relation conditions) and its
 `delete`, `increment`, `upsert`, ...), with `get`, `first`, `find`, `insert` and
 `insertMany` giving and taking grav-db `Row`s and maps.
 
-```grav
+```typescript
 let names = DB.table("users").where("age", ">", 18).orderBy("name").pluck("name")
 let rows = DB.table("users").whereIn("id", [1, 2]).get()       // a ResultSet
 let row = DB.table("users").find(1)                             // a Row, or null
@@ -1506,7 +1506,7 @@ DB.table("pages").where("slug", "home").increment("hits")
 
 ## The schema builder
 
-```grav
+```typescript
 Schema.create("posts", fn(t: Blueprint) {
     t.id()
     t.foreignId("user_id").constrained().cascadeOnDelete()
@@ -1620,7 +1620,7 @@ Each returns the column, so they chain:
 
 ### Foreign keys
 
-```grav
+```typescript
 t.foreignId("user_id").constrained()                      // REFERENCES users (id): the name without _id, plural
 t.foreignId("author_id").constrained("users")             // another table; constrained("users", "uid") another column
 t.foreignId("owner_id").references("id").on("accounts")   // the same, in two steps
@@ -1633,7 +1633,7 @@ expects.
 
 ### Indexes and drops
 
-```grav
+```typescript
 Schema.table("posts", fn(t: Blueprint) {
     t.index("title")                     // posts_title_index
     t.index(["user_id", "created_at"])   // posts_user_id_created_at_index
@@ -1665,7 +1665,7 @@ A migration is a class with `up` and `down`. A `Migrator` runs the ones not
 run yet, in the order they were added, and records them in a `migrations`
 table:
 
-```grav
+```typescript
 class CreateUsers extends Migration {
     fn up() {
         Schema.create("users", fn(t: Blueprint) {
@@ -1729,7 +1729,7 @@ Fake(42)` makes another.
 
 **Factory<T>** makes objects from a definition:
 
-```grav
+```typescript
 let definition = fn(f: Fake) -> HashMap<string, any> {
     return fields("name", f.name(), "email", f.uniqueEmail(), "age", f.number(18, 90))
 }
@@ -1758,7 +1758,7 @@ on it: start a new `Factory` for each variant.
 
 **Seeders** put data in the database:
 
-```grav
+```typescript
 class UserSeeder extends Seeder {
     fn run() {
         User.create(fields("name", "Ada", "email", "ada@example.com"))
